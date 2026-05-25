@@ -1,4 +1,109 @@
 #pragma once
+//
+// ============================================================
+// Mega MoE SM100 Kernel - 图文详解
+// ============================================================
+//
+// 【整体架构概述】
+//
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                      输入 (Input)                            │
+//                    │  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────┐  │
+//                    │  │ tokens (FP8)│  │ topk_idx     │  │ topk_weights        │  │
+//                    │  │ [M, hidden] │  │ [M, num_topk]│  │ [M, num_topk]       │  │
+//                    │  └─────────────┘  └──────────────┘  └─────────────────────┘  │
+//                    └──────────────────────────────────────────────────────────────┘
+//                                       │
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                   EP Dispatch (跨GPU通信)                      │
+//                    │                                                                    │
+//                    │   GPU 0 ──NVLink──> GPU 1 ──NVLink──> GPU 2 ──NVLink──> GPU 3   │
+//                    │      │                  │                  │                   │
+//                    │      ▼                  ▼                  ▼                   │
+//                    │   路由到正确          路由到正确          路由到正确              │
+//                    │   的expert           的expert           的expert               │
+//                    └──────────────────────────────────────────────────────────────┘
+//                                       │
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                      L1 GEMM (FP8xFP4)                       │
+//                    │                                                                    │
+//                    │      tokens(FP8) @ weights_L1(FP4) ──> intermediate(FP8)        │
+//                    │                                                                    │
+//                    │      shape: [M, hidden] x [hidden, int_hidden*2]                │
+//                    │               = [M, int_hidden*2]                              │
+//                    └──────────────────────────────────────────────────────────────┘
+//                                       │
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                      SwiGLU Activation                       │
+//                    │                                                                    │
+//                    │      gate, up = split(intermediate, 2)                        │
+//                    │      output = SiLU(gate) * up                                   │
+//                    │      (或 SwiGLU: gate * SiLU(up))                              │
+//                    └──────────────────────────────────────────────────────────────┘
+//                                       │
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                      L2 GEMM (FP8xFP4)                       │
+//                    │                                                                    │
+//                    │      intermediate(FP8) @ weights_L2(FP4) ──> output(BF16)     │
+//                    │                                                                    │
+//                    │      shape: [M, int_hidden] x [int_hidden, hidden]              │
+//                    │               = [M, hidden]                                    │
+//                    └──────────────────────────────────────────────────────────────┘
+//                                       │
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                   EP Combine (跨GPU通信)                     │
+//                    │                                                                    │
+//                    │      每个token的topk结果需要汇聚回原始位置                      │
+//                    │      GPU 0 <──NVLink── GPU 1 <──NVLink── GPU 2 <──NVLink── GPU 3 │
+//                    └──────────────────────────────────────────────────────────────┘
+//                                       │
+//                    ┌──────────────────────────────────────────────────────────────┐
+//                    │                      输出 (Output)                            │
+//                    │                   y: [M, hidden] (BF16)                       │
+//                    └──────────────────────────────────────────────────────────────┘
+//
+// 【线程分工】
+//
+//   ┌─────────────────────────────────────────────────────────────────────────────┐
+//   │  Warp 0        │ Warp 1        │ Warp 2        │ Warp 3        │ ...     │
+//   │  Dispatch #0   │ Dispatch #1   │ MMA Load A    │ MMA Load B    │ MMA     │
+//   │  (EP通信)      │ (EP通信)      │ (tokens+SFA)  │ (weights+SFB) │ Issue   │
+//   └─────────────────────────────────────────────────────────────────────────────┘
+//   │                          │                          │                       │
+//   │                          │                          │                       │
+//   ▼                          ▼                          ▼                       ▼
+//   1. 统计每个expert       2. TMA从远端GPU        3. TMA加载tokens        4. 执行UMMA
+//      的token数量             拉取数据               和scaling factors       FMA指令
+//
+// 【共享内存布局】
+//
+//   smem_buffer:
+//   ┌────────────────┬────────────────┬─────────────────────────────────────────┐
+//   │ Expert Count   │ Send Buffer    │  GEMM Shared Memory                     │
+//   │ [num_experts]  │ [dispatch_warps│  ┌──────────┬──────────┬──────────┐     │
+//   │                │ x token_size]  │  │  C/D     │    A    │    B    │     │
+//   │                │                │  │ (epilogue)│ (stages)│ (stages)│     │
+//   │                │                │  └──────────┴──────────┴──────────┘     │
+//   │                │                │  ┌──────────┬──────────┐                │
+//   │                │                │  │   SFA   │   SFB   │ (scaling factors)│
+//   │                │                │  └──────────┴──────────┘                │
+//   └────────────────┴────────────────┴─────────────────────────────────────────┘
+//
+// 【Tensor Memory布局】 (SM100特有的on-chip memory)
+//
+//   TMEM columns:
+//   ┌────────────────────────────────────────────────────────────────────────────┐
+//   │ Accumulator (C)           │ SFA (Scaling Factor A)  │ SFB (Scaling Factor B) │
+//   │ [UMMA_N * epilogue_stages]│ [SF_BLOCK_M / 32]       │ [SF_BLOCK_N / 32]       │
+//   └────────────────────────────────────────────────────────────────────────────┘
+//
+// 【数据格式】
+//
+//   FP8 (e4m3): 用于activation，默认范围 [-448, 448]
+//   FP4 (e2m1): 用于weights，默认值 {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+//   UE8M0:     Packed FP32格式，4个值打包成1个uint32
+//
+// ============================================================
 
 #include <cstdint>
 #include <cutlass/arch/barrier.h>
@@ -18,6 +123,48 @@
 
 namespace deep_gemm {
 
+// Mega MoE SM100 kernel 模板参数和函数参数说明
+//
+// 模板参数 (Template Parameters):
+//   kNumMaxTokensPerRank       - 每个rank的最大token数量，用于预分配共享内存
+//   kHidden                   - 隐藏层维度 (hidden size)
+//   kIntermediateHidden       - FFN中间层维度 (通常是 hidden * 4 / 3 或类似值)
+//   kNumExperts               - MoE模型中专家的总数
+//   kNumTopk                  - 每个token选择的top-k个专家
+//   kNumExpertsPerWave        - 每wave处理的专家数量
+//   BLOCK_M, BLOCK_N, BLOCK_K - GEMM tile的M/N/K维度配置
+//   STORE_BLOCK_M             - MMA epilogue的store block M维度
+//   SF_BLOCK_M, SF_BLOCK_N     - Scaling Factor块的M/N维度
+//   kNumMaxPoolTokens         - 池化token的最大数量 
+//   kNumPaddedSFPoolTokens     - Padding后的SF池化token数量
+//   kNumStages                - TMA加载的pipeline stages数量
+//   kNumDispatchThreads       - 负责EP dispatch的线程数
+//   kNumNonEpilogueThreads    - 负责MMA非epilogue计算的线程数 (固定为128)
+//   kNumEpilogueThreads       - 负责epilogue和combine的线程数
+//   kNumSMs                   - 使用的SM数量
+//   kNumRanks                - 并行 ranks 数量 (通常为GPU数量)
+//   kActivationClamp          - SwiGLU激活函数的clamp值
+//   kFastMath                - 是否启用fast math优化
+//   L1_SHAPE_N               - L1 GEMM的N维度 (= kIntermediateHidden * 2, gate+up)
+//   L1_SHAPE_K               - L1 GEMM的K维度 (= kHidden)
+//   L2_SHAPE_N               - L2 GEMM的N维度 (= kHidden)
+//   L2_SHAPE_K               - L2 GEMM的K维度 (= kIntermediateHidden)
+// 
+// 函数参数 (Function Parameters):
+//   y                        - 输出tensor (bfloat16, shape: [num_tokens, kHidden])
+//   cumulative_local_expert_recv_stats - 每个本地专家累计接收的token数
+//   num_tokens              - 当前batch的token数量
+//   sym_buffer              - 对称内存缓冲区 (用于EP通信)
+//   tensor_map_l1_acts       - L1输入激活的TMA descriptor (FP8)
+//   tensor_map_l1_acts_sf    - L1输入激活scaling factor的TMA descriptor
+//   tensor_map_l1_weights    - L1权重(FP4)的TMA descriptor
+//   tensor_map_l1_weights_sf - L1权重scaling factor的TMA descriptor
+//   tensor_map_l1_output     - L1输出(FP8)的TMA descriptor
+//   tensor_map_l2_acts       - L2输入激活的TMA descriptor (FP8)
+//   tensor_map_l2_acts_sf    - L2输入激活scaling factor的TMA descriptor
+//   tensor_map_l2_weights    - L2权重(FP4)的TMA descriptor
+//   tensor_map_l2_weights_sf - L2权重scaling factor的TMA descriptor
+//
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -355,8 +502,64 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
 
+    // ============================================================
+    // 【线程角色分配】 - 每个warp有明确的职责
+    //
+    //  ┌─────────────────────────────────────────────────────────────────────────────┐
+    //  │ Warp 0 ~ kNumDispatchWarps-1    : EP Dispatch Warps (跨GPU通信)              │
+    //  │   - 统计每个expert的token数量                                               │
+    //  │   - 通过NVLink从远端GPU拉取数据                                            │
+    //  │   - 写入本地L1 buffer                                                       │
+    //  ├─────────────────────────────────────────────────────────────────────────────┤
+    //  │ Warp kNumDispatchWarps       : MMA Load Warp A (tokens + SFA)               │
+    //  │   - 通过TMA从全局内存加载tokens                                             │
+    //  │   - 加载对应的scaling factors                                               │
+    //  ├─────────────────────────────────────────────────────────────────────────────┤
+    //  │ Warp kNumDispatchWarps + 1   : MMA Load Warp B (weights + SFB)             │
+    //  │   - 通过TMA从全局内存加载weights                                            │
+    //  │   - 加载对应的scaling factors                                               │
+    //  ├─────────────────────────────────────────────────────────────────────────────┤
+    //  │ Warp kNumDispatchWarps + 2   : MMA Issue Warp                              │
+    //  │   - 执行UMMA FMA指令                                                        │
+    //  │   - 仅leader CTA运行                                                        │
+    //  ├─────────────────────────────────────────────────────────────────────────────┤
+    //  │ Warp kNumDispatchWarps + 3   : 空warp (预留)                                │
+    //  ├─────────────────────────────────────────────────────────────────────────────┤
+    //  │ Warp >= kNumDispatchWarps + kNumMMANonEpilogueWarps : Epilogue Warps       │
+    //  │   - SwiGLU激活函数                                                          │
+    //  │   - 结果写回全局内存                                                        │
+    //  │   - Combine操作 (结果汇聚)                                                 │
+    //  └─────────────────────────────────────────────────────────────────────────────┘
+    //
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
+        // ============================================================
+        // 【Dispatch Warp职责】
+        //
+        // 1. 统计阶段: 遍历所有token-topk对，统计每个expert被选中的次数
+        //    ┌─────────────────────────────────────────────┐
+        //    │ token[0] → expert[5] ──> expert_count[5]++  │
+        //    │ token[0] → expert[2] ──> expert_count[2]++  │
+        //    │ token[1] → expert[5] ──> expert_count[5]++  │
+        //    │ token[1] → expert[8] ──> expert_count[8]++  │
+        //    │ ...                                        │
+        //    └─────────────────────────────────────────────┘
+        //
+        // 2. 广播阶段: 通过atomic将统计结果广播到workspace
+        //
+        // 3. 路由阶段: 计算每个token应该发往哪个rank的哪个expert
+        //
+        // 4. 拉取阶段: 通过NVLink从远端GPU拉取token数据和scaling factors
+        //
+        //    ┌────────────────────────────────────────────────────────────┐
+        //    │ GPU 0                                                      │
+        //    │   need tokens[0..3] for expert[2] from GPU 1              │
+        //    │        ◄──────── NVLink pull ──────── GPU 1              │
+        //    │                                                        │
+        //    │   need tokens[4..7] for expert[6] from GPU 2            │
+        //    │        ◄──────── NVLink pull ──────── GPU 2              │
+        //    └────────────────────────────────────────────────────────────┘
+        //
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
@@ -602,6 +805,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
+        //
+        // 5. 清理阶段: 清理workspace，为下一轮计算做准备
+        //    - 清除expert发送计数
+        //    - 清除token计数
+        //    - 清除L1/L2到达标记
+        //
+        // 6. 同步阶段: 等待所有rank完成清理
+        //
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -659,6 +870,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* At the end of kernel does not need to sync */ false
         );
     } else if (warp_idx == kNumDispatchWarps) {
+        // ============================================================
+        // 【MMA Load Warp A - 加载Tokens和SFA】
+        //
+        //  ┌──────────────────────────────────────────────────────────────────────┐
+        //  │ Global Memory ──TMA──> Shared Memory A (tokens) ──TMA──> TMEM          │
+        //  │                     Shared Memory SFA (scaling factors)               │
+        //  └──────────────────────────────────────────────────────────────────────┘
+        //
+        // 职责:
+        //   - 通过调度器获取当前需要处理的block信息
+        //   - 使用TMA从全局内存加载tokens到共享内存
+        //   - 加载对应的scaling factors (SFA)
+        //   - 支持L1和L2两个线性层的切换
+        //
+        // 调度流程:
+        //   for_each_block():
+        //     ┌─────────────────────────────────────────────────────────┐
+        //     │ Block #0 (expert 0, m_block 0):                        │
+        //     │   Linear1: [tokens] @ [weights_L1] → [intermediate]    │
+        //     │   Linear2: [intermediate] @ [weights_L2] → [output]    │
+        //     │                                                      │
+        //     │ Block #1 (expert 0, m_block 1):                       │
+        //     │   ...                                                 │
+        //     │                                                      │
+        //     │ Block #2 (expert 1, m_block 0):                       │
+        //     │   ...                                                 │
+        //     └─────────────────────────────────────────────────────────┘
+        //
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -728,6 +967,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         });
     } else if (warp_idx == kNumDispatchWarps + 1) {
+        // ============================================================
+        // 【MMA Load Warp B - 加载Weights和SFB】
+        //
+        //  ┌──────────────────────────────────────────────────────────────────────┐
+        //  │ Global Memory ──TMA──> Shared Memory B (weights, FP4)              │
+        //  │                     Shared Memory SFB (scaling factors)            │
+        //  └──────────────────────────────────────────────────────────────────────┘
+        //
+        // 职责:
+        //   - 加载FP4格式的权重数据到共享内存
+        //   - 加载对应的scaling factors (SFB)
+        //   - 权重按expert分区，每个expert有独立的权重块
+        //
+        // 权重布局 (以L1为例):
+        //   ┌────────────────────────────────────────────────────────────┐
+        //   │ expert[0] weights:  [N=intermediate*2, K=hidden]           │
+        //   │ expert[1] weights:  [N=intermediate*2, K=hidden]           │
+        //   │ ...                                                        │
+        //   │ expert[n] weights:  [N=intermediate*2, K=hidden]           │
+        //   └────────────────────────────────────────────────────────────┘
+        //
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -771,6 +1031,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         });
     } else if (warp_idx == kNumDispatchWarps + 2) {
+        // ============================================================
+        // 【MMA Issue Warp - 执行矩阵乘法】
+        //
+        //  ┌──────────────────────────────────────────────────────────────────────┐
+        //  │                                                             │
+        //  │    SMEM A (tokens)      SMEM B (weights)                     │
+        //  │         │                       │                            │
+        //  │         ▼                       ▼                            │
+        //  │    ┌─────────────────────────────────────┐                 │
+        //  │    │           UMMA FMA Unit             │                 │
+        //  │    │    (Tensor Core on SM100)            │                 │
+        //  │    │                                     │                 │
+        //  │    │  D[M,N] += A[M,K] * B[N,K]         │                 │
+        //  │    │                                     │                 │
+        //  │    └─────────────────────────────────────┘                 │
+        //  │                   │                                         │
+        //  │                   ▼                                         │
+        //  │              TMEM (Accumulator)                             │
+        //  └──────────────────────────────────────────────────────────────────────┘
+        //
+        // SM100 UMMA特性:
+        //   - 2x1 SM模式: 跨2个SM协同执行
+        //   - Block-scaled: 使用UE8M0格式的scaling factors
+        //   - 指令级并行: 每个warp同时执行多个MMA指令
+        //
+        // Pipeline流程:
+        //   Stage 0: Load A,B → Compute → Store to TMEM
+        //   Stage 1: Load A,B → Compute → Store to TMEM
+        //   Stage 2: Load A,B → Compute → Store to TMEM
+        //   ...
+        //
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -881,10 +1172,50 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
     } else if (warp_idx == kNumDispatchWarps + 3) {
+        // 【预留Warp】 - 暂时为空，保持线程同步
+
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+        // ============================================================
+        // 【Epilogue Warps - 结果处理与写回】
+        //
+        //  ┌──────────────────────────────────────────────────────────────────────┐
+        //  │  TMEM (Accumulator)                                                   │
+        //  │        │                                                             │
+        //  │        ▼                                                             │
+        //  │  ┌─────────────────────────────────────┐                            │
+        //  │  │      SwiGLU Activation (L1 only)      │                            │
+        //  │  │                                     │                            │
+        //  │  │   gate = intermediate[:, :N/2]     │                            │
+        //  │  │   up   = intermediate[:, N/2:]     │                            │
+        //  │  │   output = SiLU(gate) * up           │                            │
+        //  │  └─────────────────────────────────────┘                            │
+        //  │        │                                                             │
+        //  │        ▼                                                             │
+        //  │  ┌─────────────────────────────────────┐                            │
+        //  │  │       Type Convert (FP8 → BF16)       │                            │
+        //  │  └─────────────────────────────────────┘                            │
+        //  │        │                                                             │
+        //  │        ▼                                                             │
+        //  │  ┌─────────────────────────────────────┐                            │
+        //  │  │     Global Memory Store (TMA)      │                            │
+        //  │  │                                     │                            │
+        //  │  │  y[pool_idx, :] = result            │                            │
+        //  │  └─────────────────────────────────────┘                            │
+        //  └──────────────────────────────────────────────────────────────────────┘
+        //
+        // Epilogue Warp分工:
+        //   - 4个warps组成1个warpgroup
+        //   - Warpgroup负责处理 BLOCK_M / 2 的行
+        //   - 每个warp负责 BLOCK_N / 4 的列
+        //
+        // SwiGLU激活函数:
+        //   gate = SiLU(intermediate[:, :intermediate_dim])
+        //   up = intermediate[:, intermediate_dim:]
+        //   output = gate * up
+        //
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
 
@@ -939,6 +1270,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
             if (block_phase == sched::BlockPhase::Linear1) {
+                // ============================================================
+                // 【L1 Epilogue - SwiGLU激活】
+                //
+                // SwiGLU流程:
+                //   ┌─────────────────────────────────────────────────┐
+                //   │  L1_output[:, :] (FP8)                           │
+                //   │         │                                        │
+                //   │         ▼ split                                 │
+                //   │  ┌─────────────────┐  ┌─────────────────┐       │
+                //   │  │ gate (N/2 列)  │  │   up (N/2 列)   │       │
+                //   │  └─────────────────┘  └─────────────────┘       │
+                //   │         │                    │                 │
+                //   │         ▼                    ▼                 │
+                //   │    SiLU(gate)          (identity)            │
+                //   │         │                    │                 │
+                //   │         └─────────── * ──────┘                 │
+                //   │                    │                          │
+                //   │                    ▼                          │
+                //   │         output (FP8, N/2 列)                  │
+                //   └─────────────────────────────────────────────────┘
+                //
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 //   (values[0], values[2]), (values[1], values[3]),
@@ -1122,6 +1474,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             } else {
+                // ============================================================
+                // 【L2 Epilogue - 结果写回与Combine】
+                //
+                // L2层的输出需要通过NVLink发送回原始token位置
+                // 与L1不同，L2输出是BF16格式，直接存储到combine buffer
+                //
+                //  Combine流程:
+                //    ┌────────────────────────────────────────────────────────┐
+                //    │  L2_output (BF16)                                      │
+                //    │       │                                               │
+                //    │       │ NVLink send                                   │
+                //    │       ▼                                               │
+                //    │  ┌─────────────────────────────────────────────┐    │
+                //    │  │  Combine Buffer (按token分组)                  │    │
+                //    │  │  token[0] <- from expert[5] (topk 1)          │    │
+                //    │  │  token[0] <- from expert[2] (topk 2)          │    │
+                //    │  │  token[0] <- from expert[8] (topk 3)          │    │
+                //    │  │  ...                                          │    │
+                //    │  │  token[1] <- from expert[5] (topk 1)          │    │
+                //    │  │  token[1] <- from expert[8] (topk 2)          │    │
+                //    │  └─────────────────────────────────────────────┘    │
+                //    │                     │                               │
+                //    │                     ▼                               │
+                //    │  ┌─────────────────────────────────────────────┐ │
+                //    │  │  Weighted Sum (topk_weights * L2_output)        │ │
+                //    │  │  y = w1*out1 + w2*out2 + ...                  │ │
+                //    │  └─────────────────────────────────────────────┘ │
+                //    └────────────────────────────────────────────────────────┘
+                //
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
 

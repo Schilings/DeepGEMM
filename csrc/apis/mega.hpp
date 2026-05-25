@@ -169,7 +169,7 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden); 
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment

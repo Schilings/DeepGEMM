@@ -17,7 +17,7 @@ namespace deep_gemm {
 
 class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
 public:
-    struct Args {
+    struct Args { 
         // Templated arguments
         int num_max_tokens_per_rank;
         int hidden, intermediate_hidden;
@@ -34,7 +34,7 @@ public:
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormap
-        CUtensorMap tensor_map_l1_acts;
+        CUtensorMap tensor_map_l1_acts; 
         CUtensorMap tensor_map_l1_acts_sf;
         CUtensorMap tensor_map_l1_weights;
         CUtensorMap tensor_map_l1_weights_sf;
