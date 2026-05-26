@@ -123,68 +123,33 @@
 
 namespace deep_gemm {
 
-// Mega MoE SM100 kernel 模板参数和函数参数说明
-//
-// 模板参数 (Template Parameters):
-//   kNumMaxTokensPerRank       - 每个rank的最大token数量，用于预分配共享内存
-//   kHidden                   - 隐藏层维度 (hidden size)
-//   kIntermediateHidden       - FFN中间层维度 (通常是 hidden * 4 / 3 或类似值)
-//   kNumExperts               - MoE模型中专家的总数
-//   kNumTopk                  - 每个token选择的top-k个专家
-//   kNumExpertsPerWave        - 每wave处理的专家数量
-//   BLOCK_M, BLOCK_N, BLOCK_K - GEMM tile的M/N/K维度配置
-//   STORE_BLOCK_M             - MMA epilogue的store block M维度
-//   SF_BLOCK_M, SF_BLOCK_N     - Scaling Factor块的M/N维度
-//   kNumMaxPoolTokens         - 池化token的最大数量 
-//   kNumPaddedSFPoolTokens     - Padding后的SF池化token数量
-//   kNumStages                - TMA加载的pipeline stages数量
-//   kNumDispatchThreads       - 负责EP dispatch的线程数
-//   kNumNonEpilogueThreads    - 负责MMA非epilogue计算的线程数 (固定为128)
-//   kNumEpilogueThreads       - 负责epilogue和combine的线程数
-//   kNumSMs                   - 使用的SM数量
-//   kNumRanks                - 并行 ranks 数量 (通常为GPU数量)
-//   kActivationClamp          - SwiGLU激活函数的clamp值
-//   kFastMath                - 是否启用fast math优化
-//   L1_SHAPE_N               - L1 GEMM的N维度 (= kIntermediateHidden * 2, gate+up)
-//   L1_SHAPE_K               - L1 GEMM的K维度 (= kHidden)
-//   L2_SHAPE_N               - L2 GEMM的N维度 (= kHidden)
-//   L2_SHAPE_K               - L2 GEMM的K维度 (= kIntermediateHidden)
-// 
-// 函数参数 (Function Parameters):
-//   y                        - 输出tensor (bfloat16, shape: [num_tokens, kHidden])
-//   cumulative_local_expert_recv_stats - 每个本地专家累计接收的token数
-//   num_tokens              - 当前batch的token数量
-//   sym_buffer              - 对称内存缓冲区 (用于EP通信)
-//   tensor_map_l1_acts       - L1输入激活的TMA descriptor (FP8)
-//   tensor_map_l1_acts_sf    - L1输入激活scaling factor的TMA descriptor
-//   tensor_map_l1_weights    - L1权重(FP4)的TMA descriptor
-//   tensor_map_l1_weights_sf - L1权重scaling factor的TMA descriptor
-//   tensor_map_l1_output     - L1输出(FP8)的TMA descriptor
-//   tensor_map_l2_acts       - L2输入激活的TMA descriptor (FP8)
-//   tensor_map_l2_acts_sf    - L2输入激活scaling factor的TMA descriptor
-//   tensor_map_l2_weights    - L2权重(FP4)的TMA descriptor
-//   tensor_map_l2_weights_sf - L2权重scaling factor的TMA descriptor
-//
 template <
-    uint32_t kNumMaxTokensPerRank,
-    uint32_t kHidden, uint32_t kIntermediateHidden,
-    uint32_t kNumExperts, uint32_t kNumTopk,
-    uint32_t kNumExpertsPerWave,
-    uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-    uint32_t STORE_BLOCK_M,
-    uint32_t SF_BLOCK_M, uint32_t SF_BLOCK_N,
-    uint32_t kNumMaxPoolTokens,
-    uint32_t kNumPaddedSFPoolTokens,
-    uint32_t kNumStages,
-    uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
-    uint32_t kNumEpilogueThreads,
-    uint32_t kNumSMs, uint32_t kNumRanks,
-    float kActivationClamp,
-    bool kFastMath,
-    uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
-    uint32_t L1_SHAPE_K = kHidden,
-    uint32_t L2_SHAPE_N = kHidden,
-    uint32_t L2_SHAPE_K = kIntermediateHidden,
+    uint32_t kNumMaxTokensPerRank,       // 每个rank的最大token数量，用于预分配共享内存
+    uint32_t kHidden,                    // 隐藏层维度 (hidden size)
+    uint32_t kIntermediateHidden,        // FFN中间层维度 (通常是 hidden * 4 / 3 或类似值)
+    uint32_t kNumExperts,                // MoE模型中专家的总数
+    uint32_t kNumTopk,                   // 每个token选择的top-k个专家
+    uint32_t kNumExpertsPerWave,         // 每wave处理的专家数量
+    uint32_t BLOCK_M,                    // GEMM tile的M维度
+    uint32_t BLOCK_N,                    // GEMM tile的N维度
+    uint32_t BLOCK_K,                    // GEMM tile的K维度
+    uint32_t STORE_BLOCK_M,             // MMA epilogue的store block M维度
+    uint32_t SF_BLOCK_M,                // Scaling Factor块的M维度
+    uint32_t SF_BLOCK_N,                // Scaling Factor块的N维度
+    uint32_t kNumMaxPoolTokens,         // 池化token的最大数量
+    uint32_t kNumPaddedSFPoolTokens,    // Padding后的SF池化token数量
+    uint32_t kNumStages,                // TMA加载的pipeline stages数量
+    uint32_t kNumDispatchThreads,       // 负责EP dispatch的线程数
+    uint32_t kNumNonEpilogueThreads,    // 负责MMA非epilogue计算的线程数 (固定为128)
+    uint32_t kNumEpilogueThreads,       // 负责epilogue和combine的线程数
+    uint32_t kNumSMs,                   // 使用的SM数量
+    uint32_t kNumRanks,                 // 并行ranks数量 (通常为GPU数量)
+    float kActivationClamp,             // SwiGLU激活函数的clamp值
+    bool kFastMath,                     // 是否启用fast math优化
+    uint32_t L1_SHAPE_N = kIntermediateHidden * 2,  // L1 GEMM的N维度 (gate+up)
+    uint32_t L1_SHAPE_K = kHidden,                 // L1 GEMM的K维度
+    uint32_t L2_SHAPE_N = kHidden,                 // L2 GEMM的N维度
+    uint32_t L2_SHAPE_K = kIntermediateHidden,     // L2 GEMM的K维度
     uint32_t kNumDispatchWarps = kNumDispatchThreads / 32,
     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
     uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
@@ -194,20 +159,20 @@ template <
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
-sm100_fp8_fp4_mega_moe_impl(void* y,
-                            int* cumulative_local_expert_recv_stats,
-                            const uint32_t num_tokens,
-                            const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
-#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+sm100_fp8_fp4_mega_moe_impl(void* y,                                                          // 输出tensor (bfloat16, shape: [num_tokens, kHidden])
+                            int* cumulative_local_expert_recv_stats,                           // 每个本地专家累计接收的token数
+                            const uint32_t num_tokens,                                        // 当前batch的token数量
+                            const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,   // 对称内存缓冲区 (用于EP通信)
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,       // L1输入激活的TMA descriptor (FP8)
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,  // L1输入激活scaling factor的TMA descriptor
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,   // L1权重(FP4)的TMA descriptor
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,// L1权重scaling factor的TMA descriptor
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,    // L1输出(FP8)的TMA descriptor
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,       // L2输入激活的TMA descriptor (FP8)
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,  // L2输入激活scaling factor的TMA descriptor
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,   // L2权重(FP4)的TMA descriptor
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {// L2权重scaling factor的TMA descriptor
+//#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
@@ -237,31 +202,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights_sf);
     }
 
-    // Workspaces
+    // Workspace: 管理 EP 通信的元数据内存布局，从 sym_buffer 基地址开始的连续内存区域：
+    //   [0..31]      Barrier 信号区 (32B)
+    //                  [0..15]  4 × uint32_t grid sync 计数器
+    //                  [16..20] uint32_t NVLink barrier 计数器
+    //                  [20..27] 2 × int NVLink barrier 信号 (phase 0/1)
+    //   [32..]       Expert 发送计数 (num_experts × uint64_t)
+    //   [..]         Expert 接收计数 (num_ranks × num_experts_per_rank × uint64_t)
+    //   [..]         Expert 接收计数求和 (num_experts_per_rank × uint64_t)
+    //   [..]         L1 到达计数 (align(num_max_pool_blocks, 2) × uint32_t)
+    //   [..]         L2 块到达掩码 (num_max_pool_blocks × uint64_t)
+    //   [..]         Dispatch 拉取源 token-topk 索引 (num_experts_per_rank × num_ranks × num_max_recv_tokens × int)
+    //   [..]         Combine 推送源元数据 (num_max_pool_tokens × TokenSrcMetadata)
+    //   末尾 16B 对齐 (TMA descriptor 要求)
     const auto workspace = layout::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
-    // Token and buffer layouts
-    constexpr auto fp8_token_layout = layout::Data(kHidden);
-    constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
-    constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
-    constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);
-    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32);
-    constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false);
-    constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false);
-    constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+    // Token and buffer layouts (layout::Data: per-token 字节数, 是否TMA对齐)
+    constexpr auto fp8_token_layout = layout::Data(kHidden);                           // FP8 token: kHidden 字节/token, TMA对齐
+    constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));    // BF16 token: kHidden×2 字节/token, TMA对齐
+    constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);  // FP8中间层token: kIntermediateHidden 字节/token, TMA对齐
+    constexpr auto fp8_sf_layout = layout::Data(kHidden / 32);                         // FP8 scaling factor: 每32个元素1个SF, TMA对齐
+    constexpr auto fp8_intermediate_sf_layout = layout::Data(kIntermediateHidden / 32); // FP8中间层SF, TMA对齐
+    constexpr auto input_topk_idx_layout = layout::Data(kNumTopk * sizeof(int64_t), false); // 输入topk索引: kNumTopk个int64, 非TMA对齐
+    constexpr auto input_topk_weights_layout = layout::Data(kNumTopk * sizeof(float), false); // 输入topk权重: kNumTopk个float, 非TMA对齐
+    constexpr auto l1_topk_weights_layout = layout::Data(sizeof(float), false);            // L1 topk权重: 单个float, 非TMA对齐
 
-    // Registered inputs
-    const auto input_token_buffer = layout::Buffer(
+    // Registered inputs (layout::Buffer: Data布局, rank数, 每rank最大token数, 基地址)
+    // 各buffer在workspace末尾依次紧挨排列
+    const auto input_token_buffer = layout::Buffer(                       // 输入token缓冲区 (FP8, 单rank)
         fp8_token_layout, 1, kNumMaxTokensPerRank,
         workspace.get_end_ptr());
-    const auto input_sf_buffer = layout::Buffer(
+    const auto input_sf_buffer = layout::Buffer(                         // 输入scaling factor缓冲区 (FP8 SF, 单rank)
         fp8_sf_layout, 1, kNumMaxTokensPerRank,
         input_token_buffer.get_end_ptr());
-    const auto input_topk_idx_buffer = layout::Buffer(
+    const auto input_topk_idx_buffer = layout::Buffer(                   // 输入topk索引缓冲区 (int64 × kNumTopk, 单rank)
         input_topk_idx_layout, 1, kNumMaxTokensPerRank,
         input_sf_buffer.get_end_ptr());
-    const auto input_topk_weights_buffer = layout::Buffer(
+    const auto input_topk_weights_buffer = layout::Buffer(              // 输入topk权重缓冲区 (float × kNumTopk, 单rank)
         input_topk_weights_layout, 1, kNumMaxTokensPerRank,
         input_topk_idx_buffer.get_end_ptr());
 
@@ -592,6 +570,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Get SM offset (~6.5 us)
+        //
+        // 目的：将本SM在每个expert上的token计数累加到全局workspace，同时取回本SM在该expert
+        // 全局缓冲区中的起始槽位偏移（offset），供后续写入源索引时使用。
+        //
+        // 关键技巧：用一次 uint64_t 原子加同时完成两件事——
+        //   send_value = (1ull << 32) | smem_expert_count[i]
+        //     高32位 = 1：表示"本SM参与了对该expert的发送"（用于后续统计有多少SM参与了发送）
+        //     低32位 = 本SM要发给expert i的token数量（由上一步Count experts' tokens统计得到）
+        //
+        // ptx::atomic_add 返回加操作之前的旧值，即：
+        //   旧值低32位 = 在本SM之前，其他SM已经累加的token总数 = 本SM的起始槽位偏移
+        //   （旧值高32位暂不使用，后续在Write expert count阶段才用到SM计数）
+        //
+        // 举例：3个SM都给expert 0发token，假设写入顺序为SM0→SM1→SM2
+        //   SM0 发5个 → atomic_add返回0, smem_expert_count[0] = 0 (槽位0~4)
+        //   SM1 发3个 → atomic_add返回5, smem_expert_count[0] = 5 (槽位5~7)
+        //   SM2 发4个 → atomic_add返回8, smem_expert_count[0] = 8 (槽位8~11)
+        //
         #pragma unroll
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
             const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
@@ -601,15 +597,39 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Write source indices (~2 us with 512 tokens)
+        //
+        // 目的：将每个token-topk的源索引写入远端rank的workspace，让远端rank在后续
+        // 拉取阶段(pull phase)知道：需要从哪个rank、取哪个token的数据。
+        //
+        // 写入位置：workspace中每个(本地expert, 来源rank)组合有一段连续的索引缓冲区，
+        // 槽位号由本SM的起始偏移递增分配。
+        //
+        // 具体步骤（对每个token-topk）：
+        //   1. dst_rank_idx: 确定目标expert属于哪个rank（expert_idx / kNumExpertsPerRank）
+        //   2. dst_slot_idx: atomicAdd_block递增smem_expert_count，从步骤Get SM offset
+        //      拿到的起始偏移开始依次分配，例如起始偏移为5则第一个token分到槽位5，下一个6...
+        //   3. dst_ptr: 计算远端workspace中的写入地址
+        //      - expert_idx % kNumExpertsPerRank: 目标rank的本地expert索引
+        //      - sym_buffer.rank_idx: 来源rank（即本GPU）
+        //      - dst_slot_idx: 在该(本地expert, 来源rank)段中的槽位号
+        //   4. sym_buffer.map(dst_ptr, dst_rank_idx): 将本地workspace地址映射为目标rank的
+        //      NVLink远端地址，然后直接写入token_topk_idx（= token_idx * kNumTopk + topk_idx，
+        //      表示"哪个token的第几个topk选择"）
+        //
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
+            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;      // 目标expert所在的rank
+            const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1); // 从起始偏移递增分配槽位
+            // Dispatch拉取源索引区域: workspace中 num_experts_per_rank × num_ranks × num_max_recv_tokens_per_expert 的int数组
+            // 按三维索引 [local_expert_idx][src_rank_idx][slot_idx] 寻址
+            // 存储的是token-topk复合索引，远端rank据此知道从哪个rank拉取哪个token
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;       // NVLink直接写入远端rank
         });
 
-        // Grid sync
+        // Grid sync: 所有SM必须完成源索引写入后，各rank才能安全地读取自己workspace中的
+        // 索引缓冲区进入拉取阶段。grid_sync使用workspace中的grid sync计数器实现跨SM同步，
+        // lambda提供CTA内部的barrier同步。
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
@@ -633,6 +653,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
+        //
+        // 目的：跨所有rank的NVLink屏障同步，确保所有rank都完成了expert count写入后，
+        // 才开始拉取(pull)阶段。否则某rank可能读到其他rank尚未写入完毕的expert计数和源索引。
+        //
+        // 执行流程（3步）：
+        //   1. [sync_prologue=false] 跳过grid sync — 因为上方的barrier已经保证了CTA内部同步，
+        //      且Write expert count阶段只有SM0参与写入，其他SM不会产生写冲突
+        //   2. [NVLink barrier] 只有SM0的线程参与跨rank信令：
+        //      - 每个线程向对应远端rank发送原子递增信号 (ptx::red_add_rel_sys)
+        //      - 然后等待所有rank的信号到达本地 (自旋等待 signal_ptr == kNumRanks)
+        //      - 使用phase交替机制避免重复使用同一个信号值
+        //   3. [sync_epilogue=true] NVLink barrier后执行grid sync — 确保SM0完成
+        //      跨rank同步后，再通知其他SM可以安全进入拉取阶段
+        //
+        // 模板参数：
+        //   kNumRanks  - 参与同步的rank数
+        //   kNumSMs    - 每个rank的SM数
+        //   kNumDispatchThreads - 每个CTA的dispatch线程数
+        //   kDispatchGridSyncIndex - grid sync使用的计数器索引
+        //   kBeforeDispatchPullBarrierTag - 屏障标签，区分不同阶段的NVLink barrier
+        //
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
@@ -641,7 +682,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* After the NVLink barrier, there is a grid sync */ true
         );
 
-        // Ensure the epilogue barrier cannot run with the pull barrier
+        // Dispatch-Epilogue 握手屏障
+        //
+        // 目的：dispatch线程和epilogue线程共享同一个CTA，但执行不同的流水线阶段。
+        // 这个屏障确保dispatch线程完成NVLink barrier后，epilogue线程才继续执行，
+        // 反之亦然。防止以下竞态：
+        //   - dispatch线程在拉取数据时，epilogue线程可能还在使用shared memory做
+        //     上一个iter的combine归约，两者可能写冲突
+        //   - dispatch线程还没完成拉取，epilogue线程就开始消费尚未就绪的数据
+        //
+        // 为什么用 sync_unaligned 而非 sync_aligned：
+        //   参与同步的线程数 = kNumDispatchThreads + kNumEpilogueThreads，
+        //   kNumEpilogueThreads可能不是32的倍数，不满足bar.sync的对齐要求，
+        //   因此使用 barrier.sync（unaligned版本）
+        //
+        // kDispatchWithEpilogueBarrierIdx = 1：使用第1号barrier资源，
+        //   与第0号(kDispatchBarrierIdx，仅dispatch线程间)互不干扰
+        //
+        // 该屏障在整个kernel中被多次使用，形成dispatch和epilogue之间的流水线握手：
+        //   第1次(此处): dispatch拉取前，等待epilogue就绪
+        //   第2次(859行): dispatch清理workspace前，等待epilogue完成
+        //   第3次(1294行): L2 GEMM的dispatch拉取前
+        //   第4次(1664行): combine归约前，等待dispatch完成
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Pull token data and SF from remote ranks into local L1 buffer
@@ -649,28 +711,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
-        // Cache expert token counts in registers (same pattern as scheduler)
+        // 从全局workspace缓存每个本地expert的token接收总数到warp级寄存器
+        // fetch_expert_recv_count() 内部流程：
+        //   1. 每个lane负责缓存 expert (i*32 + lane_idx) 的计数
+        //   2. 自旋等待 workspace.expert_recv_count_sum 高32位 == kNumSMs * kNumRanks
+        //      （确保所有rank的计数都已汇总完毕）
+        //   3. 取低32位 = 该expert从所有rank接收到的token总数
+        //   4. 存入 stored_num_tokens_per_expert[]，后续 get_num_tokens() 直接查寄存器
+        // NVLink barrier已保证此处数据就绪
         scheduler.fetch_expert_recv_count();
 
         // Per-rank counts for current expert (re-loaded when expert changes)
+        // kNumRanksPerLane: 每个lane需要缓存的rank数（向上取整到32的倍数）
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx = -1;
-        uint32_t stored_rank_count[kNumRanksPerLane] = {};
-        uint32_t expert_start_idx = 0, expert_end_idx = 0;
-        uint32_t expert_pool_block_offset = 0;
+        uint32_t stored_rank_count[kNumRanksPerLane] = {};  // 当前expert每个rank的token计数，expert切换时重新加载
+        uint32_t expert_start_idx = 0, expert_end_idx = 0;  // 当前expert在全局token索引空间中的区间 [start, end)
+        uint32_t expert_pool_block_offset = 0;              // 当前expert在L1 token pool中的BLOCK_M块偏移
 
+        // 所有dispatch warp跨SM轮询拉取token，全局token索引空间按expert紧凑排列
+        // 例: expert0收到10个token → 区间[0,10), expert1收到5个 → [10,15), expert2收到8个 → [15,23)
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
-            // Advance expert until within the range
+            // 在全局token索引空间中推进expert，直到找到token_idx所属的expert区间
+            // 所有本地expert的token按顺序紧凑排列，while循环递推 [expert_start_idx, expert_end_idx)
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
                 if (++ current_expert_idx >= kNumExpertsPerRank)
                     break;
 
-                // Update pool block offset for the new expert
+                // 更新当前expert在pool中的块偏移（上一个expert的token数按BLOCK_M向上取整）
                 expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
 
-                // Move start and end to the next expert
+                // 推进到下一个expert的区间
+                // get_num_tokens() 从寄存器缓存取值，不访问全局内存
                 expert_start_idx = expert_end_idx;
                 expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
             }
@@ -680,6 +754,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 break;
 
             // Load per-rank counts when expert changes
+            // expert切换时，从workspace加载该expert各rank的接收计数到寄存器
+            // 每个lane负责 j = i*32 + lane_idx 的rank，不足的填0
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
                 #pragma unroll
@@ -869,6 +945,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             /* Before the NVLink barrier, there is a grid sync */ true,
             /* At the end of kernel does not need to sync */ false
         );
+
+        
     } else if (warp_idx == kNumDispatchWarps) {
         // ============================================================
         // 【MMA Load Warp A - 加载Tokens和SFA】
@@ -1247,7 +1325,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(STORE_BLOCK_M % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
 
-        // Ensure the epilogue barrier cannot run with the pull barrier
+        // Dispatch-Epilogue 握手屏障
+        //
+        // 目的：dispatch线程和epilogue线程共享同一个CTA，但执行不同的流水线阶段。
+        // 这个屏障确保dispatch线程完成NVLink barrier后，epilogue线程才继续执行，
+        // 反之亦然。防止以下竞态：
+        //   - dispatch线程在拉取数据时，epilogue线程可能还在使用shared memory做
+        //     上一个iter的combine归约，两者可能写冲突
+        //   - dispatch线程还没完成拉取，epilogue线程就开始消费尚未就绪的数据
+        //
+        // 为什么用 sync_unaligned 而非 sync_aligned：
+        //   参与同步的线程数 = kNumDispatchThreads + kNumEpilogueThreads，
+        //   kNumEpilogueThreads可能不是32的倍数，不满足bar.sync的对齐要求，
+        //   因此使用 barrier.sync（unaligned版本）
+        //
+        // kDispatchWithEpilogueBarrierIdx = 1：使用第1号barrier资源，
+        //   与第0号(kDispatchBarrierIdx，仅dispatch线程间)互不干扰
+        //
+        // 该屏障在整个kernel中被多次使用，形成dispatch和epilogue之间的流水线握手：
+        //   第1次(此处): dispatch拉取前，等待epilogue就绪
+        //   第2次(859行): dispatch清理workspace前，等待epilogue完成
+        //   第3次(1294行): L2 GEMM的dispatch拉取前
+        //   第4次(1664行): combine归约前，等待dispatch完成
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Persistently schedule over blocks
