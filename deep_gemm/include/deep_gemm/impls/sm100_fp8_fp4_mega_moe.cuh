@@ -543,7 +543,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
         // Dispatch warps
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
-        constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
+        // kNumTokensPerWarp = 32 / kNumTopk
+        constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk; // kNumActivateLanes = 32
         const auto read_topk_idx = [&](const auto& process) {
             // TODO: figure out better unrolling
             // Now, `unroll` is better than `unroll 8`
@@ -553,6 +554,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                  i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
                 // Allocate slots for each token-topk
                 int expert_idx = -1;
+                // ⚠️ 一个warp一次处理多个token的topk
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
                     expert_idx = static_cast<int>(
                         __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
@@ -590,6 +592,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         //
         #pragma unroll
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+            // ⚠️  高位 + 1
             const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
             smem_expert_count[i] = static_cast<uint32_t>(
                 ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
@@ -642,9 +645,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                // ⚠️ get_expert_recv_count_ptr(j, current_expert_idx) 记录的既是 rank 又是 expert——它是一个二维表，
+                // 语义是 "第 j 个 rank 发给当前本地第 current_expert_idx 个 expert 的 token 数"。
+                /*
+                Workspace 内存布局（连续排列）：
+                ┌────────────────────────────────────────────────────────────┐
+                │ expert_send_count[0..num_experts-1]                        │
+                │   含义：全局第 i 个 expert 从本 rank 发出去了多少 token       │
+                │   维度：num_experts × uint64                                │
+                │   写入：dispatch 阶段本 rank 统计后写入                      │
+                ├────────────────────────────────────────────────────────────┤
+                │ expert_recv_count[0..num_ranks-1][0..num_experts_per_rank-1]│
+                │   含义：第 j 个 rank 发给本 rank 第 e 个本地 expert 的 token数│
+                │   维度：num_ranks × num_experts_per_rank × uint64           │
+                │   写入：其他 rank 通过 NVLink 远端写入（mapped address）      │
+                ├────────────────────────────────────────────────────────────┤
+                │ expert_recv_count_sum[0..num_experts_per_rank-1]           │
+                │   含义：本 rank 第 e 个本地 expert 从所有 rank 接收的 token 总数│
+                │   维度：num_experts_per_rank × uint64                       │
+                │   写入：其他 rank 通过 atomic_add 远端累加                    │
+                └────────────────────────────────────────────────────────────┘
+                */
+                
+                // ⚠️ All 2 All --> 得到每个rank发来的expert count数据 
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
+                // ⚠️ Reduce-Scatter，相当于对上面A2A的结果按rank累加，得到expert recv count sum
                 ptx::atomic_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
@@ -656,7 +683,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         //
         // 目的：跨所有rank的NVLink屏障同步，确保所有rank都完成了expert count写入后，
         // 才开始拉取(pull)阶段。否则某rank可能读到其他rank尚未写入完毕的expert计数和源索引。
-        //
         // 执行流程（3步）：
         //   1. [sync_prologue=false] 跳过grid sync — 因为上方的barrier已经保证了CTA内部同步，
         //      且Write expert count阶段只有SM0参与写入，其他SM不会产生写冲突
@@ -668,9 +694,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         //      跨rank同步后，再通知其他SM可以安全进入拉取阶段
         //
         // 模板参数：
-        //   kNumRanks  - 参与同步的rank数
-        //   kNumSMs    - 每个rank的SM数
-        //   kNumDispatchThreads - 每个CTA的dispatch线程数
         //   kDispatchGridSyncIndex - grid sync使用的计数器索引
         //   kBeforeDispatchPullBarrierTag - 屏障标签，区分不同阶段的NVLink barrier
         //
@@ -708,10 +731,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
         // Pull token data and SF from remote ranks into local L1 buffer
         uint32_t pull_mbarrier_phase = 0;
+        // ⚠️ 一个warp一个smem，配一个mbarrier
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
-        // 从全局workspace缓存每个本地expert的token接收总数到warp级寄存器
+        // ⚠️从全局workspace缓存每个本地expert的token接收总数到warp级寄存器
         // fetch_expert_recv_count() 内部流程：
         //   1. 每个lane负责缓存 expert (i*32 + lane_idx) 的计数
         //   2. 自旋等待 workspace.expert_recv_count_sum 高32位 == kNumSMs * kNumRanks
@@ -725,95 +749,160 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         // kNumRanksPerLane: 每个lane需要缓存的rank数（向上取整到32的倍数）
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int current_expert_idx = -1;
-        uint32_t stored_rank_count[kNumRanksPerLane] = {};  // 当前expert每个rank的token计数，expert切换时重新加载
+        // ⚠️ per-lane级存储，所有rank发送到本rank的当前这个expert的token count
+        uint32_t stored_rank_count[kNumRanksPerLane] = {}; 
         uint32_t expert_start_idx = 0, expert_end_idx = 0;  // 当前expert在全局token索引空间中的区间 [start, end)
         uint32_t expert_pool_block_offset = 0;              // 当前expert在L1 token pool中的BLOCK_M块偏移
 
         // 所有dispatch warp跨SM轮询拉取token，全局token索引空间按expert紧凑排列
         // 例: expert0收到10个token → 区间[0,10), expert1收到5个 → [10,15), expert2收到8个 → [15,23)
+        // ⚠️ 按本rank的expert顺序排序token，token_idx是顺序索引
+        // ⚠️ 已有每个expert的recv count
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
             // 在全局token索引空间中推进expert，直到找到token_idx所属的expert区间
             // 所有本地expert的token按顺序紧凑排列，while循环递推 [expert_start_idx, expert_end_idx)
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
-                if (++ current_expert_idx >= kNumExpertsPerRank)
+                if (++ current_expert_idx >= kNumExpertsPerRank) 
                     break;
 
                 // 更新当前expert在pool中的块偏移（上一个expert的token数按BLOCK_M向上取整）
+                // ⚠️ math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M) 表示当前expert会被分为几个BLOCK_M块
+                // ⚠️ expert_pool_block_offset 表示这个expert的最后一块block的全局偏移
                 expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
-
-                // 推进到下一个expert的区间
-                // get_num_tokens() 从寄存器缓存取值，不访问全局内存
+  
                 expert_start_idx = expert_end_idx;
+                // ⚠️ 获取当前expert的recv count sum
                 expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
             }
-
+ 
             // Finish all tokens
             if (current_expert_idx >= kNumExpertsPerRank)
                 break;
 
             // Load per-rank counts when expert changes
-            // expert切换时，从workspace加载该expert各rank的接收计数到寄存器
-            // 每个lane负责 j = i*32 + lane_idx 的rank，不足的填0
+            // ⚠️expert切换时，从workspace加载该expert各rank的接收计数到寄存器
+            // ⚠️ per-lane级存储，所有rank发送到本rank的当前这个expert的token count
             if (old_expert_idx != current_expert_idx) {
-                old_expert_idx = current_expert_idx;
+                old_expert_idx = current_expert_idx; 
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     // TODO: this is not coalesced
+                    // ⚠️ get_expert_recv_count_ptr(j, current_expert_idx) 记录的既是 rank 又是 expert——它是一个二维表，
+                    // 语义是 "第 j 个 rank 发给当前本地第 current_expert_idx 个 expert 的 token 数"。
                     stored_rank_count[i] = j < kNumRanks ?
                         static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
                 }
             }
 
+            // ========================================================================
             // Round-robin rank selection via iterative min-peeling
+            // ========================================================================
+            // 目标：将 GEMM 调度器分配的全局 token 索引解码为 (rank, token_in_rank) 二元组
+            //
+            // 背景：当前 expert 的 token 来自多个 rank，各 rank 贡献数量不同。
+            //       例如 4 个 rank 分别发了 5, 3, 7, 2 个 token：
+            //         Rank 0: █████         (5 tokens)
+            //         Rank 1: ███           (3 tokens)
+            //         Rank 2: ███████       (7 tokens)
+            //         Rank 3: ██            (2 tokens)
+            //
+            //       MegaMoE 按轮序交错排列 token（而非把同一 rank 连续放在一起），
+            //       使不同 rank 的 token 在 GEMM 中交替处理，TMA 拉取延迟互相掩盖：
+            //         Round 1 (length=2, min of all): R0 R1 R2 R3 R0 R1 R2 R3  ← 2×4=8
+            //         Round 2 (length=1, min of remaining): R0 R2                ← 1×2=2
+            //         Round 3 (length=2, min of remaining): R0 R2 R0 R2          ← 2×2=4
+            //
+            //       每轮"剥掉"所有活跃 rank 的最小公共量（min-peeling），
+            //       保证同一轮内所有活跃 rank 的 token 数相同，形成整齐的轮序。
+            // ========================================================================
+
+            // 输出：当前 token 所属的 rank 索引
             uint32_t current_rank_in_expert_idx;
+
+            // remaining[]: 每 lane 负责若干 rank，记录每个 rank 当前还有多少 token 未排位
+            // 初始化为该 expert 从各 rank 接收到的 token 计数
             uint32_t remaining[kNumRanksPerLane];
             #pragma unroll
             for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                 remaining[i] = stored_rank_count[i];
+
+            // offset: 前几轮已排掉的 token 行数（按单 rank 计，即每轮的 length 累加）
             uint32_t offset = 0;
+
+            // token_idx_in_expert: 当前 token 在该 expert 内的相对位置（0-based）
             uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+
+            // slot_idx: 当前还剩余多少位置需要跳过才能找到目标 token
+            //           每跳过一个 round 就减去该 round 的 token 数
             uint32_t slot_idx = token_idx_in_expert;
+
+            // 输出：当前 token 在其所属 rank 内的位置（0-based）
             uint32_t token_idx_in_rank;
+
             while (true) {
-                // Compute active count and min across all ranks
-                // NOTES: reduce within each lane first, then warp-reduce once
-                uint32_t num_actives_in_lane = 0;
-                uint32_t min_in_lane = 0xffffffff;
+                // ---- Step 1: 统计本轮信息 ----
+                // 计算还有多少个 rank 有剩余 token，以及这些 rank 中的最小剩余量
+                // ⚠️  本 lane 负责的 rank 中还有剩余的个数没发过来
+                uint32_t num_actives_in_lane = 0;    
+                // 本 lane 负责的 rank 中的最小剩余量
+                uint32_t min_in_lane = 0xffffffff;   
+
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    num_actives_in_lane += remaining[i] > 0;
+                    // 统计有剩余的 rank 数
+                    num_actives_in_lane += remaining[i] > 0;    
                     if (remaining[i] > 0)
-                        min_in_lane = cute::min(min_in_lane, remaining[i]);
+                        min_in_lane = cute::min(min_in_lane, remaining[i]);  // 求最小剩余
                 }
+
+                //  ⚠️ num_active_ranks: 本轮还有 token 的 rank 数
+                // ⚠️ length: 本轮可以排多少行（取所有活跃 rank 的最小剩余量）
                 const uint32_t num_active_ranks = __reduce_add_sync(0xffffffff, num_actives_in_lane);
                 const uint32_t length = __reduce_min_sync(0xffffffff, min_in_lane);
+                
 
-                // Hit in the current round
+
+
+                // ---- Step 2: 判断目标 token 是否在本轮内 ----
+                // 本轮的 token 排列：length 行 × num_active_ranks 列（每列一个 rank）
                 const uint32_t num_round_tokens = length * num_active_ranks;
+
                 if (slot_idx < num_round_tokens) {
+                    // 目标 token 在本轮内，解码为 (rank, token_in_rank)
+
+                    // slot_idx_in_round: 目标 token 在本轮中的列序号（即 rank 序号）
                     const uint32_t slot_idx_in_round = slot_idx % num_active_ranks;
                     uint32_t num_seen_ranks = 0;
                     current_rank_in_expert_idx = 0;
+
+                    // 通过 __ballot + __fns 定位第 slot_idx_in_round 个活跃 rank
+                    // __ballot: 收集 warp 内所有 lane 的 remaining[i]>0 位掩码
+                    // __fns: 在掩码中找第 N 个置位的 bit（即第 N 个活跃 rank 的 lane 位置）
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                         const uint32_t mask = __ballot_sync(0xffffffff, remaining[i] > 0);
                         const uint32_t num_active_lanes = __popc(mask);
                         if (slot_idx_in_round >= num_seen_ranks and slot_idx_in_round < num_seen_ranks + num_active_lanes)
+                            // i*32 + __fns(...) = 全局 rank 索引
                             current_rank_in_expert_idx = i * 32 + __fns(mask, 0, slot_idx_in_round - num_seen_ranks + 1);
                         num_seen_ranks += num_active_lanes;
                     }
+
+                    // token_idx_in_rank: 目标 token 在其所属 rank 内的行号
+                    // offset 是前几轮已排掉的行数，slot_idx / num_active_ranks 是本轮内的行号
                     token_idx_in_rank = offset + (slot_idx / num_active_ranks);
                     break;
                 }
 
-                // Move into the next round
-                slot_idx -= num_round_tokens;
-                offset += length;
+                // ---- Step 3: 目标 token 不在本轮，跳过本轮 ----
+                slot_idx -= num_round_tokens;   // 减去本轮的 token 数
+                offset += length;                // 累加本轮排掉的行数
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                    // 扣除本轮消耗的 length 个 token；已耗尽的 rank 自动变 0
                     remaining[i] -= cute::min(remaining[i], length);
             }
 

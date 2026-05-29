@@ -66,13 +66,29 @@ struct MegaMoEScheduler {
         return math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
     }
 
+    // ========================================================================
+    // get_num_tokens(): 查询本地第 expert_idx 个 expert 接收到的 token 总数
+    // ========================================================================
+    // 数据来源：寄存器数组 stored_num_tokens_per_expert[]，由 fetch_expert_recv_count() 填充
+    // 存储布局：每 lane 负责 expert (i*32 + lane_idx) 的计数（warp 级分片）
+    //
+    // 查询方式：
+    //   1. 当前 lane 检查 expert_idx 是否落在自己负责的范围 (i*32 + lane_idx)
+    //   2. 命中的 lane 从自己的 stored_num_tokens_per_expert[i] 取值到 valid_value
+    //   3. ptx::exchange(valid_value, lane_idx) 在 warp 内按 lane_idx 做洗牌，
+    //      将持有目标 expert 数据的 lane 的 valid_value 广播到所有 lane
+    // ========================================================================
     CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
         uint32_t valid_value;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            // 只有负责 expert_idx == i*32 + lane_idx 的 lane 会更新 valid_value
+            // 其他 lane 的 valid_value 保持原值（但最终只有命中 lane 的值会被 exchange 取走）
             valid_value = (expert_idx == i * 32 + ptx::get_lane_idx()) ?
                 stored_num_tokens_per_expert[i] : valid_value;
         }
+        // ptx::exchange: 等价于 __shfl_sync，将 lane (expert_idx % 32) 的 valid_value 广播到所有 lane
+        // 因为 expert_idx 对应的数据恰好存储在 lane_idx == expert_idx % 32 的 lane 上
         return ptx::exchange(valid_value, expert_idx % 32);
     }
 
@@ -180,6 +196,25 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
+    // ========================================================================
+    // fetch_expert_recv_count(): 从 workspace 读取每个本地 expert 的 token 接收总数
+    // ========================================================================
+    // 填充 stored_num_tokens_per_expert[]，供后续 get_num_tokens() 查询
+    //
+    // 数据来源：workspace 中的 expert_recv_count_sum[expert_idx]
+    //   - 低 32 位：该 expert 从所有 rank 接收到的 token 总数（dispatch 阶段各 rank 原子累加）
+    //   - 高 32 位：原子累加的次数（达到 kNumSMs * kNumRanks 表示所有 SM 的 dispatch 都已完成）
+    //
+    // 存储布局：warp 级分片
+    //   - 每个 lane 负责 expert (i*32 + lane_idx) 的计数
+    //   - 例如 48 个 expert / 32 lanes = 每 lane 负责 2 个 expert (kNumExpertsPerLane=2)
+    //     lane 0: expert 0, 32;  lane 1: expert 1, 33;  ...  lane 15: expert 15, 47
+    //
+    // 同步机制：自旋等待高 32 位 == kNumSMs * kNumRanks
+    //   - kNumSMs 个 SM 各自做一轮 dispatch 写入，每个 SM 写入时高 32 位 +1
+    //   - kNumRanks 个 rank 各自做一轮，每个 rank 的写入也 +1
+    //   - 当计数达到 kNumSMs * kNumRanks 时，说明所有 rank 的所有 SM 都已完成写入
+    // ========================================================================
     CUTLASS_DEVICE void fetch_expert_recv_count() {
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
@@ -187,10 +222,13 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
+                do { 
+                    // volatile 读：确保每次循环都从内存读取最新值，不被缓存
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                // 自旋等待：高 32 位 == kNumSMs * kNumRanks 表示所有 dispatch 都已完成
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
+            // 取低 32 位 = 该 expert 接收到的 token 总数
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
