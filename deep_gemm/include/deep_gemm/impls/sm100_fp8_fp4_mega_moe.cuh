@@ -288,6 +288,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
 
+
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
     constexpr uint32_t LAYOUT_AD_M = 128;
@@ -1012,7 +1013,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                 // Wait for token TMA store to complete
                 cute::tma_store_arrive();
                 ptx::tma_store_wait<0>();
-                ptx::red_add_rel(
+
+                // 生产者 (Dispatch warp, 第 1015 行):
+                ptx::red_add_rel( //带 release 语义的原子加，确保 token 数据写入对 GEMM 可见
                     workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
             }
             __syncwarp();
@@ -1130,13 +1133,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
             const auto shape_sfa_k = math::ceil_div(shape_k, kGranK * 4u);
 
             // Compute pool block offset for this expert
+            // ⚠️ 全局m block idx
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
 
             // Wait the entire token arrival for linear 1
             if (block_phase == sched::BlockPhase::Linear1) {
+                // 消费者 (GEMM warp, 第 1136-1139 行):
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                const auto expected = scheduler.template get_valid_m<false>();
-                while (ptx::ld_acq(ptr) != expected);
+                const auto expected = scheduler.template get_valid_m<false>();// 当前 block 期望的 token 数
+                while (ptx::ld_acq(ptr) != expected);// 自旋等待，带 acquire 语义的加载，确保能看到 dispatch 写入的数据
+
             } else {
                 // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
                 // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
@@ -1146,14 +1152,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                 // due to small `num_experts_per_rank`, we may need to add it back or add a switch
                 DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
                 const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                
                 // NOTES: Equivalent to `(1ull << (2 * num_k_blocks)) - 1`, but split into two shifts
                 // to avoid undefined behavior when `num_k_blocks == 32`
+
+                // 低 2*num_k_blocks 位全 1
+                // L2 的输入是 L1 的输出（中间激活），L1 按 K 维度分块写出，每个 K 块对应一个 bit。
+                // 因为 BLOCK_K == BLOCK_N，L1 输出的 block N 被拆成 BLOCK_K/2 大小，所以 L1 每写完一个 K block，L2 需要等 2 个子块到位，即 2 * num_k_blocks 个 bit 全部置 1。
                 const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
                 while (ptx::ld_acq_gpu(ptr) != expected);
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait consumer release
+                // ⚠️ Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
                 // Compute token offset from pool block index
@@ -1168,10 +1179,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
+                    // BLOCK_K (=128)	内维（K方向）的块大小
+                    // LOAD_BLOCK_M	外维（M方向）的块大小，即一次加载的 token 行数
+                    // kSwizzleAMode	smem 的 swizzle 模式，用于避免 bank conflict
+                    // a_dtype_t	数据类型（FP8 e4m3/e5m2）
+                    // tensor_map_a_ptr	TMA tensor map 描述符（指向 HBM 中 A 矩阵的布局信息）
+                    // k_idx = k_block_idx * BLOCK_K	内维起始偏移（从第几个 K 元素开始读）
+                    // m_idx = pool_block_idx * BLOCK_M	外维起始偏移（从第几个 token 行开始读）
+                    // ⚠️num_tma_multicast	2	2-CTA multicast：2 个 CTA（leader + non-leader）共享同一笔 TMA 传输，数据只需从 HBM 读一次，写入两个 CTA 的 smem
+                    //                          这是 SM100 的 2SM TMA Load 特性，同一个 128×LOAD_BLOCK_M 的 tile 只需从 HBM 搬一次，两个 CTA 同时收到，节省带宽。
+                    // ⚠️LOAD_BLOCK_M = BLOCK_M / 2，因为 2-CTA multicast 模式下，leader CTA 和 non-leader CTA 各负责 BLOCK_M 的一半（第 1176-1177 行 non-leader 会加偏移 get_valid_m<true>() / 2），所以每个 CTA 只需从 HBM 加载半行，两份拼起来就是完整的 BLOCK_M 行。
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2);
+
+                    // K 方向，总共有 kHidden/128 行（每 128 个元素 = 4 个 SF 组合为 1 个 uint32_t）
+                    // sfa_m_idx = pool_block_idx * SF_BLOCK_M：M 方向偏移（token 行）
+                    // sfa_k_idx = k_block_idx：K 方向偏移（哪一行 SF）
+                    // 所以 SFA 的 TMA 是一次加载 SF_BLOCK_M 个连续 token 在同一个 K 位置的 SF 值，正好对应 UTCCP 一次搬运 128 个 SF 的需求。
                     tma::copy<SF_BLOCK_M, 1, 0>(
                         tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
+
                     if (is_leader_cta) {
                         full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE * 2 + SF_BLOCK_M * sizeof(uint32_t) * 2);
                     } else {
@@ -1218,16 +1245,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
             const auto shape_k = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_K : L1_SHAPE_K;
             const auto shape_n = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
+
+            // ⚠️ 同理 A 和 B 的 SF 量化粒度是一样的：1 SF / 32 元素，4 个 SF 打包为 1 个 uint32。
+            // ⚠️ A 和 B 的 shape_sf*_k 含义完全相同——都是 K 方向的 SF uint32 行数 = ceil(shape_k / 128)。
             const auto shape_sfb_k = math::ceil_div(shape_k, kGranK * 4u);
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait consumer release
+                // ⚠️ Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
                 // Compute weight offset
                 uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
+                // ⚠️ 权重数据在 HBM 中是 [num_experts, shape_n, shape_k] 布局，第 local_expert_idx 个 expert 的权重从 local_expert_idx * shape_n 开始。
+                // ⚠️ SFB（权重的 SF）同理，在 HBM 中也是按 expert 分区：[num_experts, shape_sfb_k, shape_sfb_n]。
+                // 第 local_expert_idx 个 expert 的 SF 从 local_expert_idx * shape_sfb_k 行开始，再加上当前 K 块偏移 k_block_idx。
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+                // BLOCK_K = 128 对应4个ScaleingFactors，包装成一个uint32
                 uint32_t sfb_k_idx = local_expert_idx * shape_sfb_k + k_block_idx;
 
                 // TMA copy weights with SF
@@ -1492,9 +1526,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            // Wait UMMA arrival
+            // ⚠️  Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+            // ⚠️ wait TMEM
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
             ptx::tcgen05_after_thread_sync();
 
@@ -1615,6 +1650,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                         amax_values[i].y = math::warp_reduce<4, true>(
                             cute::max(cute::abs(swiglu_values[i * 2 + 0].y), cute::abs(swiglu_values[i * 2 + 1].y)),
                             math::ReduceMax<float>());
+
+                        // ⚠️smem_amax_reduction 的含义
+                        // 这是 L1 epilogue 阶段用于 amax（绝对值最大值）跨 warp 归约的共享内存。
+                        // 用途是计算每个 ATOM_M（8行）的缩放因子 SF——要量化成 FP8 输出，需要知道每组的最大绝对值。
                         if (lane_idx < 4)
                             smem_amax_reduction[epilogue_warp_idx * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx] = amax_values[i];
                         __syncwarp();
@@ -1655,9 +1694,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
                         // Store SF to `l2_sf_buffer` as UE8M0 (MN-major layout)
                         // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
-                        // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
+                        // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)  
                         if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                            const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2;
+                            const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2; 
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
@@ -1670,7 +1709,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                             //   2. `lane_idx * 2` controls the lowest 3 bit of `token_idx_in_expert`, and `transform_sf_token_idx` is a bitwise-independent transformation if the input is less than `BLOCK_M`, so we can put `lane_idx * 2` outside
                             // This reduce the number of computation instructions.
                             const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
-                            __builtin_assume(token_base_idx < BLOCK_M);
+                            __builtin_assume(token_base_idx < BLOCK_M); 
                             const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
                                 + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
                             const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
@@ -1709,6 +1748,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     );
                 }
                 __syncwarp();
+                
             } else {
                 // ============================================================
                 // 【L2 Epilogue - 结果写回与Combine】

@@ -27,7 +27,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
           typename epilogue_type_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
-sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
+sm100_fp8_gemm_1d1d_impl(int* grouped_layout, 
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_b,

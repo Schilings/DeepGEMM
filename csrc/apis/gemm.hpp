@@ -45,13 +45,13 @@ static bool early_return(const int& m, const int &n, const int& k,
     return false;
 }
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+//#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 
-static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
-                            const std::pair<torch::Tensor, torch::Tensor>& b,
-                            const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            std::optional<std::tuple<int, int, int>> recipe,
+static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a, //A 矩阵：FP8 e4m3 数据 + 对应 SF
+                            const std::pair<torch::Tensor, torch::Tensor>& b, //B 矩阵：FP4 e2m1 数据 + 对应 SF
+                            const torch::Tensor& d, //输出，BF16 或 FP32
+                            const std::optional<torch::Tensor>& c, //可选，加到 D 上的偏置
+                            std::optional<std::tuple<int, int, int>> recipe, //SF 量化粒度，如 (1,1,32) 表示 K 方向每 32 元素共享 1 个 SF
                             std::optional<std::tuple<int, int>> recipe_a,
                             std::optional<std::tuple<int, int>> recipe_b,
                             const std::string& compiled_dims,
@@ -361,7 +361,7 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
-#endif
+//#endif
 
 #if DG_TENSORMAP_COMPATIBLE
 static void bf16_gemm_nt(const torch::Tensor& a,
