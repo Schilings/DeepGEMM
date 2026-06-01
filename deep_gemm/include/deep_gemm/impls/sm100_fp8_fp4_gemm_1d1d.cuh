@@ -66,7 +66,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,            // 分组 GEMM 的�
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,  // A 的缩放因子(SFA)的 TMA tensor map
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,  // B 的缩放因子(SFB)的 TMA tensor map
                              const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {  // 输出 C/D 矩阵的 TMA tensor map
-#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+//#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     // 2-CTA multicast 需要 2Sm TMEM 分配器，单 CTA 用 1Sm 分配器
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
@@ -596,11 +596,11 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,            // 分组 GEMM 的�
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
 
-#else
-    if (blockIdx.x == 0 and threadIdx.x == 0)
-        DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
-#endif
-}
+// #else
+//     if (blockIdx.x == 0 and threadIdx.x == 0)
+//         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
+// #endif
+// }
 
 };  // namespace deep_gemm
 
