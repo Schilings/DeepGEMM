@@ -129,18 +129,84 @@ struct Scheduler {
         }
     }
 
+    // ========================================================================
+    // get_global_idx — 将逻辑块索引转换为全局内存偏移
+    // ========================================================================
+    // 模板参数：
+    //   kWithGroupOffset — 是否需要加上分组偏移（多 expert 拼接时的跨组地址跳转）
+    //                      调用方根据当前 GEMM 类型决定是否需要，如 MGroupedMasked 需要，
+    //                      Normal 则不需要（编译期优化掉）
+    //   kIndexType       — 索引类型，决定偏移计算方式：
+    //                      MN   = M/N 维度（按 shape_dim 跳转）
+    //                      K    = K 维度（按 K 累计和跳转）
+    //                      SF_K = SF 的 K 维度（按 SF_K 累计和跳转）
+    //
+    // 函数参数：
+    //   shape_dim   — 该维度总大小（如 shape_m / shape_n / shape_k）
+    //   block_size  — 每个块的该维度大小（如 BLOCK_M / BLOCK_N / BLOCK_K）
+    //   block_idx   — 当前块在组内的逻辑索引
+    //   m_block_idx — M 方向块索引（仅 MGroupedContiguous 需要，用于查找该行所属 expert）
+    //
+    // 返回值：全局内存中的元素偏移量（单位：元素个数）
+    // ========================================================================
+    //-
+    // `kGemmType` 有 6 种值，对应不同的**矩阵组织方式**：
+    // ### 6 种 GEMM 类型
+    // |                    类型               |               含义            |                     典型场景                                      |
+    // | **Normal**                           | 单次矩阵乘 C=A×B               | 单个大矩阵乘法                                                     |
+    // | **MGroupedContiguous**               | M 维分组，**连续拼接**          | MoE 推理：多个 expert 的 token 在 M 方向拼成一个大矩阵              |
+    // | **MGroupedMasked**                   | M 维分组，**独立存储+掩码**     | MoE 推理：每个 expert 矩阵独立，用掩码标记哪些 token 属于哪个 expert |
+    // | **KGroupedContiguous**               | K 维分组，连续拼接              | 多组权重在 K 方向拼接（如 gate+up 拼接后一次算完）                   |
+    // | **Batched**                          | Batch 矩阵乘：多个独立的小矩阵乘 | Batch MatMul，每个 batch 独立的 A×B                                |
+    // | **MGroupedContiguousWithPsumLayout** | MGroupedContiguous + Psum 布局 | MoE 训练：需要部分和累加的场景                                      |
+
+    // ### 核心区别图示
+    // Normal:           一个 [M,K] × [K,N] → [M,N]
+    // MGroupedContiguous:  [M0+M1+M2, K] × [K, N] → [M0+M1+M2, N]
+    //                      ↑ 所有 expert 的 token 连续拼在一起，共享同一个 B
+    // MGroupedMasked:      expert0: [M0,K]×[K,N]   expert1: [M1,K]×[K,N]
+    //                      ↑ 每个 expert 独立存储，通过 group_idx 索引不同的 B
+    // KGroupedContiguous:  [M, K0+K1] × [K0+K1, N] → [M, N] (分两次累加)
+    //                      ↑ K 方向多组拼接，如 SwiGLU 的 gate+up
+    // Batched:             batch0: [M,K]×[K,N]   batch1: [M,K]×[K,N]
+    //                      ↑ 完全独立的多次矩阵乘
+
+    // 不同类型影响：
+    // 1. **调度方式**：MGrouped 需要按 expert 分配 tile，Normal 直接线性扫描
+    // 2. **内存寻址**：MGroupedContiguous 需要 `grouped_layout` 查 expert 编号，MGroupedMasked 用 `current_group_idx` 跳转
+    // 3. **SF 加载**：KGrouped 的 SF 在 K 方向按累计和偏移
+    // 4. **Epilogue**：MGroupedMasked 的输出需要写回各 expert 独立的位置
     template <bool kWithGroupOffset, IndexType kIndexType = IndexType::MN>
     __device__ __forceinline__ uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
                                                        const uint32_t& block_idx, const uint32_t& m_block_idx = 0) {
         if constexpr (kGemmType == GemmType::Normal) {
+            // 普通矩阵乘：无需分组偏移，直接 块号 × 块大小
+            // 例：m_block_idx=3, BLOCK_M=128 → 返回 384
             return block_idx * block_size;
+
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+            // M 分组连续布局：多个 expert 的矩阵在 M 方向连续拼接
+            // 需要先查出当前行属于哪个 expert（offset），再跳到该 expert 的区域
+            // grouped_layout[m_block_idx * BLOCK_M] 存的是该 token 对应的 expert 编号
+            // offset * shape_dim 跳过前面 offset 个 expert 的所有行
+            // 例：expert=2, shape_m=4096, m_block_idx=3, BLOCK_M=128
+            //     → 2*4096 + 3*128 = 8192 + 384 = 8576
             const auto offset = kWithGroupOffset ? cute::max(0, __ldg(grouped_layout + m_block_idx * BLOCK_M)) : 0;
             return offset * shape_dim + block_idx * block_size;
+
         } else if constexpr (kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
+            // M 分组掩码布局：每个 expert 的矩阵独立存储，通过 current_group_idx 索引
+            // current_group_idx 是调度器维护的当前 expert 编号
+            // offset * shape_dim 跳过前 offset 个 expert 的矩阵区域
             const auto offset = kWithGroupOffset ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
+
         } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+            // K 分组连续布局：多个 GEMM 在 K 方向拼接
+            // 不同 IndexType 的偏移方式不同：
+            //   MN   — 组号 × 维度大小（同 MGroupedMasked）
+            //   K    — K 累计和（前面各组 K 维度之和，因为每组 K 大小可能不同）
+            //   SF_K — SF 的 K 累计和（类似 K，但粒度不同）
             auto offset = 0;
             if constexpr (kWithGroupOffset) {
                 if constexpr (kIndexType == IndexType::MN)
@@ -151,8 +217,10 @@ struct Scheduler {
                     offset = current_sf_k_cumsum;
             }
             return offset + block_idx * block_size;
+
         } else if constexpr (kGemmType == GemmType::Batched) {
-            // Ignore kWithGroupOffset, and apply offset for IndexType::SF_K
+            // Batch 矩阵乘：各矩阵独立，M/N 维度无需偏移
+            // 仅 SF_K 类型需要按 batch 索引偏移（SF 按 batch 分区存储）
             const auto offset = kIndexType == IndexType::SF_K ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
         }
