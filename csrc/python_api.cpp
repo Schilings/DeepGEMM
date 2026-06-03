@@ -1,13 +1,17 @@
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
+#include "apis/ag_gemm.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
+#include "apis/gemm_rs.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega.hpp"
+
 #include "apis/runtime.hpp"
+
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -22,7 +26,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::einsum::register_apis(m);
     deep_gemm::hyperconnection::register_apis(m);
     deep_gemm::gemm::register_apis(m);
+    deep_gemm::gemm_rs::register_apis(m);
     deep_gemm::layout::register_apis(m);
+
     deep_gemm::mega::register_apis(m);
     deep_gemm::runtime::register_apis(m);
 }

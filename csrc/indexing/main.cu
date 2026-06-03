@@ -28,6 +28,16 @@
 // Mega kernels
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
+// AG+GEMM / GEMM+RS kernels
+#include <deep_gemm/impls/sm100_fp8_ag_gemm.cuh>
+#include <deep_gemm/impls/sm100_bf16_ag_gemm.cuh>
+#include <deep_gemm/impls/sm100_fp8_gemm_rs.cuh>
+#include <deep_gemm/impls/sm100_bf16_gemm_rs.cuh>
+
+
+
+
+
 using namespace deep_gemm;
 
 int main() {

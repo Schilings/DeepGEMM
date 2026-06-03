@@ -88,6 +88,37 @@ from .mega import (
     fp8_fp4_mega_moe,
 )
 
+# AG+GEMM kernels
+from .ag_gemm import (
+    AGGemmSymmBuffer,
+    BF16AGGemmSymmBuffer,
+    get_symm_buffer_for_ag_gemm,
+    get_symm_buffer_for_bf16_ag_gemm,
+    fp8_ag_gemm_nt,
+    fp8_ag_gemm_nt_hopper,
+    bf16_ag_gemm_nt,
+    bf16_ag_gemm_nt_hopper,
+)
+
+
+
+
+
+# GEMM+RS kernels
+from .gemm_rs import (
+    GemmRSSymmBuffer,
+    get_symm_buffer_for_gemm_rs,
+    fp8_gemm_rs_nt,
+    fp8_gemm_rs_nt_hopper,
+    bf16_gemm_rs_nt,
+    bf16_gemm_rs_nt_hopper,
+)
+
+
+
+
+
+
 # Some utils
 from . import testing
 from . import utils
