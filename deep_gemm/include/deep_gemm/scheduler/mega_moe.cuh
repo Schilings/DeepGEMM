@@ -11,7 +11,7 @@ namespace deep_gemm::sched {
 
 // Computation phase for the current block
 enum class BlockPhase {
-    None = 0,
+    None = 0, 
     Linear1 = 1,
     Linear2 = 2
 };
