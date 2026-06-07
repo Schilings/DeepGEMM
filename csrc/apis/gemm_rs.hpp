@@ -138,7 +138,7 @@ static void bf16_gemm_rs_nt(const torch::Tensor& y,
         num_ranks, num_max_tokens_per_rank, n, use_fp32_output);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
 
-    sm100_bf16_gemm_rs_nt(y, a, b, sym_buffer_ptrs, rank_idx,
+    sm100_bf16_gemm_rs_nt(y, a, b, sym_buffer, sym_buffer_ptrs, rank_idx,
                           num_max_tokens_per_rank, num_tokens_per_rank, n, k, compiled_dims);
 #else
     DG_HOST_UNREACHABLE("BF16 GEMM+RS requires TensorMap support");

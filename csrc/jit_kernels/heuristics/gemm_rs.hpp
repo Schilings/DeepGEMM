@@ -15,8 +15,10 @@ struct GemmRSConfig {
     int load_block_m, load_block_n;
     int swizzle_a_mode, swizzle_b_mode, swizzle_cd_mode;
     int num_stages, smem_size;
-    int num_rs_threads, num_non_epilogue_threads, num_epilogue_threads;
+    int num_rs_threads;  // FP8 路径仍使用 RS warps，BF16 路径设为 0
+    int num_non_epilogue_threads, num_epilogue_threads;
     int num_multicast;
+    int reduce_num_threads;  // BF16 路径: reduce epilogue kernel 的线程数
 
     friend std::ostream& operator << (std::ostream& os, const GemmRSConfig& config) {
         os << "GemmRSConfig("
@@ -24,7 +26,8 @@ struct GemmRSConfig {
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_rs_threads=" << config.num_rs_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
-           << ", num_epilogue_threads=" << config.num_epilogue_threads << ")";
+           << ", num_epilogue_threads=" << config.num_epilogue_threads
+           << ", reduce_num_threads=" << config.reduce_num_threads << ")";
         return os;
     }
 };
@@ -40,12 +43,15 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     constexpr int swizzle_a_mode = 128;
     constexpr int swizzle_b_mode = 128;
     constexpr int swizzle_cd_mode = 128;
-    constexpr int num_rs_threads = 128;
-    constexpr int num_non_epilogue_threads = 128;
-    constexpr int num_epilogue_threads = 128;
+    // BF16 (elem_size_ab=2): 不再有 RS warps，由独立 PDL reduce kernel 处理
+    // FP8  (elem_size_ab=1): 仍保留 RS warps (旧架构)
+    const int num_rs_threads = (elem_size_ab == 2) ? 0 : 128;
+    constexpr int num_non_epilogue_threads = 128;  // Warp 0 (TMA load) + Warp 1 (MMA issue)
+    constexpr int num_epilogue_threads = 128;      // Warp 2-3: TMEM → smem → TMA store
     constexpr int num_multicast = 1;
     constexpr int num_tma_store_stages = 2;
     constexpr int num_epilogue_stages = 2;
+    constexpr int reduce_num_threads = 256;        // BF16: Reduce epilogue kernel 线程数
 
     const int smem_cd = 128 * swizzle_cd_mode * num_tma_store_stages;
     const int smem_a_per_stage = load_block_m * block_k * elem_size_ab;
@@ -65,8 +71,10 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
         load_block_m, load_block_n,
         swizzle_a_mode, swizzle_b_mode, swizzle_cd_mode,
         num_stages, smem_extra + num_stages * smem_per_stage,
-        num_rs_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_multicast
+        num_rs_threads,
+        num_non_epilogue_threads, num_epilogue_threads,
+        num_multicast,
+        reduce_num_threads
     };
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {

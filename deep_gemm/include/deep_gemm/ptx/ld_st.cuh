@@ -243,6 +243,15 @@ CUTLASS_DEVICE longlong4_t ld_gez_pred(const longlong4_t* ptr, const int& pred) 
     return ret;
 }
 
+/// Release store (system-scope)
+CUTLASS_DEVICE void st_rel_sys(uint32_t* ptr, uint32_t val) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+
+CUTLASS_DEVICE void st_rel_sys(int* ptr, int val) {
+    asm volatile("st.release.sys.global.s32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+
 /// Prefetch
 CUTLASS_DEVICE void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
