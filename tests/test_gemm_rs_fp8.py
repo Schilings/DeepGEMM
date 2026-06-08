@@ -131,6 +131,23 @@ def run_test(local_rank: int, num_local_ranks: int):
     if rank_idx == 0:
         print("\n>>> Phase 4: Testing with FP32 communication dtype...")
 
+    # Build a proper FP32-path reference:
+    # fp8_gemm_nt with FP32 output → all_gather → FP32 reduce → BF16
+    # This matches the numerical path: FP32 acc → FP32 push → FP32 reduce → BF16
+    d_full_fp32 = torch.zeros((total_m, n_dim), dtype=torch.float32, device=f'cuda:{local_rank}')
+    deep_gemm.fp8_gemm_nt((a_fp8, a_sf), (b_fp8, b_sf), d_full_fp32, recipe=(1, 1, gran_k))
+    torch.cuda.synchronize(local_rank)
+
+    all_d_fp32 = [torch.empty_like(d_full_fp32) for _ in range(num_ranks)]
+    dist.all_gather(all_d_fp32, d_full_fp32)
+    torch.cuda.synchronize(local_rank)
+
+    ref_fp32_comm = torch.zeros((tokens_per_rank, n_dim), dtype=torch.float32, device=f'cuda:{local_rank}')
+    for r in range(num_ranks):
+        ref_fp32_comm += all_d_fp32[r][start_row:end_row, :]
+    ref_fp32_comm_bf16 = ref_fp32_comm.bfloat16()
+    del all_d_fp32, d_full_fp32, ref_fp32_comm
+
     # Create a new sym_buffer with FP32 comm
     sym_buffer_fp32 = deep_gemm.get_symm_buffer_for_gemm_rs(
         group, max_tokens_per_rank, n_dim, out_dtype=torch.bfloat16,
@@ -145,16 +162,16 @@ def run_test(local_rank: int, num_local_ranks: int):
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
-    diff_fp32 = (y_fp32_comm.float() - ref.float()).abs()
+    diff_fp32 = (y_fp32_comm.float() - ref_fp32_comm_bf16.float()).abs()
     max_diff_fp32 = diff_fp32.max().item()
     mean_diff_fp32 = diff_fp32.mean().item()
 
     if rank_idx == 0:
         print(f"  FP32 comm: max_diff={max_diff_fp32:.6f}, mean_diff={mean_diff_fp32:.6f}")
-        if max_diff_fp32 <= max_diff:
-            print(f"  ✅ FP32 communication has equal or better precision (expected)")
+        if max_diff_fp32 < 1.0:
+            print(f"  ✅ FP32 communication matches FP32-path reference!")
         else:
-            print(f"  ⚠️  FP32 communication slightly worse (may be noise)")
+            print(f"  ❌ FP32 communication has unexpected difference")
 
     sym_buffer.destroy()
     sym_buffer_fp32.destroy()
