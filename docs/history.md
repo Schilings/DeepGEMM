@@ -976,3 +976,90 @@ BF16 也完美通过！现在 commit 修复并 push：
 3. 测试中缺少 `recipe=(1,1,128)` 导致默认 recipe `(1,128,128)` 与 per-token SF 不匹配
 4. 测试中多余的 `disable_ue8m0_cast=True`
 5. 重新编译了 `_C.so` 以包含新增的 `comm_dtype`/`reduce_in_fp32` 参数
+
+-
+现在我来分析测试中的问题。让我看 Phase 4 的测试逻辑和参考值计算的关键区别：
+现在我完全理解了问题所在。让我解释：
+
+---
+
+## Phase 4 (`max_diff=1.0`) 的根本原因
+
+问题出在**参考值 `ref` 的计算方式与 FP32 comm 的数值路径不一致**。
+
+### 数值路径对比
+
+**参考值 `ref`（Phase 3 用的）：**
+```
+fp8_gemm_nt → output BF16 → all_gather → cast to FP32 → 求和 → cast to BF16
+```
+
+**Phase 3（BF16 comm）：**
+```
+fp8_gemm → FP32 累加器 → cast to BF16 → NVLink push (BF16) → BF16 reduce → output BF16
+```
+
+**Phase 4（FP32 comm）：**
+```
+fp8_gemm → FP32 累加器 → NVLink push (FP32) → FP32 reduce → cast to BF16 → output BF16
+```
+
+### 关键区别
+
+Phase 3 和参考值走的路径本质相同：
+- 参考：`FP32 acc → BF16` 然后 `BF16 → FP32 → sum → BF16`
+- Phase 3：`FP32 acc → BF16` 然后 `BF16 → BF16 reduce → BF16`
+
+两者的精度瓶颈都在 **GEMM 输出先被截断为 BF16**，再做 reduce。所以它们一致（diff=0）。
+
+Phase 4 走的路径不同：
+- `FP32 acc → FP32 push → FP32 reduce → BF16`
+
+这里 **GEMM 的 FP32 累加值没有经过 BF16 截断就直接通信和 reduce**，最后才 cast 到 BF16。
+
+### 举个具体例子
+
+假设两个 rank 的 GEMM 某个元素分别算出：
+- Rank 0: `3.14159265` (FP32)
+- Rank 1: `2.71828182` (FP32)
+
+**参考路径**：先截断为 BF16 → `3.140625 + 2.71875 = 5.859375` → BF16 = `5.84375`
+
+**FP32 comm 路径**：直接 FP32 求和 → `3.14159265 + 2.71828182 = 5.85987447` → BF16 = `5.875`
+
+差值 = `|5.84375 - 5.875| = 0.03125`... 但在更极端的情况下（大数值、多次累加），差异可以到 1.0。
+
+### 结论
+
+`max_diff=1.0` **不是 bug**，而是**参考值和待测路径的数值路径不同导致的正常差异**。FP32 comm 实际上**更精确**（保留了更多中间精度），但因为参考值是用 BF16 中间结果算的，反而显得"不一致"。
+
+### 如何修复测试
+
+如果要让 Phase 4 也精确匹配，参考值应该用 **FP32 output** 的 `fp8_gemm_nt` 来计算：
+
+```python
+# FP32 reference for FP32 comm test
+d_full_fp32 = torch.zeros((total_m, n_dim), dtype=torch.float32, device=...)
+deep_gemm.fp8_gemm_nt((a_fp8, a_sf), (b_fp8, b_sf), d_full_fp32, recipe=(1, 1, gran_k))
+# reduce in FP32, then cast to BF16
+ref_fp32_comm = sum_of_chunks(d_full_fp32).bfloat16()
+```
+
+这样 FP32 通信路径和参考的数值路径就完全一致了。需要我修复这个测试吗？
+
+现在我需要确认 `fp8_gemm_nt` 是否支持 FP32 output dtype：
+Line 76 确认 `fp8_gemm_nt` 支持 `d.scalar_type() == torch::kFloat`。现在修复测试：
+现在运行测试验证：
+全部通过！Phase 4 现在也是 `max_diff=0.000000`。提交并推送：
+✅ 修复完成，已推送。
+
+**测试结果（2x B300 SXM6）：**
+
+| Phase | 测试内容 | max_diff |
+|-------|---------|----------|
+| 1 | Warm-up (JIT 编译) | — |
+| 2 | 一致性检查 | 0.000000 ✅ |
+| 3 | BF16 comm vs BF16-path ref | 0.000000 ✅ |
+| 4 | FP32 comm vs FP32-path ref | 0.000000 ✅ |
+
+**修复原理：** 之前 Phase 4 用的参考值是 `fp8_gemm_nt(BF16 output) → BF16 reduce`，而 FP32 comm kernel 走的是 `FP32 acc → FP32 push → FP32 reduce → BF16`。两条路径的精度截断点不同，所以结果不一致。修复后用 `fp8_gemm_nt(FP32 output) → FP32 reduce → BF16` 作为参考，与 kernel 的数值路径完全匹配。
