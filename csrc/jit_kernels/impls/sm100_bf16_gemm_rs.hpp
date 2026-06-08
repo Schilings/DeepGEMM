@@ -162,7 +162,7 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_sms = device_runtime->get_num_sms();
     const auto m = runtime_m_per_rank * num_ranks;
-    auto config = get_gemm_rs_config(m, n, k, num_sms, static_cast<int>(a.element_size()));
+    auto config = get_gemm_rs_config(m, n, k, num_sms, static_cast<int>(a.element_size()), num_ranks);
 
     DG_HOST_ASSERT(config.block_k == 64);
 

@@ -29,19 +29,20 @@ using namespace deep_gemm::math;
 //
 //  【设计思想】
 //
-//  两阶段分离架构：
+//  两阶段分离架构（方案 B: 统一 barrier 同步）：
 //
 //  ┌──────────────────────────────────────────────────────────────┐
 //  │ 阶段1: GEMM + NVLink Push (本 kernel)                       │
 //  │                                                              │
-//  │  调度顺序: rank i 先计算发往 rank i+1 的 chunk → push       │
-//  │           再计算 rank i+2 → push                            │
-//  │           ...                                                │
-//  │           最后计算自己 rank i 的 → 直接写本地 partial buf     │
+//  │  Ring 调度: rank i 先计算 rank (i+1) 的 chunk → push        │
+//  │            再计算 rank (i+2) → push                         │
+//  │            ...                                               │
+//  │            最后计算自己 rank i 的 → 直接写本地 partial buf    │
+//  │            每波计算掩盖上一波的 NVLink 通信                    │
 //  │                                                              │
-//  │  N 次计算掩盖 N-1 次通信                                     │
-//  │  Epilogue: TMEM → smem → TMA store 到远端 partial buffer    │
-//  │  完成后设置 ready flag (st_rel_sys)                          │
+//  │  Epilogue: TMEM → smem → per-row TMA bulk store (CE)        │
+//  │  所有 tile 完成后: tma_store_wait + threadfence_system       │
+//  │  + nvlink_barrier 跨 rank 同步（整个 kernel 只做一次）        │
 //  └──────────────────────────────────────────────────────────────┘
 //             │
 //             │ PDL (Programmatic Dependent Launch)
@@ -50,17 +51,18 @@ using namespace deep_gemm::math;
 //  │ 阶段2: Reduce Epilogue (独立 kernel)                         │
 //  │                                                              │
 //  │  cudaGridDependencySynchronize() 等待阶段1完成               │
-//  │  从 partial buffer 读取各 rank 的数据                        │
+//  │  直接读取 partial buffer（无需轮询 ready flag）              │
 //  │  element-wise 累加 → 写 output                               │
 //  └──────────────────────────────────────────────────────────────┘
 //
 //  【优势】
 //
-//  相比 RS Warp 内嵌方案：
+//  相比 per-tile fence + ready flag 方案：
 //  1. GEMM kernel 线程全部用于计算和通信，无空转
-//  2. Reduce kernel 不需要自旋等待，进入时数据已就绪
+//  2. __threadfence_system 整个 kernel 只执行一次（而非每 tile 一次）
 //  3. TMA 异步写远端，epilogue 不阻塞下一轮 MMA 发射
-//  4. 两个 kernel 间通过 PDL 重叠，reduce 可在 GEMM 即将结束时开始
+//  4. Reduce kernel 无需自旋等 ready flag，进入即可直接读取
+//  5. 两个 kernel 间通过 PDL 重叠，reduce 可在 GEMM 即将结束时开始
 //
 // ============================================================================================
 
@@ -110,11 +112,13 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
                      (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M)), "Invalid block size");
 
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
-    constexpr uint32_t STORE_BLOCK_N =        kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
+    // STORE_BLOCK_N is computed based on comm_dtype_t since we write comm_dtype_t to smem for TMA store
+    constexpr uint32_t STORE_BLOCK_N =        kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(comm_dtype_t);
     constexpr uint32_t kNumUMMAStoreThreads = kSwapAB ? kNumEpilogueThreads : STORE_BLOCK_M;
     DG_STATIC_ASSERT(kNumUMMAStoreThreads % 32 == 0, "Invalid store block M");
 
-    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
+    // smem CD stage sized for comm_dtype_t (what gets TMA-stored to remote partial buffer)
+    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(comm_dtype_t);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(ab_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(ab_dtype_t);
@@ -184,15 +188,11 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
-    // ── Clean ready flags (cross-rank sync) ──
-    for (uint32_t i = sm_idx * kNumThreads + thread_idx;
-         i < kNumRanks * workspace.get_num_m_blocks_per_rank() * workspace.get_num_n_blocks();
-         i += kNumSMs * kNumThreads) {
-        auto* ready_base = workspace.get_ready_ptr();
-        ready_base[i] = 0;
-    }
-    constexpr uint32_t kAfterReadyCleanBarrierTag = 41;
-    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kAfterReadyCleanBarrierTag>(
+    // ── 方案 B: 不再使用 per-tile ready flag ──
+    // 所有同步通过 kernel 结束前的 nvlink_barrier 统一完成
+    // 此处只需一次跨 rank barrier 保证上一轮（如果有）的 reduce 已完成
+    constexpr uint32_t kInitBarrierTag = 41;
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kInitBarrierTag>(
         workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
 
     // ── Pipeline state ──
@@ -348,21 +348,46 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 4~7 (Epilogue Warps): TMEM → registers → global store to remote
+    //  Warp 4~7 (Epilogue Warps): TMEM → smem → per-row TMA bulk store to remote
     // ════════════════════════════════════════════════════════════════
     //
-    //  简化设计: 直接从 TMEM 读取 FP32 累加值，转 BF16，全局 store 到远端 partial buffer
-    //  - 每个线程处理自己 lane 对应的行
-    //  - 128 个线程覆盖 128 行 (= STORE_BLOCK_M = BLOCK_M for our tile)
-    //  - 逐列组迭代完成整个 BLOCK_N
-    //  - 写完后设置 ready flag
+    //  优化设计: 使用 TMA bulk copy (cp.async.bulk) 替代标量 global store
+    //  - TMEM → registers → shared memory (linear row-major layout)
+    //  - Per-row TMA 1D bulk copy → 远端 partial buffer (异步 DMA，不占 SM store buffer)
+    //  - Partial buffer is row-major with stride = shape_n (不一定连续)，
+    //    所以每行需要独立的 bulk copy 到正确的全局地址
+    //  - 双缓冲 smem pipeline: 前一轮 bulk copies 与当前 TMEM→smem 重叠
+    //  - 方案 B: 不再 per-tile fence/flag，所有 tile 完成后 kernel 结束前统一
+    //    threadfence_system + nvlink_barrier 跨 rank 同步
+    //
+    //  性能优势 (vs 原方案每元素标量 store + per-element fence):
+    //  1. TMA bulk copy 走 DMA 引擎 (CE)，不 stall SM 的 LSU
+    //  2. 每行 128~256 bytes 的 bulk transfer，CE 可 pipeline 128 行的请求
+    //  3. __threadfence_system 整个 kernel 只 1 次（而非 per-tile）
+    //  4. MMA warp 不再被 epilogue 反压——smem 写入极快，TMEM 立即释放
+    //  5. Reduce kernel 无需轮询 ready flag，直接读取
     //
     else if (warp_idx >= kNumNonEpilogueThreads / 32 and
              warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
         const auto epilogue_warp_idx = warp_idx - kNumNonEpilogueThreads / 32;
         const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
-        // Each thread handles one row (128 threads = 128 rows = STORE_BLOCK_M)
-        const uint32_t my_row = epilogue_thread_idx;
+
+        // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
+        // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
+        // Each warp's 32 lanes map to 32 consecutive TMEM rows automatically.
+
+        // Number of comm_dtype_t elements per 128-bit (16-byte) store
+        constexpr uint32_t kElemsPerStore = 16 / sizeof(comm_dtype_t);  // BF16: 8, FP32: 4
+        // Bytes per row in partial buffer for this tile's N-slice
+        constexpr uint32_t kRowBytesPerNSlice = STORE_BLOCK_N * sizeof(comm_dtype_t);
+        // Number of 128-bit stores per row to cover STORE_BLOCK_N
+        constexpr uint32_t kStoresPerRow = STORE_BLOCK_N / kElemsPerStore;
+        // N-slices to cover BLOCK_N
+        constexpr uint32_t kNumNSlices = BLOCK_N / STORE_BLOCK_N;
+
+        // smem layout: one row per thread, total STORE_BLOCK_M rows × STORE_BLOCK_N cols
+        // smem size per stage = STORE_BLOCK_M * kRowBytesPerNSlice (= SMEM_CD_SIZE_PER_STAGE)
+        uint32_t tma_stage_idx = 0;
 
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
@@ -376,82 +401,107 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
             const uint32_t local_m = local_m_block_idx * BLOCK_M;
             const bool is_self_rank = (dst_rank == rank_idx);
 
-            // ── TMEM → registers → global memory store ──
-            // TMEM layout: 128 rows (one per thread in 32dp addressing) × UMMA_N columns
-            // SM100_TMEM_LOAD_32dp32b4x: loads 4 × 32-bit (= 4 floats) per thread from TMEM
-            // Each float is one accumulator element at (thread's row, tmem_addr column)
-            //
-            // We iterate over N in chunks of 4 floats, convert to comm_dtype_t, and store.
-            // comm_dtype_t controls the communication precision:
-            //   - bfloat16_t: saves NVLink bandwidth (2 bytes/elem), slight precision loss in reduce
-            //   - float:      full precision communication (4 bytes/elem), no reduce precision loss
-            constexpr uint32_t kElemsPerLoad = 4;  // SM100_TMEM_LOAD_32dp32b4x gives 4 floats
-            constexpr uint32_t kNumIters = UMMA_N / kElemsPerLoad;  // BLOCK_N / 4
-
+            // ── TMEM → smem → per-row TMA bulk store ──
             #pragma unroll
             for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                if (my_row < WAVE_BLOCK_M) {
-                    #pragma unroll
-                    for (uint32_t iter = 0; iter < kNumIters; ++ iter) {
-                        uint32_t tmem_col = accum_stage_idx * UMMA_N + iter * kElemsPerLoad;
-                        uint32_t f0, f1, f2, f3;
-                        cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_col, f0, f1, f2, f3);
-                        cutlass::arch::fence_view_async_tmem_load();
+                #pragma unroll
+                for (uint32_t s = 0; s < kNumNSlices; ++ s) {
+                    auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
 
-                        // Compute destination address in partial buffer
-                        uint32_t global_row = local_m + w * WAVE_BLOCK_M + my_row;
-                        uint32_t global_col = n_block_idx * BLOCK_N + iter * kElemsPerLoad;
+                    // Wait previous TMA stores in this pipeline stage to complete
+                    if (epilogue_warp_idx == 0)
+                        cute::tma_store_wait<kNumTMAStoreStages - 1>();
+                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                        comm_dtype_t* dst_ptr = is_self_rank ?
-                            workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col) :
-                            sym_buffer.map(
-                                workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col),
-                                dst_rank);
+                    // ── Phase 1: TMEM → registers → smem (linear layout) ──
+                    // Each thread writes one row of STORE_BLOCK_N elements
+                    // epilogue_thread_idx ∈ [0, STORE_BLOCK_M) maps to row offset within wave
+                    if (epilogue_thread_idx < STORE_BLOCK_M) {
+                        auto* row_ptr = smem_base_ptr + epilogue_thread_idx * kRowBytesPerNSlice;
 
-                        // Store elements in communication format
-                        if constexpr (cute::is_same_v<comm_dtype_t, float>) {
-                            // FP32 communication: store raw FP32 values (16 bytes per 4 elements)
-                            *reinterpret_cast<uint32_t*>(dst_ptr + 0) = f0;
-                            *reinterpret_cast<uint32_t*>(dst_ptr + 1) = f1;
-                            *reinterpret_cast<uint32_t*>(dst_ptr + 2) = f2;
-                            *reinterpret_cast<uint32_t*>(dst_ptr + 3) = f3;
-                        } else {
-                            // BF16 communication: convert FP32 → BF16 and pack pairs (8 bytes per 4 elements)
-                            uint32_t bf16_pair0 = cast_into_bf16_and_pack(f0, f1);
-                            uint32_t bf16_pair1 = cast_into_bf16_and_pack(f2, f3);
-                            *reinterpret_cast<uint32_t*>(dst_ptr + 0) = bf16_pair0;
-                            *reinterpret_cast<uint32_t*>(dst_ptr + 2) = bf16_pair1;
+                        #pragma unroll
+                        for (uint32_t st = 0; st < kStoresPerRow; ++ st) {
+                            uint32_t tmem_col = accum_stage_idx * UMMA_N +
+                                                s * STORE_BLOCK_N + st * kElemsPerStore;
+
+                            if constexpr (cute::is_same_v<comm_dtype_t, float>) {
+                                // FP32: load 4 FP32, store as-is (16 bytes)
+                                uint32_t f0, f1, f2, f3;
+                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_col, f0, f1, f2, f3);
+                                cutlass::arch::fence_view_async_tmem_load();
+                                ptx::st_shared(row_ptr + st * 16, f0, f1, f2, f3);
+                            } else {
+                                // BF16: load 8 FP32, convert to 8 BF16 (16 bytes)
+                                uint32_t f0, f1, f2, f3, f4, f5, f6, f7;
+                                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_col, f0, f1, f2, f3, f4, f5, f6, f7);
+                                cutlass::arch::fence_view_async_tmem_load();
+                                ptx::st_shared(row_ptr + st * 16,
+                                    math::cast_into_bf16_and_pack(f0, f1),
+                                    math::cast_into_bf16_and_pack(f2, f3),
+                                    math::cast_into_bf16_and_pack(f4, f5),
+                                    math::cast_into_bf16_and_pack(f6, f7));
+                            }
                         }
                     }
+
+                    // Release TMEM stage as soon as the last smem write is complete
+                    if (w == kNumMWaves - 1 and s == kNumNSlices - 1) {
+                        ptx::tcgen05_before_thread_sync();
+                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                    }
+
+                    // ── Phase 2: Issue per-row TMA 1D bulk copies (smem → remote global) ──
+                    // Partial buffer has stride = shape_n (not STORE_BLOCK_N), so rows
+                    // are non-contiguous in global memory — must issue one bulk copy per row.
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        uint32_t base_row = local_m + w * STORE_BLOCK_M;
+                        uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
+
+                        #pragma unroll 1
+                        for (uint32_t row = 0; row < STORE_BLOCK_M; ++ row) {
+                            comm_dtype_t* dst_ptr = is_self_rank ?
+                                workspace.get_partial_ptr<comm_dtype_t>(rank_idx, base_row + row, base_col) :
+                                sym_buffer.map(
+                                    workspace.get_partial_ptr<comm_dtype_t>(rank_idx, base_row + row, base_col),
+                                    dst_rank);
+
+                            auto* src_ptr = smem_base_ptr + row * kRowBytesPerNSlice;
+                            ptx::tma_store_1d(dst_ptr, src_ptr, kRowBytesPerNSlice);
+                        }
+                        cute::tma_store_arrive();
+                    }
+
+                    // Advance TMA store pipeline stage
+                    tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
                 }
             }
 
-            // Release TMEM stage for next MMA iteration
-            ptx::tcgen05_before_thread_sync();
-            tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-
-            // ── Ensure all stores are visible, then set ready flag ──
-            __threadfence_system();
-
-            if (epilogue_thread_idx == 0) {
-                uint32_t* remote_ready_ptr = is_self_rank ?
-                    workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx) :
-                    sym_buffer.map(
-                        workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx),
-                        dst_rank);
-                ptx::st_rel_sys(remote_ready_ptr, 1u);
-            }
         }
+
+        // ── 所有 tile 处理完毕，等待最后的 TMA stores 完成 ──
+        // 方案 B: 不再 per-tile fence/flag，kernel 结束前统一同步
+        if (epilogue_warp_idx == 0)
+            cute::tma_store_wait<0>();
     }
 
-    // TODO: Remove redundant synchronization
+    // ── 方案 B: kernel 结束前统一 fence + 跨 rank barrier ──
+    // 确保所有 TMA stores 对远端可见，然后所有 rank 同步
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+    __threadfence_system();
+
+    constexpr uint32_t kFinalBarrierTag = 42;
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kFinalBarrierTag>(
+        workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
 
     // Deallocate tensor memory
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
 
     // ── PDL: 通知后续 reduce kernel 本 GEMM kernel 即将完成 ──
+    // 此时所有 rank 的 partial data 已全部就绪，reduce kernel 可直接读取
     cudaTriggerProgrammaticLaunchCompletion();
 
 #else
@@ -467,14 +517,14 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
 //  【设计思想】
 //
 //  本 kernel 作为 GEMM+Push kernel 的下游，通过 PDL 机制实现零间隙调度。
-//  进入时调用 cudaGridDependencySynchronize()，确保 partial buffer 数据已全部就绪。
-//  然后执行向量化的 element-wise reduce（各 rank 的 partial results 累加）。
+//  方案 B: GEMM kernel 结束前已执行 threadfence_system + nvlink_barrier（跨 rank 同步），
+//  因此本 kernel 进入时所有 partial data 已全部就绪，无需轮询任何 ready flag。
 //
 //  数据流:
-//    partial_buffer[rank_0][m_block][n_block] + ... + partial_buffer[rank_N-1][...] → output
+//    partial_buffer[rank_0][row][col] + ... + partial_buffer[rank_N-1][...] → output
 //
 //  优势:
-//  - 不需要自旋等待 ready flag（PDL 保证进入时数据已就绪）
+//  - 不需要 per-tile 轮询 ready flag —— 所有数据进入时已保证就绪
 //  - 所有线程立即开始有效计算，无资源浪费
 //  - 可以利用全部 SM 资源进行 reduce
 //  - GPU 硬件可以在 GEMM kernel 快结束时就开始调度本 kernel
@@ -495,9 +545,9 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
                                 const uint32_t shape_m_per_rank) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
 
-    // ── 等待前序 GEMM kernel 完成（PDL 保证本 rank 的 GEMM grid 已结束）──
-    // NOTE: PDL 只保证本 rank 的 GEMM kernel 完成，不保证远程 rank 的 NVLink 写入已完成。
-    //       因此必须在下游轮询 ready flag，确保数据已实际写入。
+    // ── 等待前序 GEMM kernel 完成 ──
+    // 方案 B: GEMM kernel 结束前已做 threadfence_system + nvlink_barrier，
+    //         所有 rank 的 partial data 已全部就绪，无需轮询 ready flag。
     cudaGridDependencySynchronize();
 
     // workspace elem_size based on comm_dtype_t (what's actually stored in the partial buffer)
@@ -521,19 +571,11 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
     // Accumulation type: FP32 when kReduceInFP32, otherwise same as comm_dtype_t
     using accum_t = cute::conditional_t<kReduceInFP32, float, comm_dtype_t>;
 
-    // Pre-compute tile indices for ready flag polling
-    const uint32_t num_m_blocks = workspace.get_num_m_blocks_per_rank();
-    const uint32_t num_n_blocks = workspace.get_num_n_blocks();
-
-    // 主循环：每个线程处理若干个向量
+    // 主循环：每个线程处理若干个向量（无需轮询 ready flag）
     for (uint32_t vec_idx = global_thread_idx; vec_idx < total_vecs; vec_idx += total_threads) {
         const uint32_t elem_base = vec_idx * kVecSize;
         const uint32_t row = elem_base / shape_n;
         const uint32_t col = elem_base - row * shape_n;
-
-        // Compute tile indices for ready flag
-        const uint32_t m_block = row / BLOCK_M;
-        const uint32_t n_block = col / BLOCK_N;
 
         // Accumulator
         accum_t acc[kVecSize];
@@ -543,11 +585,7 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
 
         #pragma unroll 1
         for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
-            // Poll ready flag: wait until the partial data for this tile is written
-            auto* ready_ptr = workspace.get_ready_ptr(src_rank, m_block, n_block);
-            while (ptx::ld_acq_sys(ready_ptr) == 0);
-
-            // 向量化读取 (16 bytes)
+            // 直接读取 —— GEMM kernel 的 nvlink_barrier 已保证所有数据就绪
             const auto* partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, row, col);
             const auto* vec_ptr = reinterpret_cast<const uint4*>(partial_ptr);
             uint4 data = *vec_ptr;
@@ -566,10 +604,6 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
         // Convert accumulator to output dtype and write
         uint4 result;
         auto* result_out = reinterpret_cast<cd_dtype_t*>(&result);
-        // Output vector size may differ from comm vector size (e.g., comm=FP32, output=BF16)
-        // We need to handle size mismatch: kVecSize elements of comm_dtype → kVecSize elements of cd_dtype
-        // Since both work on kVecSize elements but output uint4 may not hold all of them,
-        // we write element by element when sizes differ
         if constexpr (sizeof(cd_dtype_t) == sizeof(comm_dtype_t)) {
             // Same size: pack into uint4 directly
             #pragma unroll
@@ -596,15 +630,9 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
         const uint32_t col = elem_idx - row * shape_n;
         if (row >= runtime_m_per_rank) continue;
 
-        const uint32_t m_block = row / BLOCK_M;
-        const uint32_t n_block = col / BLOCK_N;
-
         accum_t acc = accum_t(0);
         #pragma unroll 1
         for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
-            auto* ready_ptr = workspace.get_ready_ptr(src_rank, m_block, n_block);
-            while (ptx::ld_acq_sys(ready_ptr) == 0);
-
             const auto* partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, row, col);
             if constexpr (kReduceInFP32) {
                 acc += static_cast<float>(*partial_ptr);
