@@ -587,3 +587,115 @@ Python bf16_gemm_rs_nt()
 - **减少 launch overhead**：一次 launch 完成所有 tile
 - **更好的 L2 cache 利用**：可以配合 tile swizzle 优化访存局部性
 - **天然适合 PDL**：persistent kernel 运行时间可预测，便于流水线依赖调度
+
+
+
+现在我全面理解了架构。让我制定修改计划：
+
+**现状分析：**
+1. GEMM kernel 的 epilogue 将 FP32 累加器转为 `cd_dtype_t`（BF16）push 到远端 partial buffer
+2. Reduce epilogue 从 partial buffer 读 BF16，用 FP32 累加后转 BF16 写出
+3. 通信数据类型（partial buffer 中的数据类型）目前固定是 `cd_dtype_t`（BF16）
+
+**用户需求：**
+- 通信格式应该可以通过模板参数控制
+- 如果用户不在乎精度，可以用 BF16 通信（省带宽）+ BF16 累加（不用 FP32）
+- 如果用户在乎精度，可以用 FP32 通信 + FP32 累加
+- 甚至可以 BF16 通信 + FP32 累加（当前行为）
+
+我需要引入一个新的模板参数 `comm_dtype_t`（通信数据类型）和 `accum_reduce_in_fp32`（reduce 累加是否用 FP32）。
+让我先看看 Python 接口层怎么调用的：
+Now I have a complete picture. Let me also look at the `to_string` function for dtype mapping and understand the `runtime_utils.hpp`:
+Now I have a complete understanding. Let me design the solution:
+
+**Design:**
+- 引入 `comm_dtype_t` 模板参数，控制 partial buffer 中存储的数据类型（通信数据类型）
+- 引入 `kReduceInFP32` 模板参数（bool），控制 reduce epilogue 是否用 FP32 累加
+- GEMM epilogue 会把 FP32 累加器转为 `comm_dtype_t` 后 push
+- Reduce epilogue 根据 `kReduceInFP32` 选择 FP32 或直接 `comm_dtype_t` 累加
+- Python 层暴露 `comm_dtype` 参数（默认 `torch.bfloat16`）和 `reduce_in_fp32` 参数（默认 `True`）
+
+开始实现：
+Now update the workspace construction in the GEMM kernel to use `comm_dtype_t`'s size:
+Now update the epilogue to store in `comm_dtype_t` format. The key section is where data gets written to the partial buffer:
+Now update the Reduce Epilogue kernel to support `comm_dtype_t` and `kReduceInFP32`:
+`GemmRSWorkspace` 本身已经通过 `elem_size` 参数支持动态大小了（构造时传入 `sizeof(comm_dtype_t)`），不需要额外修改。现在修改 JIT runtime 层：
+Now update the JIT runtime to pass `comm_dtype_t` and `kReduceInFP32`:
+Now update the Reduce Epilogue runtime:
+Now update the unified entry function `sm100_bf16_gemm_rs_nt` to accept and pass the new parameters:
+Now update the GEMM args construction to pass `comm_dtype`:
+Now update the reduce args construction:
+Now update the C++ API layer (`csrc/apis/gemm_rs.hpp`) to accept and pass the new parameters:
+Now update the pybind11 registration:
+Also need to update `get_symm_buffer_size_for_gemm_rs` — it currently uses `use_fp32_output` to decide elem_size, but now we need `use_fp32_comm` to be separate. Let me check how `GemmRSSymmBuffer` uses it:
+
+The `GemmRSSymmBuffer` already passes `use_fp32_output` to `get_symm_buffer_size_for_gemm_rs`. Now the buffer size should depend on the **communication** dtype, not output dtype. Let me update the Python layer to support this. First, update the `GemmRSSymmBuffer`:
+Now update `get_symm_buffer_for_gemm_rs`:
+Now update `bf16_gemm_rs_nt` Python function to pass `comm_dtype` and `reduce_in_fp32`:
+Now let's rebuild and test. First, rebuild the package:
+Good, installed. Now let's run the test with default settings (BF16 comm + FP32 reduce, same as before):
+默认配置通过。现在写一个完整的测试，验证不同通信模式：
+2 卡全部通过！（Mode 2 在 2 卡下也是 0 差异因为 BF16 加 2 个值精度足够）。现在测 8 卡，这时 Mode 2 应该显示出 BF16 累加的精度差异：
+完美！8 卡结果也符合预期：
+
+| 模式 | comm_dtype | reduce精度 | max_diff vs FP32 ref | 说明 |
+|------|-----------|-----------|---------------------|------|
+| Mode 1 | BF16 | FP32 | 0.000000 ✅ | 默认模式，省带宽+高精度 |
+| Mode 2 | BF16 | BF16 | 8.000000 ✅ | NCCL-like 行为，有累加误差（正常） |
+| Mode 3 | FP32 | FP32 | 0.000000 ✅ | 全精度模式，bit-exact |
+
+再跑 4 卡确认：
+4 卡 Mode 2 也是 0（4 个 BF16 累加在这个 case 中没有产生舍入误差，但 8 个时候就有了）。全部通过！
+
+最后确认原始测试没有退化：
+-
+全部完成！让我总结一下改动：
+
+## ✅ 改动总结
+
+### 设计思路
+
+引入两个独立的精度控制维度：
+
+| 参数 | 控制什么 | 选项 | 影响 |
+|------|---------|------|------|
+| `comm_dtype` | 通信数据格式（partial buffer 中存什么） | `torch.bfloat16` / `torch.float32` | NVLink 带宽 |
+| `reduce_in_fp32` | Reduce 累加精度 | `True` / `False` | Reduce 精度 |
+
+### 三种典型使用模式
+
+| 模式 | comm_dtype | reduce_in_fp32 | 适用场景 |
+|------|-----------|----------------|---------|
+| **默认（推荐）** | BF16 | True | 省带宽 + 高精度 reduce，训练常用 |
+| **NCCL-like** | BF16 | False | 和 NCCL reduce_scatter 行为一致，不在乎微小精度 |
+| **全精度** | FP32 | True | 需要 bit-exact 精度，带宽翻倍 |
+
+### 用户接口变更
+
+```python
+# 创建 buffer 时指定通信精度
+sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(
+    group, tokens_per_rank, n_dim,
+    out_dtype=torch.bfloat16,
+    comm_dtype=torch.bfloat16  # 新参数，默认 bf16
+)
+
+# 调用时指定 reduce 精度
+deep_gemm.bf16_gemm_rs_nt(
+    y, a, b, sym_buffer, tokens_per_rank,
+    reduce_in_fp32=True  # 新参数，默认 True
+)
+```
+
+**完全向后兼容**——所有新参数都有默认值，原有代码无需修改。
+
+### 修改的文件
+
+| 文件 | 改动 |
+|------|------|
+| `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh` | GEMM kernel 添加 `comm_dtype_t` 模板参数；Reduce kernel 添加 `comm_dtype_t` + `kReduceInFP32` |
+| `csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp` | JIT codegen 传递新模板参数 |
+| `csrc/apis/gemm_rs.hpp` | C++ API 添加 `comm_dtype_str` + `reduce_in_fp32` 参数 |
+| `deep_gemm/gemm_rs/__init__.py` | Python API 添加 `comm_dtype` + `reduce_in_fp32` |
+| `tests/test_gemm_rs_comm_modes.py` | 新增三模式验证测试 |
+
