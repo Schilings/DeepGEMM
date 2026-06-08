@@ -72,7 +72,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumNonEpilogueThreads,
           uint32_t kNumEpilogueThreads,
           uint32_t kNumSMs, uint32_t kNumRanks,
-          typename cd_dtype_t>
+          typename cd_dtype_t,
+          typename comm_dtype_t = cd_dtype_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
                            const uint32_t runtime_m_per_rank,
@@ -132,7 +133,7 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
     const uint32_t lane_idx = ptx::get_lane_idx();
     const uint32_t rank_idx = sym_buffer.rank_idx;
     const auto workspace = layout::GemmRSWorkspace(
-        sym_buffer.get_base_ptr(), kNumRanks, shape_m_per_rank, shape_n, sizeof(cd_dtype_t), BLOCK_M, BLOCK_N);
+        sym_buffer.get_base_ptr(), kNumRanks, shape_m_per_rank, shape_n, sizeof(comm_dtype_t), BLOCK_M, BLOCK_N);
 
     // Synchronize the cluster before 2-CTA TMEM allocation
     kNumMulticast > 1 ? cute::cluster_sync() : void();
@@ -380,7 +381,10 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
             // SM100_TMEM_LOAD_32dp32b4x: loads 4 × 32-bit (= 4 floats) per thread from TMEM
             // Each float is one accumulator element at (thread's row, tmem_addr column)
             //
-            // We iterate over N in chunks of 4 floats, convert to BF16, and store.
+            // We iterate over N in chunks of 4 floats, convert to comm_dtype_t, and store.
+            // comm_dtype_t controls the communication precision:
+            //   - bfloat16_t: saves NVLink bandwidth (2 bytes/elem), slight precision loss in reduce
+            //   - float:      full precision communication (4 bytes/elem), no reduce precision loss
             constexpr uint32_t kElemsPerLoad = 4;  // SM100_TMEM_LOAD_32dp32b4x gives 4 floats
             constexpr uint32_t kNumIters = UMMA_N / kElemsPerLoad;  // BLOCK_N / 4
 
@@ -394,23 +398,30 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
                         cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_col, f0, f1, f2, f3);
                         cutlass::arch::fence_view_async_tmem_load();
 
-                        // Convert FP32 → BF16 and pack pairs
-                        uint32_t bf16_pair0 = cast_into_bf16_and_pack(f0, f1);
-                        uint32_t bf16_pair1 = cast_into_bf16_and_pack(f2, f3);
-
                         // Compute destination address in partial buffer
                         uint32_t global_row = local_m + w * WAVE_BLOCK_M + my_row;
                         uint32_t global_col = n_block_idx * BLOCK_N + iter * kElemsPerLoad;
 
-                        cd_dtype_t* dst_ptr = is_self_rank ?
-                            workspace.get_partial_ptr<cd_dtype_t>(rank_idx, global_row, global_col) :
+                        comm_dtype_t* dst_ptr = is_self_rank ?
+                            workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col) :
                             sym_buffer.map(
-                                workspace.get_partial_ptr<cd_dtype_t>(rank_idx, global_row, global_col),
+                                workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col),
                                 dst_rank);
 
-                        // Store 4 BF16 elements (2 × uint32_t = 8 bytes)
-                        *reinterpret_cast<uint32_t*>(dst_ptr + 0) = bf16_pair0;
-                        *reinterpret_cast<uint32_t*>(dst_ptr + 2) = bf16_pair1;
+                        // Store elements in communication format
+                        if constexpr (cute::is_same_v<comm_dtype_t, float>) {
+                            // FP32 communication: store raw FP32 values (16 bytes per 4 elements)
+                            *reinterpret_cast<uint32_t*>(dst_ptr + 0) = f0;
+                            *reinterpret_cast<uint32_t*>(dst_ptr + 1) = f1;
+                            *reinterpret_cast<uint32_t*>(dst_ptr + 2) = f2;
+                            *reinterpret_cast<uint32_t*>(dst_ptr + 3) = f3;
+                        } else {
+                            // BF16 communication: convert FP32 → BF16 and pack pairs (8 bytes per 4 elements)
+                            uint32_t bf16_pair0 = cast_into_bf16_and_pack(f0, f1);
+                            uint32_t bf16_pair1 = cast_into_bf16_and_pack(f2, f3);
+                            *reinterpret_cast<uint32_t*>(dst_ptr + 0) = bf16_pair0;
+                            *reinterpret_cast<uint32_t*>(dst_ptr + 2) = bf16_pair1;
+                        }
                     }
                 }
             }
@@ -473,7 +484,9 @@ sm100_bf16_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
 template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kNumThreads = 256,
-          typename cd_dtype_t = cutlass::bfloat16_t>
+          typename cd_dtype_t = cutlass::bfloat16_t,
+          typename comm_dtype_t = cd_dtype_t,
+          bool kReduceInFP32 = true>
 __global__ void __launch_bounds__(kNumThreads, 1)
 sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
                                 const uint32_t runtime_m_per_rank,
@@ -487,8 +500,9 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
     //       因此必须在下游轮询 ready flag，确保数据已实际写入。
     cudaGridDependencySynchronize();
 
+    // workspace elem_size based on comm_dtype_t (what's actually stored in the partial buffer)
     const auto workspace = layout::GemmRSWorkspace(
-        const_cast<void*>(workspace_base), kNumRanks, shape_m_per_rank, shape_n, sizeof(cd_dtype_t), BLOCK_M, BLOCK_N);
+        const_cast<void*>(workspace_base), kNumRanks, shape_m_per_rank, shape_n, sizeof(comm_dtype_t), BLOCK_M, BLOCK_N);
 
     const uint32_t sm_idx = blockIdx.x;
     const uint32_t thread_idx = threadIdx.x;
@@ -496,10 +510,16 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
     const uint32_t total_threads = kNumSMs * kNumThreads;
 
     // ── 向量化 reduce ──
-    // 每 8 个 BF16 元素打包为一个 uint4 (16 bytes) 进行向量化访存
-    constexpr uint32_t kVecSize = 8;
+    // Vector size depends on comm_dtype_t:
+    //   BF16: 8 elements per uint4 (16 bytes / 2 bytes)
+    //   FP32: 4 elements per uint4 (16 bytes / 4 bytes)
+    constexpr uint32_t kVecBytes = 16;  // Always load 16 bytes at a time (uint4)
+    constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);
     const uint32_t total_elements = runtime_m_per_rank * shape_n;
     const uint32_t total_vecs = total_elements / kVecSize;
+
+    // Accumulation type: FP32 when kReduceInFP32, otherwise same as comm_dtype_t
+    using accum_t = cute::conditional_t<kReduceInFP32, float, comm_dtype_t>;
 
     // Pre-compute tile indices for ready flag polling
     const uint32_t num_m_blocks = workspace.get_num_m_blocks_per_rank();
@@ -515,41 +535,56 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
         const uint32_t m_block = row / BLOCK_M;
         const uint32_t n_block = col / BLOCK_N;
 
-        // FP32 累加器
-        float acc[kVecSize];
+        // Accumulator
+        accum_t acc[kVecSize];
         #pragma unroll
         for (uint32_t i = 0; i < kVecSize; ++ i)
-            acc[i] = 0.0f;
+            acc[i] = accum_t(0);
 
         #pragma unroll 1
         for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
             // Poll ready flag: wait until the partial data for this tile is written
-            // This is needed because PDL only guarantees the local GEMM grid completed,
-            // but remote NVLink writes may still be in-flight
             auto* ready_ptr = workspace.get_ready_ptr(src_rank, m_block, n_block);
             while (ptx::ld_acq_sys(ready_ptr) == 0);
 
-            // 向量化读取 8 个 BF16 (16 bytes)
-            const auto* partial_ptr = workspace.get_partial_ptr<cd_dtype_t>(src_rank, row, col);
+            // 向量化读取 (16 bytes)
+            const auto* partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, row, col);
             const auto* vec_ptr = reinterpret_cast<const uint4*>(partial_ptr);
             uint4 data = *vec_ptr;
             // 解包并累加
-            const auto* bf16_data = reinterpret_cast<const cd_dtype_t*>(&data);
+            const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
             #pragma unroll
             for (uint32_t i = 0; i < kVecSize; ++ i) {
-                acc[i] += static_cast<float>(bf16_data[i]);
+                if constexpr (kReduceInFP32) {
+                    acc[i] += static_cast<float>(comm_data[i]);
+                } else {
+                    acc[i] += comm_data[i];
+                }
             }
         }
 
-        // 转回 BF16 并写出
+        // Convert accumulator to output dtype and write
         uint4 result;
-        auto* result_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
-        #pragma unroll
-        for (uint32_t i = 0; i < kVecSize; ++ i) {
-            result_bf16[i] = cd_dtype_t(acc[i]);
+        auto* result_out = reinterpret_cast<cd_dtype_t*>(&result);
+        // Output vector size may differ from comm vector size (e.g., comm=FP32, output=BF16)
+        // We need to handle size mismatch: kVecSize elements of comm_dtype → kVecSize elements of cd_dtype
+        // Since both work on kVecSize elements but output uint4 may not hold all of them,
+        // we write element by element when sizes differ
+        if constexpr (sizeof(cd_dtype_t) == sizeof(comm_dtype_t)) {
+            // Same size: pack into uint4 directly
+            #pragma unroll
+            for (uint32_t i = 0; i < kVecSize; ++ i) {
+                result_out[i] = cd_dtype_t(acc[i]);
+            }
+            auto* out_vec_ptr = reinterpret_cast<uint4*>(output + row * shape_n + col);
+            *out_vec_ptr = result;
+        } else {
+            // Different sizes: write elements individually
+            #pragma unroll
+            for (uint32_t i = 0; i < kVecSize; ++ i) {
+                output[(row * shape_n + col) + i] = cd_dtype_t(acc[i]);
+            }
         }
-        auto* out_vec_ptr = reinterpret_cast<uint4*>(output + row * shape_n + col);
-        *out_vec_ptr = result;
     }
 
     // ── 处理剩余元素（非对齐的尾部） ──
@@ -564,15 +599,18 @@ sm100_bf16_reduce_epilogue_impl(cd_dtype_t* __restrict__ output,
         const uint32_t m_block = row / BLOCK_M;
         const uint32_t n_block = col / BLOCK_N;
 
-        float acc = 0.0f;
+        accum_t acc = accum_t(0);
         #pragma unroll 1
         for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
-            // Poll ready flag before reading partial data
             auto* ready_ptr = workspace.get_ready_ptr(src_rank, m_block, n_block);
             while (ptx::ld_acq_sys(ready_ptr) == 0);
 
-            const auto* partial_ptr = workspace.get_partial_ptr<cd_dtype_t>(src_rank, row, col);
-            acc += static_cast<float>(*partial_ptr);
+            const auto* partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, row, col);
+            if constexpr (kReduceInFP32) {
+                acc += static_cast<float>(*partial_ptr);
+            } else {
+                acc += *partial_ptr;
+            }
         }
         output[row * shape_n + col] = cd_dtype_t(acc);
     }

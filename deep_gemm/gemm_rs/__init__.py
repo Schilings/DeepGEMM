@@ -15,16 +15,30 @@ class GemmRSSymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_max_tokens_per_rank: int,
                  hidden: int,
-                 out_dtype: torch.dtype = torch.bfloat16):
+                 out_dtype: torch.dtype = torch.bfloat16,
+                 comm_dtype: torch.dtype = None):
+        """
+        Args:
+            group: Process group for distributed communication
+            num_max_tokens_per_rank: Maximum tokens per rank (must be aligned)
+            hidden: Hidden dimension (N)
+            out_dtype: Output tensor dtype (bfloat16 or float32)
+            comm_dtype: Communication dtype for partial buffer (bfloat16 or float32).
+                        Controls the precision of NVLink data transfer.
+                        - bfloat16 (default): saves 50% NVLink bandwidth, slight precision loss in reduce
+                        - float32: full precision communication, 2x bandwidth cost
+                        If None, defaults to bfloat16 (recommended for training).
+        """
         self.group = group
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.hidden = hidden
         self.out_dtype = out_dtype
-        self.use_fp32_output = out_dtype == torch.float32
+        self.comm_dtype = comm_dtype if comm_dtype is not None else torch.bfloat16
+        self.use_fp32_comm = self.comm_dtype == torch.float32
 
-
+        # Buffer size is determined by comm_dtype (what's stored in partial buffer)
         num_bytes, slice_buffers = _C.get_symm_buffer_size_for_gemm_rs(
-            group.size(), num_max_tokens_per_rank, hidden, self.use_fp32_output)
+            group.size(), num_max_tokens_per_rank, hidden, self.use_fp32_comm)
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
         self.buffer.zero_()
@@ -44,9 +58,22 @@ class GemmRSSymmBuffer:
 def get_symm_buffer_for_gemm_rs(group: dist.ProcessGroup,
                                 num_max_tokens_per_rank: int,
                                 hidden: int,
-                                out_dtype: torch.dtype = torch.bfloat16) -> GemmRSSymmBuffer:
+                                out_dtype: torch.dtype = torch.bfloat16,
+                                comm_dtype: torch.dtype = None) -> GemmRSSymmBuffer:
+    """
+    Create a symmetric buffer for GEMM + Reduce-Scatter.
+
+    Args:
+        group: Process group
+        num_max_tokens_per_rank: Maximum tokens per rank
+        hidden: Hidden dimension (N)
+        out_dtype: Output tensor dtype
+        comm_dtype: Communication dtype for NVLink transfer (bfloat16 or float32).
+                    - None/bfloat16: saves bandwidth, recommended for training
+                    - float32: full precision, 2x bandwidth cost
+    """
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_gemm_rs())
-    return GemmRSSymmBuffer(group, num_max_tokens_per_rank, hidden, out_dtype)
+    return GemmRSSymmBuffer(group, num_max_tokens_per_rank, hidden, out_dtype, comm_dtype)
 
 
 def _fp8_gemm_nt_sm90(a: Tuple[torch.Tensor, torch.Tensor],
@@ -117,8 +144,26 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
                     b: torch.Tensor,
                     sym_buffer: GemmRSSymmBuffer,
                     num_tokens_per_rank: int,
-                    compiled_dims: str = 'nk'):
+                    compiled_dims: str = 'nk',
+                    reduce_in_fp32: bool = True):
+    """
+    BF16 GEMM + Reduce-Scatter (fused kernel on SM100).
+
+    Args:
+        y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
+        a: Input matrix [total_tokens, K], dtype bfloat16
+        b: Weight matrix [N, K] (NT layout), dtype bfloat16
+        sym_buffer: Symmetric buffer (created via get_symm_buffer_for_gemm_rs)
+        num_tokens_per_rank: Actual tokens per rank for this call
+        compiled_dims: JIT compilation dimension string
+        reduce_in_fp32: Whether to accumulate in FP32 during the reduce phase.
+                        - True (default): higher precision reduce, output is bit-exact with FP32 ref
+                        - False: reduce in comm_dtype precision, slightly less accurate but faster
+                        Note: when comm_dtype=float32, this flag has no effect (already FP32).
+    """
     assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt is for SM100/B-series GPUs'
+    # Determine comm_dtype string for C++ side
+    comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
     _C.bf16_gemm_rs_nt(
         y, a, b,
         sym_buffer.buffer,
@@ -127,6 +172,8 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
         sym_buffer.num_max_tokens_per_rank,
         num_tokens_per_rank,
         compiled_dims,
+        comm_dtype_str,
+        reduce_in_fp32,
     )
 
 

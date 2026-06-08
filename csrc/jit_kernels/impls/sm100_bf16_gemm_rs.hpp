@@ -27,6 +27,7 @@ public:
         int m, n, k;
         int num_ranks;
         at::ScalarType y_dtype;
+        at::ScalarType comm_dtype;  // Communication data type for partial buffer
         GemmRSConfig config;
 
         layout::SymBuffer<> sym_buffer_ptrs;
@@ -50,6 +51,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {}
     >);
 }};
@@ -60,7 +62,8 @@ static void __instantiate_kernel() {{
     args.config.swap_ab ? "true" : "false", args.config.with_accumulation ? "true" : "false",
     args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
-    to_string(args.y_dtype));
+    to_string(args.y_dtype),
+    to_string(args.comm_dtype));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -92,6 +95,8 @@ public:
         int max_m_per_rank;
         int num_sms;
         at::ScalarType y_dtype;
+        at::ScalarType comm_dtype;  // Communication data type (what's in the partial buffer)
+        bool reduce_in_fp32;        // Whether to accumulate in FP32 during reduce
         GemmRSConfig config;
 
         void* y;
@@ -110,13 +115,17 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
+        {},
+        {},
         {}
     >);
 }};
 )", args.config.block_m, args.config.block_n,
     args.launch_args.grid_dim.first, args.num_ranks,
     args.config.reduce_num_threads,
-    to_string(args.y_dtype));
+    to_string(args.y_dtype),
+    to_string(args.comm_dtype),
+    args.reduce_in_fp32 ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -147,7 +156,9 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
                                   const int& runtime_m_per_rank,
                                   const int& n,
                                   const int& k,
-                                  const std::string& compiled_dims) {
+                                  const std::string& compiled_dims,
+                                  const at::ScalarType& comm_dtype = torch::kBFloat16,
+                                  const bool& reduce_in_fp32 = true) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_sms = device_runtime->get_num_sms();
     const auto m = runtime_m_per_rank * num_ranks;
@@ -167,6 +178,9 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
                                                static_cast<int>(b.stride(-2)),
                                                config.swizzle_b_mode);
 
+    // Validate comm_dtype
+    DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
+
     // ── 阶段1: GEMM + Push kernel ──
     // 线程数 = num_non_epilogue_threads + num_epilogue_threads (不再有 RS warps)
     const SM100BF16GemmRSRuntime::Args gemm_args = {
@@ -175,6 +189,7 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
         .m = m, .n = n, .k = k,
         .num_ranks = num_ranks,
         .y_dtype = y.scalar_type(),
+        .comm_dtype = comm_dtype,
         .config = config,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_a = tensor_map_a,
@@ -205,6 +220,8 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
         .max_m_per_rank = max_m_per_rank,
         .num_sms = num_sms,
         .y_dtype = y.scalar_type(),
+        .comm_dtype = comm_dtype,
+        .reduce_in_fp32 = reduce_in_fp32,
         .config = config,
         .y = y.data_ptr(),
         .workspace_base = workspace_base,

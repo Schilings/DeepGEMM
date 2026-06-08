@@ -110,7 +110,9 @@ static void bf16_gemm_rs_nt(const torch::Tensor& y,
                             const int& rank_idx,
                             const int& num_max_tokens_per_rank,
                             const int& num_tokens_per_rank,
-                            const std::string& compiled_dims) {
+                            const std::string& compiled_dims,
+                            const std::string& comm_dtype_str = "bf16",
+                            const bool& reduce_in_fp32 = true) {
 #if DG_TENSORMAP_COMPATIBLE
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 10);
@@ -133,13 +135,24 @@ static void bf16_gemm_rs_nt(const torch::Tensor& y,
     check_major_type_cd(y);
     DG_HOST_ASSERT(n % 128 == 0 and k % 64 == 0);
 
-    const bool use_fp32_output = y.scalar_type() == torch::kFloat;
+    // Parse communication dtype
+    at::ScalarType comm_dtype;
+    if (comm_dtype_str == "bf16" or comm_dtype_str == "bfloat16") {
+        comm_dtype = torch::kBFloat16;
+    } else if (comm_dtype_str == "fp32" or comm_dtype_str == "float32") {
+        comm_dtype = torch::kFloat;
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported comm_dtype: must be 'bf16' or 'fp32'");
+    }
+
+    const bool use_fp32_comm = (comm_dtype == torch::kFloat);
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_gemm_rs(
-        num_ranks, num_max_tokens_per_rank, n, use_fp32_output);
+        num_ranks, num_max_tokens_per_rank, n, use_fp32_comm);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
 
     sm100_bf16_gemm_rs_nt(y, a, b, sym_buffer, sym_buffer_ptrs, rank_idx,
-                          num_max_tokens_per_rank, num_tokens_per_rank, n, k, compiled_dims);
+                          num_max_tokens_per_rank, num_tokens_per_rank, n, k, compiled_dims,
+                          comm_dtype, reduce_in_fp32);
 #else
     DG_HOST_UNREACHABLE("BF16 GEMM+RS requires TensorMap support");
 #endif
@@ -163,7 +176,9 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("y"), pybind11::arg("a"), pybind11::arg("b"), pybind11::arg("sym_buffer"),
           pybind11::arg("sym_buffer_ptrs"), pybind11::arg("rank_idx"),
           pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_tokens_per_rank"),
-          pybind11::arg("compiled_dims") = "nk");
+          pybind11::arg("compiled_dims") = "nk",
+          pybind11::arg("comm_dtype") = "bf16",
+          pybind11::arg("reduce_in_fp32") = true);
 #endif
 }
 
