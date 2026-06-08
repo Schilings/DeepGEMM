@@ -6,6 +6,7 @@
 
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
+#include "../utils/system.hpp"
 
 #define PYTORCH_SUPPORTS_GET_CUBLASLT_HANDLE (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3))
 

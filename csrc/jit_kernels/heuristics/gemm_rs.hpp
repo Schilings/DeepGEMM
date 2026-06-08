@@ -18,13 +18,21 @@ struct GemmRSConfig {
     int num_rs_threads;  // FP8 路径仍使用 RS warps，BF16 路径设为 0
     int num_non_epilogue_threads, num_epilogue_threads;
     int num_multicast;
+    bool is_multicast_on_a;
+    bool swap_ab;
+    bool with_accumulation;
     int reduce_num_threads;  // BF16 路径: reduce epilogue kernel 的线程数
 
     friend std::ostream& operator << (std::ostream& os, const GemmRSConfig& config) {
         os << "GemmRSConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
-           << ", num_rs_threads=" << config.num_rs_threads
+           << ", swizzle_a=" << config.swizzle_a_mode << ", swizzle_b=" << config.swizzle_b_mode
+           << ", swizzle_cd=" << config.swizzle_cd_mode
+           << ", num_multicast=" << config.num_multicast
+           << ", is_multicast_on_a=" << config.is_multicast_on_a
+           << ", swap_ab=" << config.swap_ab
+           << ", with_accumulation=" << config.with_accumulation
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
            << ", reduce_num_threads=" << config.reduce_num_threads << ")";
@@ -66,6 +74,10 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int num_stages = std::min((SM100ArchSpec::smem_capacity - smem_extra) / smem_per_stage, 8);
     DG_HOST_ASSERT(num_stages >= 2);
 
+    constexpr bool is_multicast_on_a = true;  // Default: multicast on A dimension
+    constexpr bool swap_ab = false;            // Default: no swap
+    constexpr bool with_accumulation = false;  // Default: no accumulation
+
     const auto config = GemmRSConfig{
         block_m, block_n, block_k,
         load_block_m, load_block_n,
@@ -74,6 +86,9 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
         num_rs_threads,
         num_non_epilogue_threads, num_epilogue_threads,
         num_multicast,
+        is_multicast_on_a,
+        swap_ab,
+        with_accumulation,
         reduce_num_threads
     };
 

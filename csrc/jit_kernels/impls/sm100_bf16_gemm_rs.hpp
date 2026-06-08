@@ -45,6 +45,9 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_bf16_gemm_rs_nt_impl<
         {}, {}, {},
         {},
+        {}, {}, {},
+        {}, {},
+        {}, {},
         {}, {},
         {}, {},
         {}
@@ -52,6 +55,9 @@ static void __instantiate_kernel() {{
 }};
 )", args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_stages,
+    args.config.swizzle_a_mode, args.config.swizzle_b_mode, args.config.swizzle_cd_mode,
+    args.config.num_multicast, args.config.is_multicast_on_a ? "true" : "false",
+    args.config.swap_ab ? "true" : "false", args.config.with_accumulation ? "true" : "false",
     args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.y_dtype));

@@ -7,8 +7,10 @@
 
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/tma_utils.cuh>
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm::sm100 {
+using namespace deep_gemm::math;
 
 __device__ __forceinline__
 cute::UMMA::SmemDescriptor make_smem_desc(cute::UMMA::LayoutType layout, void* smem_ptr,
