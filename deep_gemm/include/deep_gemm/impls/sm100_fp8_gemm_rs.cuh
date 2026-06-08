@@ -29,19 +29,20 @@ using namespace deep_gemm::math;
 //
 //  【设计思想】
 //
-//  两阶段分离架构（与 BF16 版本相同的设计模式）：
+//  两阶段分离架构（方案 B: 统一 barrier 同步）：
 //
 //  ┌──────────────────────────────────────────────────────────────┐
 //  │ 阶段1: FP8 GEMM + NVLink Push (本 kernel)                   │
 //  │                                                              │
-//  │  调度顺序: rank i 先计算发往 rank i+1 的 chunk → push       │
-//  │           再计算 rank i+2 → push                            │
-//  │           ...                                                │
-//  │           最后计算自己 rank i 的 → 直接写本地 partial buf     │
+//  │  Ring 调度: rank i 先计算 rank (i+1) 的 chunk → push        │
+//  │            再计算 rank (i+2) → push                         │
+//  │            ...                                               │
+//  │            最后计算自己 rank i 的 → 直接写本地 partial buf    │
+//  │            每波计算掩盖上一波的 NVLink 通信                    │
 //  │                                                              │
-//  │  N 次计算掩盖 N-1 次通信                                     │
 //  │  Epilogue: TMEM → registers → global store 到远端 partial   │
-//  │  完成后设置 ready flag (st_rel_sys)                          │
+//  │  所有 tile 完成后: __threadfence_system + nvlink_barrier     │
+//  │  跨 rank 同步（整个 kernel 只做一次）                         │
 //  └──────────────────────────────────────────────────────────────┘
 //             │
 //             │ PDL (Programmatic Dependent Launch)
@@ -50,7 +51,7 @@ using namespace deep_gemm::math;
 //  │ 阶段2: Reduce Epilogue (独立 kernel, 复用 bf16 版本)         │
 //  │                                                              │
 //  │  cudaGridDependencySynchronize() 等待阶段1完成               │
-//  │  从 partial buffer 读取各 rank 的数据                        │
+//  │  直接读取 partial buffer（无需轮询 ready flag）              │
 //  │  element-wise 累加 → 写 output                               │
 //  └──────────────────────────────────────────────────────────────┘
 //
@@ -61,12 +62,13 @@ using namespace deep_gemm::math;
 //  - Warp 1: UTCCP 拷贝 SF 到 TMEM + SM100_MMA_MXF8F6F4_SS::fma
 //  - 累加器始终为 FP32，通信精度由 comm_dtype_t 模板参数控制
 //
-//  【优势】（相比旧版内嵌 RS warps 方案）
+//  【优势】（相比 per-tile fence + ready flag 方案）
 //
-//  1. 去掉 128 个 RS 线程（384→256），所有线程用于计算和通信
-//  2. Reduce kernel 不需自旋等待，PDL 保证数据已就绪
-//  3. 简化的 epilogue: 直接 TMEM → registers → global store
+//  1. __threadfence_system 整个 kernel 只执行一次（而非每 tile 一次）
+//  2. Reduce kernel 无需自旋等 ready flag，进入即可直接读取
+//  3. 简化的 epilogue: TMEM → registers → global store，无 flag 设置开销
 //  4. 支持 comm_dtype_t 选择通信精度（BF16 省带宽 / FP32 保精度）
+//  5. 两个 kernel 间通过 PDL 重叠，reduce 可在 GEMM 即将结束时开始
 //
 // ============================================================================================
 
@@ -221,15 +223,11 @@ sm100_fp8_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
-    // ── Clean ready flags (cross-rank sync) ──
-    for (uint32_t i = sm_idx * kNumThreads + thread_idx;
-         i < kNumRanks * workspace.get_num_m_blocks_per_rank() * workspace.get_num_n_blocks();
-         i += kNumSMs * kNumThreads) {
-        auto* ready_base = workspace.get_ready_ptr();
-        ready_base[i] = 0;
-    }
-    constexpr uint32_t kAfterReadyCleanBarrierTag = 41;
-    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kAfterReadyCleanBarrierTag>(
+    // 方案 B: 不需要 ready flag 清零和初始 barrier
+    // 所有同步通过 kernel 结束前的 nvlink_barrier 统一完成
+    constexpr uint32_t kInitBarrierTag = 41;
+    constexpr uint32_t kFinalBarrierTag = 42;
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kInitBarrierTag>(
         workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
 
     // ── Pipeline state ──
@@ -547,23 +545,17 @@ sm100_fp8_gemm_rs_nt_impl(const uint32_t shape_m_per_rank,
             // Release TMEM stage for next MMA iteration
             ptx::tcgen05_before_thread_sync();
             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-
-            // ── Ensure all stores are visible, then set ready flag ──
-            __threadfence_system();
-
-            if (epilogue_thread_idx == 0) {
-                uint32_t* remote_ready_ptr = is_self_rank ?
-                    workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx) :
-                    sym_buffer.map(
-                        workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx),
-                        dst_rank);
-                ptx::st_rel_sys(remote_ready_ptr, 1u);
-            }
         }
     }
 
-    // TODO: Remove redundant synchronization
+    // ── 方案 B: 所有 tile 完成后，统一做一次全局 fence + 跨 rank barrier ──
+    // 确保所有 global store（包括 NVLink push）对远端可见
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+    __threadfence_system();
+
+    // 跨 rank nvlink_barrier: 等所有 rank 的 GEMM kernel 都完成写入
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kFinalBarrierTag>(
+        workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
 
     // Deallocate tensor memory
     if (warp_idx == 0)
