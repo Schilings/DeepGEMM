@@ -287,15 +287,18 @@ cd /root/.local/codebuddy/DeepGEMM
 # 2 GPU, 默认 20 iterations
 python benchmarks/bench_gemm_rs.py 2
 
+# 4 GPU
+python benchmarks/bench_gemm_rs.py 4
+
 # 8 GPU, 50 iterations（更稳定的测量）
 python benchmarks/bench_gemm_rs.py 8 50
 ```
 
-Benchmark 覆盖多种 shape（M=256~4096, N/K=512~7168），输出每种配置的延迟（μs）、TFLOPS 和相对加速比。
+Benchmark 覆盖多种 shape（M=256~4096, N/K=512~7168）和多种 rank 数（2/4/8），输出每种配置的延迟（μs）、TFLOPS 和相对加速比。
 
 详细结果与分析见 [BENCHMARK_GEMM_RS.md](./BENCHMARK_GEMM_RS.md)。
 
-> **结论**：融合 kernel 在小 batch（M_per_rank ≤ 256）下提供 1.3–1.6x 加速（适合 MoE inference），大矩阵下应使用分离方案。
+> **结论**：融合 kernel 仅在 **2 GPU + 小 batch（M_per_rank ≤ 256）** 下有正收益（1.3–1.6x）。4+ GPU 或大矩阵场景下应使用分离方案（NCCL reduce_scatter）。
 
 ## 常见问题
 
