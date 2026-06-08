@@ -177,6 +177,45 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
     )
 
 
+def bf16_gemm_rs_fused(y: torch.Tensor,
+                      a: torch.Tensor,
+                      b: torch.Tensor,
+                      sym_buffer: GemmRSSymmBuffer,
+                      num_tokens_per_rank: int,
+                      compiled_dims: str = 'nk',
+                      reduce_in_fp32: bool = True):
+    """
+    BF16 GEMM + Reduce-Scatter 全融合版本（单 kernel 完成 compute + push + reduce）。
+
+    与 bf16_gemm_rs_nt 相比：
+    - 单 kernel：不需要第二个 reduce kernel
+    - 在线 reduce：Reduce Warps 在 GEMM 进行的同时轮询并 reduce，compute 和 reduce 完全 overlap
+    - 省带宽：不需要从 DRAM 重新读取 partial buffer
+
+    Args:
+        y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
+        a: Input matrix [total_tokens, K], dtype bfloat16
+        b: Weight matrix [N, K] (NT layout), dtype bfloat16
+        sym_buffer: Symmetric buffer (created via get_symm_buffer_for_gemm_rs)
+        num_tokens_per_rank: Actual tokens per rank for this call
+        compiled_dims: JIT compilation dimension string
+        reduce_in_fp32: Whether to accumulate in FP32 during reduce
+    """
+    assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_fused is for SM100/B-series GPUs'
+    comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
+    _C.bf16_gemm_rs_fused(
+        y, a, b,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        num_tokens_per_rank,
+        compiled_dims,
+        comm_dtype_str,
+        reduce_in_fp32,
+    )
+
+
 def fp8_gemm_rs_nt(y: torch.Tensor,
                    a: Tuple[torch.Tensor, torch.Tensor],
                    b: Tuple[torch.Tensor, torch.Tensor],

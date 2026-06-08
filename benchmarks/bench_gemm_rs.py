@@ -123,17 +123,29 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
         t_fused_bf16 = bench_fn(bf16_fused, num_iters=num_iters, barrier_group=group)
 
+        # --- Full Fused: bf16_gemm_rs_fused (single kernel, no reduce kernel) ---
+        y_fused_full = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=device)
+
+        def bf16_fused_full():
+            deep_gemm.bf16_gemm_rs_fused(y_fused_full, a_bf16, b_bf16, sym_buffer_bf16,
+                                          tokens_per_rank, compiled_dims='nk')
+
+        t_fused_full = bench_fn(bf16_fused_full, num_iters=num_iters, barrier_group=group)
+
         speedup_bf16 = t_separate_bf16 / t_fused_bf16 if t_fused_bf16 > 0 else float('inf')
+        speedup_full = t_separate_bf16 / t_fused_full if t_fused_full > 0 else float('inf')
 
         if rank_idx == 0:
             shape_str = f"{total_m}×{n_dim}×{k_dim}"
             print(f"{shape_str:>20} │ {'BF16 separate (gemm+RS)':^30} │ "
                   f"{t_separate_bf16*1e6:10.1f} │ {flops/t_separate_bf16/1e12:8.1f} │ {'baseline':>8}")
-            print(f"{'':>20} │ {'BF16 fused (gemm_rs_nt)':^30} │ "
+            print(f"{'':>20} │ {'BF16 fused 2-kernel':^30} │ "
                   f"{t_fused_bf16*1e6:10.1f} │ {flops/t_fused_bf16/1e12:8.1f} │ {speedup_bf16:7.2f}x")
+            print(f"{'':>20} │ {'BF16 fused FULL (方案A)':^30} │ "
+                  f"{t_fused_full*1e6:10.1f} │ {flops/t_fused_full/1e12:8.1f} │ {speedup_full:7.2f}x")
 
         sym_buffer_bf16.destroy()
-        del d_full_bf16, y_separate_bf16, y_fused_bf16
+        del d_full_bf16, y_separate_bf16, y_fused_bf16, y_fused_full
         dist.barrier(group)
 
         # ═══════════════════════════════════════════════════════════════════

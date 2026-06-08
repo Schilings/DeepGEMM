@@ -111,6 +111,7 @@ from .gemm_rs import (
     fp8_gemm_rs_nt,
     fp8_gemm_rs_nt_hopper,
     bf16_gemm_rs_nt,
+    bf16_gemm_rs_fused,
     bf16_gemm_rs_nt_hopper,
 )
 
