@@ -636,7 +636,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,            // 分组 GEMM 的�
 //     if (blockIdx.x == 0 and threadIdx.x == 0)
 //         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
 // #endif
-// }
+}
 
 };  // namespace deep_gemm
 

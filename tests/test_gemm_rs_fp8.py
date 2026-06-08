@@ -45,13 +45,14 @@ def run_test(local_rank: int, num_local_ranks: int):
     dist.barrier()
 
     # ── Quantize to FP8 (per-token for A, per-token for B in NT layout) ──
-    a_fp8, a_sf = per_token_cast_to_fp8(a_bf16, use_ue8m0=False, gran_k=gran_k)
-    b_fp8, b_sf = per_token_cast_to_fp8(b_bf16, use_ue8m0=False, gran_k=gran_k)
+    # SM100 requires UE8M0 scale factors (packed int format)
+    a_fp8, a_sf = per_token_cast_to_fp8(a_bf16, use_ue8m0=True, gran_k=gran_k)
+    b_fp8, b_sf = per_token_cast_to_fp8(b_bf16, use_ue8m0=True, gran_k=gran_k)
 
     # ── Reference: fp8_gemm_nt (full GEMM) + FP32 manual reduce_scatter ──
     # Compute full GEMM on all ranks
     d_full = torch.zeros((total_m, n_dim), dtype=torch.bfloat16, device=f'cuda:{local_rank}')
-    deep_gemm.fp8_gemm_nt((a_fp8, a_sf), (b_fp8, b_sf), d_full)
+    deep_gemm.fp8_gemm_nt((a_fp8, a_sf), (b_fp8, b_sf), d_full, recipe=(1, 1, gran_k))
     torch.cuda.synchronize(local_rank)
 
     # Gather all ranks' GEMM results and reduce in FP32
@@ -79,7 +80,7 @@ def run_test(local_rank: int, num_local_ranks: int):
         print(">>> Phase 1: Warm-up (JIT compilation)...")
     deep_gemm.fp8_gemm_rs_nt(y, (a_fp8, a_sf), (b_fp8, b_sf), sym_buffer,
                               tokens_per_rank, recipe=(1, 1, gran_k),
-                              compiled_dims='nk', disable_ue8m0_cast=True)
+                              compiled_dims='nk')
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
@@ -89,7 +90,7 @@ def run_test(local_rank: int, num_local_ranks: int):
     y2 = torch.zeros_like(y)
     deep_gemm.fp8_gemm_rs_nt(y2, (a_fp8, a_sf), (b_fp8, b_sf), sym_buffer,
                               tokens_per_rank, recipe=(1, 1, gran_k),
-                              compiled_dims='nk', disable_ue8m0_cast=True)
+                              compiled_dims='nk')
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
@@ -139,7 +140,7 @@ def run_test(local_rank: int, num_local_ranks: int):
     y_fp32_comm = torch.zeros_like(y)
     deep_gemm.fp8_gemm_rs_nt(y_fp32_comm, (a_fp8, a_sf), (b_fp8, b_sf), sym_buffer_fp32,
                               tokens_per_rank, recipe=(1, 1, gran_k),
-                              compiled_dims='nk', disable_ue8m0_cast=True,
+                              compiled_dims='nk',
                               comm_dtype='fp32', reduce_in_fp32=True)
     torch.cuda.synchronize(local_rank)
     dist.barrier()
