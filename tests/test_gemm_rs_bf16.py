@@ -1,7 +1,7 @@
 """
-Lightweight validation test for BF16 GEMM + Reduce-Scatter operator on 2 GPUs.
-Compares bf16_gemm_rs_nt kernel with standard bf16_gemm + reduce_scatter_tensor.
-Usage: MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 python test_gemm_rs_bf16.py
+Lightweight validation test for BF16 GEMM + Reduce-Scatter operator (2~8 GPUs).
+Compares bf16_gemm_rs_nt kernel with bf16_gemm + FP32 manual reduce-scatter.
+Usage: python test_gemm_rs_bf16.py [num_gpus]  (default: 2)
 """
 
 import os
@@ -42,14 +42,26 @@ def run_test(local_rank: int, num_local_ranks: int):
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
-    # ── Reference: standard bf16_gemm + reduce_scatter_tensor ──
+    # ── Reference: bf16_gemm + FP32 manual reduce_scatter ──
+    # NOTE: We use FP32 accumulation for the reference because our reduce epilogue
+    # kernel also accumulates in FP32. torch.reduce_scatter_tensor uses BF16 accumulation
+    # (via NCCL), which introduces significant rounding errors at 8+ ranks.
     d_full = torch.zeros((total_m, n_dim), dtype=torch.bfloat16, device=f'cuda:{local_rank}')
     deep_gemm.bf16_gemm_nt(a, b, d_full)
     torch.cuda.synchronize(local_rank)
 
-    ref = torch.empty((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=f'cuda:{local_rank}')
-    dist.reduce_scatter_tensor(ref, d_full.contiguous(), op=dist.ReduceOp.SUM, group=group)
+    # Gather all ranks' GEMM results and reduce in FP32
+    all_d_fulls = [torch.empty_like(d_full) for _ in range(num_ranks)]
+    dist.all_gather(all_d_fulls, d_full)
     torch.cuda.synchronize(local_rank)
+
+    start_row = rank_idx * tokens_per_rank
+    end_row = start_row + tokens_per_rank
+    ref_fp32 = torch.zeros((tokens_per_rank, n_dim), dtype=torch.float32, device=f'cuda:{local_rank}')
+    for r in range(num_ranks):
+        ref_fp32 += all_d_fulls[r][start_row:end_row, :].float()
+    ref = ref_fp32.bfloat16()
+    del all_d_fulls, d_full, ref_fp32
     dist.barrier()
 
     # ── Create symmetric buffer ──
@@ -116,5 +128,7 @@ def run_test(local_rank: int, num_local_ranks: int):
 
 
 if __name__ == '__main__':
-    num_gpus = 2
+    import sys
+    num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+    print(f"Launching test with {num_gpus} GPUs...")
     mp.spawn(run_test, args=(num_gpus,), nprocs=num_gpus, join=True)
