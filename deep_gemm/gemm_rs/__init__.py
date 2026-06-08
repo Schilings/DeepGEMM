@@ -178,16 +178,15 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
 
 
 def fp8_gemm_rs_nt(y: torch.Tensor,
-
-
-
                    a: Tuple[torch.Tensor, torch.Tensor],
                    b: Tuple[torch.Tensor, torch.Tensor],
                    sym_buffer: GemmRSSymmBuffer,
                    num_tokens_per_rank: int,
                    recipe: Tuple[int, int, int] = (1, 1, 32),
                    compiled_dims: str = 'nk',
-                   disable_ue8m0_cast: bool = False):
+                   disable_ue8m0_cast: bool = False,
+                   comm_dtype: str = 'bf16',
+                   reduce_in_fp32: bool = True):
     _C.fp8_gemm_rs_nt(
         y, a, b,
         sym_buffer.buffer,
@@ -198,5 +197,7 @@ def fp8_gemm_rs_nt(y: torch.Tensor,
         recipe,
         compiled_dims,
         disable_ue8m0_cast,
+        comm_dtype,
+        reduce_in_fp32,
     )
 

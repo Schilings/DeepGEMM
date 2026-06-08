@@ -51,9 +51,9 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     constexpr int swizzle_a_mode = 128;
     constexpr int swizzle_b_mode = 128;
     constexpr int swizzle_cd_mode = 128;
-    // BF16 (elem_size_ab=2): 不再有 RS warps，由独立 PDL reduce kernel 处理
-    // FP8  (elem_size_ab=1): 仍保留 RS warps (旧架构)
-    const int num_rs_threads = (elem_size_ab == 2) ? 0 : 128;
+    // BF16 (elem_size_ab=2) 和 FP8 (elem_size_ab=1):
+    // 都已改为两阶段 PDL 架构，不再需要 RS warps
+    const int num_rs_threads = 0;
     constexpr int num_non_epilogue_threads = 128;  // Warp 0 (TMA load) + Warp 1 (MMA issue)
     constexpr int num_epilogue_threads = 128;      // Warp 2-3: TMEM → smem → TMA store
     constexpr int num_multicast = 1;

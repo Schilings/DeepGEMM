@@ -60,7 +60,9 @@ static void fp8_gemm_rs_nt(const torch::Tensor& y,
                            const int& num_tokens_per_rank,
                            const std::tuple<int, int, int>& recipe,
                            const std::string& compiled_dims,
-                           const bool& disable_ue8m0_cast) {
+                           const bool& disable_ue8m0_cast,
+                           const std::string& comm_dtype_str = "bf16",
+                           const bool& reduce_in_fp32 = true) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     const auto [a, a_sf] = a_tuple;
     const auto [b, b_sf] = b_tuple;
@@ -89,13 +91,24 @@ static void fp8_gemm_rs_nt(const torch::Tensor& y,
         a_sf, b_sf, m, n, k, recipe_opt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, disable_ue8m0_cast);
     DG_HOST_ASSERT(gran_k_a == gran_k_b);
 
-    const bool use_fp32_output = y.scalar_type() == torch::kFloat;
+    // Parse communication dtype
+    at::ScalarType comm_dtype;
+    if (comm_dtype_str == "bf16" or comm_dtype_str == "bfloat16") {
+        comm_dtype = torch::kBFloat16;
+    } else if (comm_dtype_str == "fp32" or comm_dtype_str == "float32") {
+        comm_dtype = torch::kFloat;
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported comm_dtype: must be 'bf16' or 'fp32'");
+    }
+
+    const bool use_fp32_comm = (comm_dtype == torch::kFloat);
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_gemm_rs(
-        num_ranks, num_max_tokens_per_rank, n, use_fp32_output);
+        num_ranks, num_max_tokens_per_rank, n, use_fp32_comm);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
 
-    sm100_fp8_gemm_rs_nt(y, a, sfa, b, sfb, sym_buffer_ptrs, rank_idx,
-                         num_max_tokens_per_rank, num_tokens_per_rank, gran_k_a, n, k, compiled_dims);
+    sm100_fp8_gemm_rs_nt(y, a, sfa, b, sfb, sym_buffer, sym_buffer_ptrs, rank_idx,
+                         num_max_tokens_per_rank, num_tokens_per_rank, gran_k_a, n, k, compiled_dims,
+                         comm_dtype, reduce_in_fp32);
 
 #else
     DG_HOST_UNREACHABLE("FP8 GEMM+RS requires FP8 and TensorMap support");
@@ -169,7 +182,9 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_tokens_per_rank"),
           pybind11::arg("recipe") = std::make_tuple(1, 1, 32),
           pybind11::arg("compiled_dims") = "nk",
-          pybind11::arg("disable_ue8m0_cast") = false);
+          pybind11::arg("disable_ue8m0_cast") = false,
+          pybind11::arg("comm_dtype") = "bf16",
+          pybind11::arg("reduce_in_fp32") = true);
 #endif
 #if DG_TENSORMAP_COMPATIBLE
     m.def("bf16_gemm_rs_nt", &bf16_gemm_rs_nt,
