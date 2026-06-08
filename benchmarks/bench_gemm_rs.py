@@ -137,24 +137,8 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
         dist.barrier(group)
 
         # ═══════════════════════════════════════════════════════════════════
-        # FP8 Benchmark (skip if SKIP_FP8 env is set)
+        # FP8 Benchmark
         # ═══════════════════════════════════════════════════════════════════
-        if os.environ.get('SKIP_FP8', ''):
-            if rank_idx == 0:
-                print(f"{'':>20} │ {'(FP8 skipped)':^30} │ {'---':>10} │ {'---':>8} │ {'---':>8}")
-                print("─" * 90)
-            results.append({
-                'shape': (total_m, n_dim, k_dim),
-                'bf16_separate_us': t_separate_bf16 * 1e6,
-                'bf16_fused_us': t_fused_bf16 * 1e6,
-                'bf16_speedup': speedup_bf16,
-                'fp8_separate_us': 0, 'fp8_fused_bf16_us': 0, 'fp8_fused_fp32_us': 0,
-                'fp8_speedup_bf16': 0, 'fp8_speedup_fp32': 0,
-            })
-            del a_bf16, b_bf16
-            dist.barrier(group)
-            continue
-
         gran_k = 128
         a_fp8, a_sf = per_token_cast_to_fp8(a_bf16, use_ue8m0=True, gran_k=gran_k)
         b_fp8, b_sf = per_token_cast_to_fp8(b_bf16, use_ue8m0=True, gran_k=gran_k)

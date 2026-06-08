@@ -92,21 +92,30 @@ DeepGEMM 的 **GEMM-RS (GEMM + Reduce-Scatter)** 融合 kernel，目标是在多
 | 测试 | 2 GPU | 8 GPU |
 |------|-------|-------|
 | BF16 GEMM-RS | ✅ PASS (max_diff=0.0) | ✅ PASS (max_diff=0.0) |
-| FP8 GEMM-RS | ❌ `cudaErrorIllegalAddress` (pre-existing) | — |
+| FP8 GEMM-RS (BF16 comm) | ✅ PASS (max_diff=0.0) | ✅ PASS (max_diff=0.0) |
+| FP8 GEMM-RS (FP32 comm) | ✅ PASS (max_diff=0.0) | ✅ PASS (max_diff=0.0) |
 
 ---
 
 ## 🐛 已知问题
 
-### FP8 Kernel `cudaErrorIllegalAddress`
+### ~~FP8 Kernel `cudaErrorIllegalAddress`~~ ✅ 已修复！
 
-- **状态**: Pre-existing bug，在方案B改动之前和之后都存在
-- **验证方式**: `git stash` 回滚到原始代码后仍然崩溃
-- **可能原因**: 
-  - FP8 epilogue 中的 `sym_buffer.map()` 地址映射问题
-  - workspace 布局/大小计算错误
-  - 或者 FP8 kernel 的 tile 调度逻辑有越界访问
-- **优先级**: 待 BF16 稳定后排查
+- **根因**: `get_pipeline_config_for_gemm_rs()` 在计算 shared memory 大小时，
+  漏了 FP8 特有的 SFA/SFB 缓冲区和 `with_sf_full` barriers 开销
+- **修复**: 为 `get_pipeline_config_for_gemm_rs()` 添加 `is_fp8` 参数，
+  FP8 路径正确计入 `smem_sfa_per_stage + smem_sfb_per_stage + 3 barriers/stage`
+- **验证**: 2 GPU 和 8 GPU FP8 测试全部 PASS (max_diff=0.000000)
+
+### FP8 Fused 性能问题（待优化）
+
+- **现象**: FP8 fused 比 separate 慢很多（0.07x ~ 0.72x）
+- **根因**: FP8 epilogue 使用逐元素 global store（不是 TMA bulk store）
+  - 每个线程逐个写 4 bytes 到远端 NVLink 内存
+  - 对于大 shape 严重串行化
+- **优化方向**: 
+  - 改为 TMA store（需要 FP32→BF16/FP32 转换后写入 smem，再 TMA bulk store）
+  - 或者仿照 BF16 kernel 的 TMEM→smem→TMA store 流水线
 
 ---
 
@@ -153,19 +162,21 @@ benchmarks/
 
 ## 🚀 后续优化方向（按优先级）
 
-### P0: FP8 Bug 修复
-- 排查 `cudaErrorIllegalAddress` 根因
-- 可能需要检查 sym_buffer 映射、workspace 大小、tile 调度边界
+### P0: FP8 Epilogue 性能优化
+- **TMA Store**: 将 FP8 epilogue 从逐元素 global store 改为 TMEM→smem→TMA bulk store
+  - 参考 BF16 kernel 的实现（smem staging + TMA 1D store per row）
+  - 需要在 smem 中做 FP32→comm_dtype 转换后再 TMA 写出
+- **当前状态**: FP8 fused 只有小 shape 接近 separate 性能（0.72x），大 shape 慢 5~10x
 
 ### P1: 大 Shape 性能优化
-- **TMA Store 2D**: 替代 FP8 当前逐行 global store，减少 epilogue 延迟
 - **Heuristics 调优**: 4096×2048×4096 等 shape 的 block_m 选择优化
 - **Persistent kernel**: 考虑 persistent thread block 减少 launch overhead
+- **BF16 大 shape**: 目前 0.57x~0.71x 的 shape 需要更好的 tile 分配策略
 
 ### P2: 功能完善
-- FP8 comm_dtype 支持（BF16 通信精度 vs FP32 通信精度）
 - 支持更多 MoE shape 组合
 - 与 mega_moe 的深度整合
+- 多节点支持（跨 NVSwitch domain）
 
 ---
 

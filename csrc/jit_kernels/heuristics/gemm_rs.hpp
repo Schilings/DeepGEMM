@@ -107,10 +107,12 @@ static std::tuple<int, int, int, int> get_block_config_for_gemm_rs(
 
 // ── Pipeline stage 数量计算 ──
 // 根据 shared memory 容量和 tile 大小自动计算最大 stage 数
+// is_fp8: FP8 需要额外的 SFA/SFB shared memory 和 with_sf_full barriers
 static std::pair<int, int> get_pipeline_config_for_gemm_rs(
     const int& block_m, const int& block_n, const int& block_k,
     const int& store_block_m, const int& elem_size_ab,
-    const int& num_epilogue_threads, const int& swizzle_cd_mode) {
+    const int& num_epilogue_threads, const int& swizzle_cd_mode,
+    const bool& is_fp8 = false) {
     constexpr int kNumTMAStoreStages = 2;
     constexpr int kNumEpilogueStages = 2;
 
@@ -125,18 +127,27 @@ static std::pair<int, int> get_pipeline_config_for_gemm_rs(
     const int smem_a_per_stage = load_block_m * block_k * elem_size_ab;
     const int smem_b_per_stage = load_block_n * block_k * elem_size_ab;
 
-    // Barriers:
-    // - kNumStages full barriers + kNumStages empty barriers (for MMA pipeline)
-    // - kNumEpilogueStages tmem_full + kNumEpilogueStages tmem_empty (for epilogue pipeline)
-    // We don't know num_stages yet, so compute fixed barrier cost separately
-    // Each stage has 2 barriers (full + empty), each 8 bytes
-    // Fixed: epilogue barriers + tmem pointer
-    const int smem_barriers_per_stage = 2 * 8;  // full + empty per stage
+    // FP8: scale factor buffers per stage
+    // SF_BLOCK_M = align(block_m, 128), SF_BLOCK_N = align(block_n, 128)
+    const int sf_block_m = is_fp8 ? ((block_m + 127) / 128 * 128) : 0;
+    const int sf_block_n = is_fp8 ? ((block_n + 127) / 128 * 128) : 0;
+    const int smem_sfa_per_stage = sf_block_m * 4;  // sizeof(uint32_t)
+    const int smem_sfb_per_stage = sf_block_n * 4;
+
+    // Barriers per stage:
+    // - BF16: full + empty = 2 barriers per stage
+    // - FP8: full + empty + with_sf_full = 3 barriers per stage
+    const int barriers_per_stage = is_fp8 ? 3 : 2;
+    const int smem_barriers_per_stage = barriers_per_stage * 8;
+
+    // Fixed: epilogue barriers (tmem_full + tmem_empty) + tmem pointer
     const int smem_barriers_fixed = kNumEpilogueStages * 2 * 8;  // tmem full/empty
     const int smem_tmem_ptr = 4;
 
     const int smem_fixed = smem_cd + smem_barriers_fixed + smem_tmem_ptr;
-    const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_barriers_per_stage;
+    const int smem_per_stage = smem_a_per_stage + smem_b_per_stage
+                             + smem_sfa_per_stage + smem_sfb_per_stage
+                             + smem_barriers_per_stage;
 
     // No artificial cap — let shared memory capacity decide
     const int num_stages = (SM100ArchSpec::smem_capacity - smem_fixed) / smem_per_stage;
@@ -148,6 +159,7 @@ static std::pair<int, int> get_pipeline_config_for_gemm_rs(
 static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k, const int& num_sms,
                                         const int& elem_size_ab = 1, const int& num_ranks = 1) {
     const int m_per_rank = num_ranks > 1 ? m / num_ranks : m;
+    const bool is_fp8 = (elem_size_ab == 1);  // FP8 = 1 byte, BF16 = 2 bytes
 
     // ── 动态 block 配置 ──
     const auto [block_m, store_block_m, num_epilogue_threads, num_non_epilogue_threads] =
@@ -168,7 +180,7 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     // ── Pipeline stages ──
     const auto [num_stages, smem_size] = get_pipeline_config_for_gemm_rs(
         block_m, block_n, block_k, store_block_m, elem_size_ab,
-        num_epilogue_threads, swizzle_cd_mode);
+        num_epilogue_threads, swizzle_cd_mode, is_fp8);
 
     constexpr bool is_multicast_on_a = true;
     constexpr bool swap_ab = false;
