@@ -1,7 +1,7 @@
 # GEMM + Reduce-Scatter: 旧方案记录（Push + PDL 两阶段）
 
 > **⚠️ 此方案已废弃**。经多卡 benchmark 验证性能不可接受（8GPU 仅为 NCCL 分离方案的 0.21x）。
-> 当前方案见 [GEMM_RS_V2.md](./GEMM_RS_V2.md)。本文档仅作为历史参考保留。
+> 当前方案见 [GEMM_RS_DESIGN.md](./GEMM_RS_DESIGN.md)。本文档仅作为历史参考保留。
 
 ## 概述
 

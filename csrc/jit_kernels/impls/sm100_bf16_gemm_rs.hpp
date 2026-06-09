@@ -17,9 +17,9 @@
 namespace deep_gemm {
 
 // ════════════════════════════════════════════════════════════════
-//  V2: Single-kernel Pull-based GEMM + Reduce-Scatter
+//  Single-kernel Pull-based GEMM + Reduce-Scatter
 // ════════════════════════════════════════════════════════════════
-class SM100BF16GemmRSV2Runtime final : public LaunchRuntime<SM100BF16GemmRSV2Runtime> {
+class SM100BF16GemmRSRuntime final : public LaunchRuntime<SM100BF16GemmRSRuntime> {
 public:
     struct Args {
         int max_m_per_rank;
@@ -38,7 +38,7 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        // V2 kernel template parameters:
+        // Kernel template parameters:
         //   BLOCK_M, BLOCK_N, BLOCK_K, kNumStages,
         //   kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
         //   kNumMulticast, kIsMulticastOnA,
@@ -47,12 +47,12 @@ public:
         //   kNumSMs, kNumRanks,
         //   cd_dtype_t, comm_dtype_t
         return fmt::format(R"(
-#include <deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh>
+#include <deep_gemm/impls/sm100_bf16_gemm_rs.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_bf16_gemm_rs_v2_impl<
+    auto ptr = reinterpret_cast<void*>(&sm100_bf16_gemm_rs_impl<
         {}, {}, {},
         {},
         {}, {}, {},
@@ -94,24 +94,24 @@ static void __instantiate_kernel() {{
 };
 
 // ════════════════════════════════════════════════════════════════
-//  统一入口: 启动 V2 单 kernel GEMM + Pull RS
+//  统一入口: 启动单 kernel GEMM + Pull RS
 // ════════════════════════════════════════════════════════════════
-static void sm100_bf16_gemm_rs_v2_nt(const torch::Tensor& y,
-                                     const torch::Tensor& a,
-                                     const torch::Tensor& b,
-                                     const torch::Tensor& sym_buffer,
-                                     const std::vector<int64_t>& sym_buffer_ptrs,
-                                     const int& rank_idx,
-                                     const int& max_m_per_rank,
-                                     const int& runtime_m_per_rank,
-                                     const int& n,
-                                     const int& k,
-                                     const std::string& compiled_dims,
-                                     const at::ScalarType& comm_dtype = torch::kBFloat16) {
+static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
+                                  const torch::Tensor& a,
+                                  const torch::Tensor& b,
+                                  const torch::Tensor& sym_buffer,
+                                  const std::vector<int64_t>& sym_buffer_ptrs,
+                                  const int& rank_idx,
+                                  const int& max_m_per_rank,
+                                  const int& runtime_m_per_rank,
+                                  const int& n,
+                                  const int& k,
+                                  const std::string& compiled_dims,
+                                  const at::ScalarType& comm_dtype = torch::kBFloat16) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_sms = device_runtime->get_num_sms();
     const auto m = runtime_m_per_rank * num_ranks;
-    auto config = get_gemm_rs_v2_config(m, n, k, num_sms, static_cast<int>(a.element_size()), num_ranks);
+    auto config = get_gemm_rs_config(m, n, k, num_sms, static_cast<int>(a.element_size()), num_ranks);
 
     DG_HOST_ASSERT(config.block_k == 64);
 
@@ -132,7 +132,7 @@ static void sm100_bf16_gemm_rs_v2_nt(const torch::Tensor& y,
     // Total threads = gemm + epilogue + comm
     const int total_threads = config.num_non_epilogue_threads + config.num_epilogue_threads + config.num_rs_threads;
 
-    const SM100BF16GemmRSV2Runtime::Args args = {
+    const SM100BF16GemmRSRuntime::Args args = {
         .max_m_per_rank = max_m_per_rank,
         .runtime_m_per_rank = runtime_m_per_rank,
         .m = m, .n = n, .k = k,
@@ -150,9 +150,9 @@ static void sm100_bf16_gemm_rs_v2_nt(const torch::Tensor& y,
                                   config.num_multicast)
     };
 
-    const auto code = SM100BF16GemmRSV2Runtime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_gemm_rs_v2_nt", code);
-    SM100BF16GemmRSV2Runtime::launch(runtime, args);
+    const auto code = SM100BF16GemmRSRuntime::generate(args);
+    const auto runtime = compiler->build("sm100_bf16_gemm_rs_nt", code);
+    SM100BF16GemmRSRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm

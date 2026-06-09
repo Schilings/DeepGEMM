@@ -1,7 +1,7 @@
 """
-Validation test for BF16 GEMM + Reduce-Scatter V2 (Pull-based, single-kernel fusion).
-Compares bf16_gemm_rs_v2_nt kernel with bf16_gemm + FP32 manual reduce-scatter.
-Usage: python tests/test_gemm_rs_v2.py [num_gpus]  (default: 2)
+Validation test for BF16 GEMM + Reduce-Scatter (Pull-based, single-kernel fusion).
+Compares bf16_gemm_rs_nt kernel with bf16_gemm + FP32 manual reduce-scatter.
+Usage: python tests/test_gemm_rs.py [num_gpus]  (default: 2)
 """
 
 import os
@@ -27,7 +27,7 @@ def run_test(local_rank: int, num_local_ranks: int):
 
     if rank_idx == 0:
         print(f"\n{'='*60}")
-        print(f"BF16 GEMM-RS V2 Test (Pull-based): {num_ranks} GPUs")
+        print(f"BF16 GEMM-RS Test (Pull-based): {num_ranks} GPUs")
         print(f"  M_per_rank={tokens_per_rank}, K={k_dim}, N={n_dim}")
         print(f"{'='*60}\n")
 
@@ -66,8 +66,8 @@ def run_test(local_rank: int, num_local_ranks: int):
     # ── Warm-up (JIT compilation) ──
     y = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=f'cuda:{local_rank}')
     if rank_idx == 0:
-        print(">>> Phase 1: Warm-up (JIT compilation for V2 kernel)...")
-    deep_gemm.bf16_gemm_rs_v2_nt(y, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
+        print(">>> Phase 1: Warm-up (JIT compilation)...")
+    deep_gemm.bf16_gemm_rs_nt(y, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
@@ -75,7 +75,7 @@ def run_test(local_rank: int, num_local_ranks: int):
     if rank_idx == 0:
         print(">>> Phase 2: Second run for consistency check...")
     y2 = torch.zeros_like(y)
-    deep_gemm.bf16_gemm_rs_v2_nt(y2, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
+    deep_gemm.bf16_gemm_rs_nt(y2, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
@@ -83,7 +83,7 @@ def run_test(local_rank: int, num_local_ranks: int):
     if rank_idx == 0:
         print(f"  Consistency check: max_diff={warmup_diff:.6f}")
         if warmup_diff < 0.01:
-            print(f"  ✅ V2 Kernel produces consistent results across runs")
+            print(f"  ✅ Kernel produces consistent results across runs")
         else:
             print(f"  ❌ Inconsistent results!")
 
@@ -97,11 +97,11 @@ def run_test(local_rank: int, num_local_ranks: int):
 
     if rank_idx == 0:
         print(f"\n{'='*60}")
-        print(f"Results (V2 Pull-based):")
+        print(f"Results:")
         print(f"  Max abs diff:  {max_diff:.6f}")
         print(f"  Mean abs diff: {mean_diff:.6f}")
         if max_diff < 1.0:
-            print(f"  ✅ PASS — BF16 GEMM-RS V2 matches reference!")
+            print(f"  ✅ PASS — BF16 GEMM-RS matches reference!")
         elif max_diff < 5.0:
             print(f"  ⚠️  Close but check numerical precision")
         else:
@@ -116,12 +116,12 @@ def run_test(local_rank: int, num_local_ranks: int):
 
     if rank_idx == 0:
         print(f"{'='*60}")
-        print("V2 Test complete.")
+        print("Test complete.")
         print(f"{'='*60}\n")
 
 
 if __name__ == '__main__':
     import sys
     num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    print(f"Launching V2 test with {num_gpus} GPUs...")
+    print(f"Launching GEMM-RS test with {num_gpus} GPUs...")
     mp.spawn(run_test, args=(num_gpus,), nprocs=num_gpus, join=True)

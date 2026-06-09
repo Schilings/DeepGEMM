@@ -16,7 +16,7 @@ DeepGEMM 的 **GEMM-RS (GEMM + Reduce-Scatter)** 融合 kernel，目标是在多
 
 - **设计方案**: Pull-based 单 kernel，tile 级 overlap
 - **代码状态**: 已写完，待多卡测试验证
-- **之前的尝试（Push + PDL 两阶段）**: 已验证性能不行（8GPU 仅 0.21x NCCL），保留代码作为参考但不再继续开发
+- **之前的尝试（Push + PDL 两阶段）**: 已验证性能不行（8GPU 仅 0.21x NCCL），代码已删除，仅留旧文档作为参考
 
 ---
 
@@ -76,13 +76,13 @@ W4-7 (128T): Comm — Pull-based Reduce-Scatter
 
 ```bash
 # 清除 JIT 缓存
-rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_v2*
+rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs*
 
 # 2 GPU 正确性测试
-python tests/test_gemm_rs_v2.py 2
+python tests/test_gemm_rs.py 2
 
 # 8 GPU 正确性测试
-python tests/test_gemm_rs_v2.py 8
+python tests/test_gemm_rs.py 8
 ```
 
 **预期**：pull + reduce 应该得到与 `bf16_gemm_nt + nccl_reduce_scatter` 相同的结果（允许 FP32 累加误差）。
@@ -90,10 +90,10 @@ python tests/test_gemm_rs_v2.py 8
 ### 优先级 P1：Benchmark
 
 ```bash
-# 性能对比 (当前方案 vs 旧方案 vs GEMM+NCCL分离)
-python benchmarks/bench_gemm_rs_v2.py 2 20
-python benchmarks/bench_gemm_rs_v2.py 4 20
-python benchmarks/bench_gemm_rs_v2.py 8 20
+# 性能对比 (Fused vs GEMM+NCCL分离)
+python benchmarks/bench_gemm_rs.py 2 20
+python benchmarks/bench_gemm_rs.py 4 20
+python benchmarks/bench_gemm_rs.py 8 20
 ```
 
 ### 优先级 P2：根据测试结果调优
@@ -117,13 +117,13 @@ python benchmarks/bench_gemm_rs_v2.py 8 20
 
 ```
 === 核心实现 ===
-deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh   # 核心 kernel
-csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp              # JIT runtime
-csrc/jit_kernels/heuristics/gemm_rs.hpp                       # get_gemm_rs_v2_config()
-csrc/apis/gemm_rs.hpp                                         # C++ API: bf16_gemm_rs_v2_nt()
-deep_gemm/gemm_rs/__init__.py                                 # Python API: bf16_gemm_rs_v2_nt()
-tests/test_gemm_rs_v2.py                                      # 正确性测试
-benchmarks/bench_gemm_rs_v2.py                                # Benchmark (vs GEMM+NCCL分离)
+deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh      # 核心 kernel
+csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp                 # JIT runtime
+csrc/jit_kernels/heuristics/gemm_rs.hpp                       # get_gemm_rs_config()
+csrc/apis/gemm_rs.hpp                                         # C++ API: bf16_gemm_rs_nt()
+deep_gemm/gemm_rs/__init__.py                                 # Python API: bf16_gemm_rs_nt()
+tests/test_gemm_rs.py                                         # 正确性测试
+benchmarks/bench_gemm_rs.py                                   # Benchmark (vs GEMM+NCCL分离)
 
 === 公共基础设施 ===
 deep_gemm/include/deep_gemm/comm/barrier.cuh                  # nvlink_barrier / grid_sync
@@ -156,13 +156,13 @@ git submodule update --init --recursive
 pip install -e . --no-build-isolation
 
 # ===== 测试 =====
-python tests/test_gemm_rs_v2.py 2       # 正确性 (2 GPU)
-python tests/test_gemm_rs_v2.py 8       # 正确性 (8 GPU)
-python benchmarks/bench_gemm_rs_v2.py 2 20   # Benchmark (2 GPU)
-python benchmarks/bench_gemm_rs_v2.py 8 20   # Benchmark (8 GPU)
+python tests/test_gemm_rs.py 2       # 正确性 (2 GPU)
+python tests/test_gemm_rs.py 8       # 正确性 (8 GPU)
+python benchmarks/bench_gemm_rs.py 2 20   # Benchmark (2 GPU)
+python benchmarks/bench_gemm_rs.py 8 20   # Benchmark (8 GPU)
 
 # ===== 清除 JIT 缓存 =====
-rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_v2*
+rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs*
 
 # ===== Git 操作 =====
 cd /root/.local/codebuddy/DeepGEMM

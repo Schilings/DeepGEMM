@@ -46,12 +46,12 @@ struct GemmRSConfig {
 //  Pull-based single-kernel GEMM + RS 配置
 //  需要额外的 comm threads 用于 pull + reduce
 // ════════════════════════════════════════════════════════════════
-static GemmRSConfig get_gemm_rs_v2_config(const int& m, const int& n, const int& k, const int& num_sms,
-                                           const int& elem_size_ab = 1, const int& num_ranks = 1) {
+static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k, const int& num_sms,
+                                       const int& elem_size_ab = 1, const int& num_ranks = 1) {
     const int m_per_rank = num_ranks > 1 ? m / num_ranks : m;
     const bool is_fp8 = (elem_size_ab == 1);
 
-    // V2 warp allocation:
+    // Warp allocation:
     //   W0: TMA Load (32 threads)
     //   W1: MMA Issue (32 threads)
     //   W2-3: Epilogue (64 threads) — TMEM → smem → local partial + set flag
@@ -60,7 +60,7 @@ static GemmRSConfig get_gemm_rs_v2_config(const int& m, const int& n, const int&
     constexpr int num_epilogue_threads = 64;       // W2-W3 (Epilogue, lighter since only local write)
     constexpr int num_rs_threads = 128;            // W4-W7 (Comm: pull + reduce)
     // Note: num_non_epilogue_threads includes W0(TMA) + W1(MMA) + W2-3(epilogue base)
-    // Actually for V2: kNumGemmThreads=128, kNumEpilogueThreads=64, kNumCommThreads=128
+    // kNumGemmThreads=128, kNumEpilogueThreads=64, kNumCommThreads=128
     // Total = 320 threads = 10 warps
 
     constexpr int block_n = 128;
@@ -89,9 +89,9 @@ static GemmRSConfig get_gemm_rs_v2_config(const int& m, const int& n, const int&
     constexpr int swizzle_b_mode = 128;
     constexpr int swizzle_cd_mode = 128;
     constexpr int num_multicast = 1;
-    constexpr int reduce_num_threads = 0;  // V2 不需要单独的 reduce kernel
+    constexpr int reduce_num_threads = 0;  // 不需要单独的 reduce kernel
 
-    // Pipeline stages (same formula as V1, but with additional comm smem)
+    // Pipeline stages (with additional comm smem for pull+reduce)
     constexpr int kNumTMAStoreStages = 2;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumCommStages = 2;
@@ -136,7 +136,7 @@ static GemmRSConfig get_gemm_rs_v2_config(const int& m, const int& n, const int&
     };
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format("GemmRSV2Config(m={}, n={}, k={}, num_sms={}, num_ranks={})",
+        const auto key = fmt::format("GemmRSConfig(m={}, n={}, k={}, num_sms={}, num_ranks={})",
                                      m, n, k, num_sms, num_ranks);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {

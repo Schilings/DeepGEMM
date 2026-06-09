@@ -7,7 +7,7 @@
 #include "layout.hpp"
 
 #if DG_TENSORMAP_COMPATIBLE
-#include "../jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp"
+#include "../jit_kernels/impls/sm100_bf16_gemm_rs.hpp"
 #endif
 
 #include <deep_gemm/layout/gemm_rs.cuh>
@@ -50,7 +50,7 @@ get_symm_buffer_size_for_gemm_rs(const int& num_ranks,
 // ════════════════════════════════════════════════════════════════
 //  Pull-based Single-kernel GEMM + Reduce-Scatter
 // ════════════════════════════════════════════════════════════════
-static void bf16_gemm_rs_v2_nt(const torch::Tensor& y,
+static void bf16_gemm_rs_nt(const torch::Tensor& y,
                                const torch::Tensor& a,
                                const torch::Tensor& b,
                                const torch::Tensor& sym_buffer,
@@ -97,9 +97,9 @@ static void bf16_gemm_rs_v2_nt(const torch::Tensor& y,
         num_ranks, num_max_tokens_per_rank, n, use_fp32_comm);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
 
-    sm100_bf16_gemm_rs_v2_nt(y, a, b, sym_buffer, sym_buffer_ptrs, rank_idx,
-                             num_max_tokens_per_rank, num_tokens_per_rank, n, k, compiled_dims,
-                             comm_dtype);
+    sm100_bf16_gemm_rs_nt(y, a, b, sym_buffer, sym_buffer_ptrs, rank_idx,
+                          num_max_tokens_per_rank, num_tokens_per_rank, n, k, compiled_dims,
+                          comm_dtype);
 #else
     DG_HOST_UNREACHABLE("BF16 GEMM+RS requires TensorMap support");
 #endif
@@ -109,7 +109,7 @@ static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_gemm_rs", &get_token_alignment_for_gemm_rs);
     m.def("get_symm_buffer_size_for_gemm_rs", &get_symm_buffer_size_for_gemm_rs);
-    m.def("bf16_gemm_rs_v2_nt", &bf16_gemm_rs_v2_nt,
+    m.def("bf16_gemm_rs_nt", &bf16_gemm_rs_nt,
           pybind11::arg("y"), pybind11::arg("a"), pybind11::arg("b"), pybind11::arg("sym_buffer"),
           pybind11::arg("sym_buffer_ptrs"), pybind11::arg("rank_idx"),
           pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_tokens_per_rank"),

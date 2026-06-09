@@ -98,15 +98,15 @@ Rank i 计算 tile 的顺序：
 
 ```
 === 核心实现 ===
-deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh  — 核心 kernel (~450行)
-csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp            — JIT runtime + launch
-csrc/jit_kernels/heuristics/gemm_rs.hpp                     — get_gemm_rs_v2_config()
-csrc/apis/gemm_rs.hpp                                       — C++ API: bf16_gemm_rs_v2_nt()
-deep_gemm/gemm_rs/__init__.py                               — Python API: bf16_gemm_rs_v2_nt()
+deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh   — 核心 kernel (~450行)
+csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp              — JIT runtime + launch
+csrc/jit_kernels/heuristics/gemm_rs.hpp                    — get_gemm_rs_config()
+csrc/apis/gemm_rs.hpp                                      — C++ API: bf16_gemm_rs_nt()
+deep_gemm/gemm_rs/__init__.py                              — Python API: bf16_gemm_rs_nt()
 
 === 测试 ===
-tests/test_gemm_rs_v2.py                                    — 正确性测试 (支持 2/4/8 GPU)
-benchmarks/bench_gemm_rs_v2.py                              — 对比: 当前方案 vs 旧方案 vs GEMM+NCCL分离
+tests/test_gemm_rs.py                                      — 正确性测试 (支持 2/4/8 GPU)
+benchmarks/bench_gemm_rs.py                                — 对比: Fused vs GEMM+NCCL分离
 ```
 
 ## Python API
@@ -124,7 +124,7 @@ sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(
 )
 
 # GEMM+RS
-deep_gemm.bf16_gemm_rs_v2_nt(
+deep_gemm.bf16_gemm_rs_nt(
     y,                    # [tokens_per_rank, N], output
     a,                    # [total_tokens, K], input (BF16)
     b,                    # [N, K], weight NT layout (BF16)
@@ -139,18 +139,18 @@ deep_gemm.bf16_gemm_rs_v2_nt(
 ```bash
 cd /root/.local/codebuddy/DeepGEMM
 
-# 清除旧 JIT 缓存
-rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_v2*
+# 清除 JIT 缓存
+rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs*
 
 # 正确性测试 (2 GPUs)
-python tests/test_gemm_rs_v2.py 2
+python tests/test_gemm_rs.py 2
 
 # 正确性测试 (8 GPUs)
-python tests/test_gemm_rs_v2.py 8
+python tests/test_gemm_rs.py 8
 
 # 性能基准测试
-python benchmarks/bench_gemm_rs_v2.py 2 20
-python benchmarks/bench_gemm_rs_v2.py 8 20
+python benchmarks/bench_gemm_rs.py 2 20
+python benchmarks/bench_gemm_rs.py 8 20
 ```
 
 > **注意**：不要用 `torchrun`，脚本内部用 `mp.spawn` 管理多进程。
@@ -172,7 +172,7 @@ python benchmarks/bench_gemm_rs_v2.py 8 20
 
 ### 如果性能不达预期
 
-1. **nsys profile**: `nsys profile python benchmarks/bench_gemm_rs_v2.py 2 5`
+1. **nsys profile**: `nsys profile python benchmarks/bench_gemm_rs.py 2 5`
 2. **检查 SM 占用率**: 320 线程可能限制 occupancy → 考虑减少 Comm Warps
 3. **检查 NVLink 利用率**: `nvidia-smi nvlink -i 0 -s` 查看 NVLink 吞吐
 4. **Comm Warps 瓶颈**: 如果 pull 延迟高，考虑用 TMA Load 代替手动 global load

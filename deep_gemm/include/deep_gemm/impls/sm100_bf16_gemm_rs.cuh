@@ -24,7 +24,7 @@ using namespace deep_gemm::sm100;
 using namespace deep_gemm::math;
 
 // ============================================================================================
-//  sm100_bf16_gemm_rs_v2_impl —— BF16 GEMM + Reduce-Scatter V2 (Pull-based Tile Overlap)
+//  sm100_bf16_gemm_rs_impl —— BF16 GEMM + Reduce-Scatter (Pull-based Tile Overlap)
 // ============================================================================================
 //
 //  【设计思想 — 借鉴 Flux + MegaMoe】
@@ -87,7 +87,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           typename cd_dtype_t,
           typename comm_dtype_t = cd_dtype_t>
 __global__ void __launch_bounds__(kNumGemmThreads + kNumEpilogueThreads + kNumCommThreads, 1)
-sm100_bf16_gemm_rs_v2_impl(const uint32_t shape_m_per_rank,
+sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                            const uint32_t runtime_m_per_rank,
                            const uint32_t shape_n,
                            const uint32_t shape_k,
@@ -552,7 +552,7 @@ sm100_bf16_gemm_rs_v2_impl(const uint32_t shape_m_per_rank,
                     const auto start_clock = clock64();
                     while (ptx::ld_acq_sys(remote_ready_ptr) == 0u) {
                         if (clock64() - start_clock >= kTimeoutCycles) {
-                            printf("GEMM-RS V2 comm warp timeout: rank=%d, poll_rank=%d, tile=(%d,%d)\n",
+                            printf("GEMM-RS comm warp timeout: rank=%d, poll_rank=%d, tile=(%d,%d)\n",
                                    rank_idx, poll_rank, my_m_block, my_n_block);
                             DG_DEVICE_ASSERT(false and "Comm warp ready flag timeout");
                         }

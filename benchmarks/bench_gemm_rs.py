@@ -1,13 +1,13 @@
 """
-Benchmark: GEMM-RS (Pull-based) vs Separate (GEMM + NCCL RS)
+Benchmark: GEMM-RS (Fused) vs Separate (GEMM + NCCL RS)
 
 Compares end-to-end latency for:
-  1. bf16_gemm_rs_v2_nt (pull-based single kernel)
+  1. bf16_gemm_rs_nt (pull-based single kernel)
   2. bf16_gemm_nt + torch.distributed.reduce_scatter_tensor (separate)
 
 Usage:
-    python benchmarks/bench_gemm_rs_v2.py [num_gpus] [num_iters]
-    e.g.  python benchmarks/bench_gemm_rs_v2.py 2 20
+    python benchmarks/bench_gemm_rs.py [num_gpus] [num_iters]
+    e.g.  python benchmarks/bench_gemm_rs.py 2 20
 """
 
 import os
@@ -111,7 +111,7 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
         # ── Benchmark: Fused (Pull-based) ──
         def run_fused():
-            deep_gemm.bf16_gemm_rs_v2_nt(y_fused, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
+            deep_gemm.bf16_gemm_rs_nt(y_fused, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
 
         time_fused = bench_fn(run_fused, num_iters=num_iters, barrier_group=group)
 
