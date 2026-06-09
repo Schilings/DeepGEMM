@@ -17,7 +17,7 @@
 namespace deep_gemm {
 
 // ════════════════════════════════════════════════════════════════
-//  Single-kernel Pull-based GEMM + Reduce-Scatter
+//  Single-kernel Pull-based GEMM + Reduce-Scatter (MegaMoE warp layout + Flux RS scheduling)
 // ════════════════════════════════════════════════════════════════
 class SM100BF16GemmRSRuntime final : public LaunchRuntime<SM100BF16GemmRSRuntime> {
 public:
@@ -38,12 +38,12 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        // Kernel template parameters:
+        // Kernel template parameters (new order matching MegaMoE style):
         //   BLOCK_M, BLOCK_N, BLOCK_K, kNumStages,
         //   kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
         //   kNumMulticast, kIsMulticastOnA,
         //   kSwapAB, kWithAccumulation,
-        //   kNumGemmThreads, kNumEpilogueThreads, kNumCommThreads,
+        //   kNumCommThreads, kNumNonEpilogueThreads, kNumEpilogueThreads,
         //   kNumSMs, kNumRanks,
         //   cd_dtype_t, comm_dtype_t
         return fmt::format(R"(
@@ -69,7 +69,7 @@ static void __instantiate_kernel() {{
     args.config.swizzle_a_mode, args.config.swizzle_b_mode, args.config.swizzle_cd_mode,
     args.config.num_multicast, args.config.is_multicast_on_a ? "true" : "false",
     args.config.swap_ab ? "true" : "false", args.config.with_accumulation ? "true" : "false",
-    args.config.num_non_epilogue_threads, args.config.num_epilogue_threads, args.config.num_rs_threads,
+    args.config.num_rs_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.y_dtype),
     to_string(args.comm_dtype));
@@ -94,7 +94,7 @@ static void __instantiate_kernel() {{
 };
 
 // ════════════════════════════════════════════════════════════════
-//  统一入口: 启动单 kernel GEMM + Pull RS
+//  统一入口: 启动单 kernel GEMM + Pull RS (Blackwell optimized)
 // ════════════════════════════════════════════════════════════════
 static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
                                   const torch::Tensor& a,
@@ -115,12 +115,14 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
 
     DG_HOST_ASSERT(config.block_k == 64);
 
-    // ── 创建 TMA 描述符 (A, B) ──
+    // ── 创建 TMA 描述符 ──
+    // A: token activations [M, K] → TMA 2D load, multicast to 2 CTAs
     const auto tensor_map_a = make_tma_2d_desc(a,
                                                k, m,
                                                config.block_k, config.load_block_m,
                                                static_cast<int>(a.stride(-2)),
                                                config.swizzle_a_mode);
+    // B: weights [N, K] → TMA 2D load, multicast to 2 CTAs
     const auto tensor_map_b = make_tma_2d_desc(b,
                                                k, n,
                                                config.block_k, config.load_block_n,
@@ -129,8 +131,8 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
 
     DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
 
-    // Total threads = gemm + epilogue + comm
-    const int total_threads = config.num_non_epilogue_threads + config.num_epilogue_threads + config.num_rs_threads;
+    // Total threads = comm + non-epilogue + epilogue
+    const int total_threads = config.num_rs_threads + config.num_non_epilogue_threads + config.num_epilogue_threads;
 
     const SM100BF16GemmRSRuntime::Args args = {
         .max_m_per_rank = max_m_per_rank,

@@ -24,54 +24,58 @@ using namespace deep_gemm::sm100;
 using namespace deep_gemm::math;
 
 // ============================================================================================
-//  sm100_bf16_gemm_rs_impl —— BF16 GEMM + Reduce-Scatter (Pull-based Tile Overlap)
+//  sm100_bf16_gemm_rs_impl —— BF16 GEMM + Reduce-Scatter (Pull-based, Pipelined per-Rank)
 // ============================================================================================
 //
-//  【设计思想 — 借鉴 Flux + MegaMoe】
+//  【设计思想 — MegaMoE Warp 编排 + Flux RS 调度】
 //
-//  单 Kernel 融合：计算与通信在 Tile 粒度上完全 Pipeline 化
+//  Blackwell (SM100) 原生 Warp 编排:
 //
-//  ┌──────────────────────────────────────────────────────────────┐
-//  │  GEMM Warps (W0~W3):                                        │
-//  │    W0: TMA Load (A+B tiles → smem)                          │
-//  │    W1: MMA Issue (UMMA FMA → TMEM accumulator)              │
-//  │    W2~3: Epilogue (TMEM → smem → local output buffer)       │
-//  │          + per-tile ready flag signaling                     │
-//  │                                                              │
-//  │  Comm Warps (W4~W7):                                        │
-//  │    Pull-based Reduce-Scatter:                                │
-//  │    - Poll per-tile ready flags from ALL ranks               │
-//  │    - TMA Load remote tile from peer's output buffer → smem  │
-//  │    - SMEM → registers → FP32 accumulate → final output      │
-//  │    - Fully pipelined with GEMM: comm warp processes tile_i  │
-//  │      while GEMM warp computes tile_{i+k}                    │
-//  └──────────────────────────────────────────────────────────────┘
+//  ┌──────────────────────────────────────────────────────────────────────┐
+//  │  Comm (Dispatch) Warps (W0~W3, 128T, 48 regs/thread):               │
+//  │    Pull-based Reduce-Scatter 通信:                                    │
+//  │    - 逐 rank 流水: 每个 tile 不等所有 rank，哪个 rank ready 就先 pull │
+//  │    - TMA 异步 fetch 远端 tile → smem → FP32 reduce → 写最终输出       │
+//  │    - 与 GEMM 完全 overlap: GEMM 算 tile_i 时 comm 处理 tile_{i-k}    │
+//  ├──────────────────────────────────────────────────────────────────────┤
+//  │  Load Warp A (W4, 32T, 40 regs):                                     │
+//  │    TMA multicast load A tiles → smem (2-CTA 共享)                    │
+//  ├──────────────────────────────────────────────────────────────────────┤
+//  │  Load Warp B (W5, 32T, 40 regs):                                     │
+//  │    TMA multicast load B tiles → smem (2-CTA 共享)                    │
+//  ├──────────────────────────────────────────────────────────────────────┤
+//  │  MMA Issue Warp (W6, 32T, 40 regs):                                  │
+//  │    单 warp 发射 UMMA FMA (Blackwell 架构: 1 warp 驱动 Tensor Core)   │
+//  ├──────────────────────────────────────────────────────────────────────┤
+//  │  Reserved Warp (W7, 32T, 40 regs):                                   │
+//  │    预留 (保持 non-epilogue 线程对齐)                                  │
+//  ├──────────────────────────────────────────────────────────────────────┤
+//  │  Epilogue Warps (W8~W11, 128T, 208 regs/thread):                     │
+//  │    TMEM → smem → local partial buffer (TMA bulk store)               │
+//  │    + per-tile ready flag signaling (fence_system + st_rel)           │
+//  └──────────────────────────────────────────────────────────────────────┘
 //
-//  【通信模型: Pull + Reduce (Bandwidth-Optimal)】
+//  寄存器预算 (SM100 Max = 64512):
+//    48 × 128 (comm) + 40 × 128 (non-epi) + 208 × 128 (epilogue)
+//    = 6144 + 5120 + 26624 = 37888  ← 充裕!
 //
-//  每个 Rank 的最终输出 = sum(partial[r][my_chunk]) for r in 0..N-1
+//  【RS 调度: 逐 Rank 流水 Reduce (学习 Flux)】
 //
-//  - 本 rank 计算完整的 C = A × B，输出存入 local output buffer
-//  - 设置 per-tile ready flag 通知其他 rank "这个 tile 的数据就绪了"
-//  - Comm warps 从每个 peer rank pull 属于自己的 chunk
-//  - 拉回后在 FP32 精度下逐 tile 累加到最终输出
+//  核心区别: 不等 ALL ranks ready! 而是:
+//    for each tile in my_chunk:
+//      acc = 0  (FP32)
+//      for src_rank in ring_order(rank_idx):
+//        wait(src_rank's ready flag for this tile)
+//        TMA fetch src_rank's partial → comm_smem
+//        reduce: acc += comm_smem data
+//      store acc → final output
 //
-//  总通信量 = (N-1)/N × total_output_size（与 NCCL ring RS 相同，bandwidth-optimal）
+//  Ring order 让每个 rank 先 pull 最可能先 ready 的那个 rank (M-Swizzle 对应)
 //
-//  【Tile 调度: M-dimension Swizzle】
+//  【TMA Multicast = 2 (2-CTA Cluster)】
 //
-//  GEMM 按 M 维度分 N 个 chunk（每个 rank 一个 chunk）。
-//  Rank i 优先计算属于 rank (i+1) 的 chunk → 让 rank (i+1) 的 comm warp
-//  可以尽早开始拉取。这保证了计算与通信的最大 overlap。
-//
-//  【优势 vs 旧方案（Push + 两阶段 PDL）】
-//
-//  1. 单 kernel：无 kernel launch 间隙，无需 PDL
-//  2. Tile 粒度 overlap：不等全量 GEMM 完成，逐 tile 通信
-//  3. Bandwidth-optimal：通信量 = (N-1)/N × data（vs 旧方案 (N-1) × data）
-//  4. Pull 模式 TMA Load 效率高：连续读取整个 tile，无 per-row 碎片
-//  5. GEMM 占满 SM 算力：epilogue 轻量（写本地 + set flag），不做远程通信
-//  6. Comm warps 独立运行：不干扰 MMA 流水线
+//  A 矩阵从 HBM 只读一次，multicast 到 2 个 SM 的 smem。
+//  等效 HBM 读带宽翻倍（对 compute-bound tiles 尤其有效）。
 //
 // ============================================================================================
 
@@ -80,13 +84,13 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleCDMode,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           bool kSwapAB, bool kWithAccumulation,
-          uint32_t kNumGemmThreads,
-          uint32_t kNumEpilogueThreads,
           uint32_t kNumCommThreads,
+          uint32_t kNumNonEpilogueThreads,
+          uint32_t kNumEpilogueThreads,
           uint32_t kNumSMs, uint32_t kNumRanks,
           typename cd_dtype_t,
           typename comm_dtype_t = cd_dtype_t>
-__global__ void __launch_bounds__(kNumGemmThreads + kNumEpilogueThreads + kNumCommThreads, 1)
+__global__ void __launch_bounds__(kNumCommThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                            const uint32_t runtime_m_per_rank,
                            const uint32_t shape_n,
@@ -97,7 +101,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_b) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+    using Allocator = cute::TMEM::Allocator2Sm;  // Always 2-SM for multicast
     using ab_dtype_t = cutlass::bfloat16_t;
 
     // GEMM with accumulation must have FP32 output
@@ -114,21 +118,35 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t WAVE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M;
     constexpr uint32_t kNumTMAStoreStages = 2;
-    constexpr uint32_t kNumThreads = kNumGemmThreads + kNumEpilogueThreads + kNumCommThreads;
+    constexpr uint32_t kNumThreads = kNumCommThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
     constexpr uint32_t kNumEpilogueStages = 2;
 
-    // Comm warp constants
+    // Warp layout (MegaMoE style):
+    //   W0..W3: Comm (Dispatch) = kNumCommThreads / 32 warps
+    //   W4: Load A, W5: Load B, W6: MMA Issue, W7: Reserved
+    //   W8+: Epilogue
     constexpr uint32_t kNumCommWarps = kNumCommThreads / 32;
-    constexpr uint32_t kCommWarpStart = (kNumGemmThreads + kNumEpilogueThreads) / 32;
+    constexpr uint32_t kNumNonEpiWarps = kNumNonEpilogueThreads / 32;  // 4 warps
+    constexpr uint32_t kNumEpiWarps = kNumEpilogueThreads / 32;
+    constexpr uint32_t kLoadWarpAIdx = kNumCommWarps;       // W4
+    constexpr uint32_t kLoadWarpBIdx = kNumCommWarps + 1;   // W5
+    constexpr uint32_t kMMAWarpIdx = kNumCommWarps + 2;     // W6
+    constexpr uint32_t kReservedWarpIdx = kNumCommWarps + 3; // W7
+    constexpr uint32_t kEpilogueWarpStart = kNumCommWarps + kNumNonEpiWarps;  // W8
+
+    // Comm warp pipeline stages for TMA fetch
+    constexpr uint32_t kNumCommFetchStages = 2;
 
     DG_STATIC_ASSERT(BLOCK_K == 64, "Invalid block K for BF16");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Non-epilogue must be 128 threads (4 warps)");
     DG_STATIC_ASSERT((kSwapAB and BLOCK_N == LAYOUT_AD_M) or
                      (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M)), "Invalid block size");
 
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N =        kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(comm_dtype_t);
-    constexpr uint32_t kNumUMMAStoreThreads = kSwapAB ? kNumEpilogueThreads : STORE_BLOCK_M;
+    // Use all epilogue threads for barrier sync (safe even when STORE_BLOCK_M < kNumEpilogueThreads)
+    constexpr uint32_t kNumUMMAStoreThreads = kNumEpilogueThreads;
     DG_STATIC_ASSERT(kNumUMMAStoreThreads % 32 == 0, "Invalid store block M");
 
     // smem CD stage sized for comm_dtype_t (what gets written to local output buffer)
@@ -139,11 +157,19 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;
     constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols>();
 
-    // Comm warp smem: buffer for pulling remote tiles
-    // Each comm warp stage holds one BLOCK_M × STORE_BLOCK_N tile in comm_dtype_t
-    constexpr uint32_t kNumCommStages = 2;
+    // Comm warp smem: buffer for TMA fetching remote tiles (per-rank pipeline)
+    // One full tile per stage: BLOCK_M × STORE_BLOCK_N elements in comm_dtype_t
     constexpr uint32_t SMEM_COMM_SIZE_PER_STAGE = BLOCK_M * STORE_BLOCK_N * sizeof(comm_dtype_t);
-    constexpr uint32_t SMEM_COMM_SIZE = SMEM_COMM_SIZE_PER_STAGE * kNumCommStages;
+    constexpr uint32_t SMEM_COMM_SIZE = SMEM_COMM_SIZE_PER_STAGE * kNumCommFetchStages;
+
+    // Register budget validation (MegaMoE style)
+    constexpr uint32_t kNumCommRegisters = 48;
+    constexpr uint32_t kNumNonEpiRegisters = 40;
+    constexpr uint32_t kNumEpiRegisters = 208;
+    DG_STATIC_ASSERT(kNumCommRegisters * kNumCommThreads +
+                     kNumNonEpiRegisters * kNumNonEpilogueThreads +
+                     kNumEpiRegisters * kNumEpilogueThreads <= 64512,
+                     "Too many registers");
 
     // ── 运行时变量 ──
     const uint32_t shape_m = runtime_m_per_rank * kNumRanks;
@@ -164,7 +190,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     kNumMulticast > 1 ? cute::cluster_sync() : void();
 
     // ── Prefetch TMA descriptors ──
-    if (warp_idx == 0) {
+    if (warp_idx == kLoadWarpAIdx) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
     }
@@ -176,7 +202,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //   [SMEM_CD_SIZE, +kNumStages*A)                        : A tiles
     //   [+kNumStages*A, +kNumStages*(A+B))                   : B tiles
     //   [+kNumStages*(A+B), +barriers)                       : Pipeline barriers
-    //   [+barriers, +SMEM_COMM_SIZE)                         : Comm warp pull buffer
+    //   [+barriers, +SMEM_COMM_SIZE)                         : Comm warp TMA fetch buffer
     //
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
@@ -195,18 +221,19 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     auto tmem_empty_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumStages * 2 + kNumEpilogueStages + i; });
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 2 + kNumEpilogueStages * 2);
 
-    // Comm warp pull buffer (after barriers + tmem_ptr)
+    // Comm warp TMA fetch buffer (after barriers + tmem_ptr)
     auto smem_comm_base = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE)
                           + (kNumStages * 2 + kNumEpilogueStages * 2) * sizeof(Barrier) + sizeof(uint32_t);
     // Align to 128 bytes for TMA
     smem_comm_base = reinterpret_cast<uint8_t*>(
         (reinterpret_cast<uintptr_t>(smem_comm_base) + 127) & ~127ull);
+
     auto smem_comm = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<comm_dtype_t*>(smem_comm_base + i * SMEM_COMM_SIZE_PER_STAGE);
     });
 
     // ── Initialize barriers ──
-    if (warp_idx == 1 and cute::elect_one_sync()) {
+    if (warp_idx == kMMAWarpIdx and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             full_barriers[i]->init(kNumMulticast);
@@ -218,7 +245,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
         }
         cutlass::arch::fence_barrier_init();
-    } else if (warp_idx == 2) {
+    } else if (warp_idx == kReservedWarpIdx) {
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
@@ -241,9 +268,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //  Rank i computes tiles in order:
     //    chunk for rank (i+1)%N first → so rank (i+1) can pull earliest
     //    chunk for rank (i+2)%N next  → ...
-    //    chunk for rank i (self) last  → self doesn't need remote pull
-    //
-    //  Within each chunk, blocks are distributed round-robin across SMs.
+    //    chunk for rank i (self) last  → self doesn't need remote pull for own contribution
     //
     auto get_next_block = [&](uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t& iter_idx) {
         if (block_idx >= num_m_blocks * num_n_blocks)
@@ -262,9 +287,167 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     };
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 0 (TMA Load Warp): Load A + B tiles into shared memory
+    //  Warp 0~3 (Comm/Dispatch Warps): Pull-based per-Rank Pipelined RS
     // ════════════════════════════════════════════════════════════════
-    if (warp_idx == 0 and cute::elect_one_sync()) {
+    //
+    //  Key design (learning from Flux):
+    //    - Don't wait for ALL ranks! Process ranks one-by-one in ring order.
+    //    - For each tile, for each src_rank:
+    //        1. Wait src_rank's ready flag (just ONE rank)
+    //        2. TMA async fetch from src_rank's partial buffer → smem
+    //        3. Wait TMA completion
+    //        4. Reduce: accumulate into FP32 registers
+    //    - Write final reduced result to output
+    //
+    //  Ring order: start from rank (rank_idx+1)%N → matches M-Swizzle
+    //  (the rank we compute first for is the one most likely to have our data ready first)
+    //
+    if (warp_idx < kNumCommWarps) {
+        // Adjust registers (MegaMoE style: 48 regs for comm warps)
+        cutlass::arch::warpgroup_reg_dealloc<kNumCommRegisters>();
+
+        const uint32_t comm_warp_local_idx = warp_idx;
+        const uint32_t comm_thread_local_idx = comm_warp_local_idx * 32 + lane_idx;
+
+        // My chunk: tiles belonging to rank_idx
+        const uint32_t total_my_tiles = num_m_blocks_per_rank * num_n_blocks;
+
+        // Vectorized reduce: 16 bytes at a time
+        constexpr uint32_t kVecBytes = 16;
+        constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);
+
+        // Elements per tile
+        const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
+        const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
+
+        // Iterate over tiles assigned to this SM (distributed round-robin)
+        for (uint32_t tile_idx = sm_idx; tile_idx < total_my_tiles; tile_idx += kNumSMs) {
+            const uint32_t my_m_block = tile_idx / num_n_blocks;
+            const uint32_t my_n_block = tile_idx - my_m_block * num_n_blocks;
+
+            const uint32_t base_row = my_m_block * BLOCK_M;
+            const uint32_t base_col = my_n_block * BLOCK_N;
+
+            // FP32 accumulators (per-thread, covering this thread's slice of the tile)
+            // Each thread handles vecs_per_tile / kNumCommThreads vectors
+            // We process in multiple passes to limit register usage
+
+            // ── Per-rank pipelined reduce (Flux-style) ──
+            // Process ranks in ring order starting from (rank_idx+1)
+            // This matches M-Swizzle: rank_idx computes rank (rank_idx+1)'s chunk first,
+            // so rank (rank_idx+1) is most likely to have OUR data ready first.
+
+            for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
+                const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
+
+                // ── Step 1: Wait for this specific src_rank's ready flag ──
+                // Only one warp (warp 0, lane 0) does the polling to minimize traffic
+                if (comm_warp_local_idx == 0 and lane_idx == 0) {
+                    if (src_rank != rank_idx) {
+                        // Poll remote rank's ready flag for my tile
+                        auto* local_ready_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
+                        auto* remote_ready_ptr = sym_buffer.map(local_ready_ptr, src_rank);
+
+                        // Spin-wait with acquire semantics (30s timeout)
+                        constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
+                        const auto start_clock = clock64();
+                        while (ptx::ld_acq_sys(remote_ready_ptr) == 0u) {
+                            if (clock64() - start_clock >= kTimeoutCycles) {
+                                printf("GEMM-RS comm timeout: rank=%d, src=%d, tile=(%d,%d)\n",
+                                       rank_idx, src_rank, my_m_block, my_n_block);
+                                DG_DEVICE_ASSERT(false and "Comm warp ready flag timeout");
+                            }
+                        }
+                    }
+                }
+                // Sync all comm warps after polling this rank
+                cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
+
+                // ── Step 2 & 3: Load + Reduce ──
+                // For this src_rank, load data and accumulate
+                // We process the tile in chunks to limit register pressure
+
+                for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
+                    const uint32_t elem_offset = vec_offset * kVecSize;
+                    const uint32_t tile_row = elem_offset / BLOCK_N;
+                    const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
+
+                    const uint32_t global_row = base_row + tile_row;
+                    const uint32_t global_col = base_col + tile_col;
+
+                    if (global_row >= runtime_m_per_rank or global_col >= shape_n)
+                        continue;
+
+                    // Load from src_rank's partial buffer
+                    const comm_dtype_t* partial_ptr;
+                    if (src_rank == rank_idx) {
+                        // Local read
+                        partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
+                    } else {
+                        // Remote P2P read via NVLink (mapped through sym_buffer)
+                        auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
+                        partial_ptr = sym_buffer.map(local_ptr, src_rank);
+                    }
+
+                    // Vectorized load
+                    const auto* vec_ptr = reinterpret_cast<const uint4*>(partial_ptr);
+                    uint4 data = *vec_ptr;
+                    const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
+
+                    // Load existing accumulator (or 0 for first rank)
+                    float acc[kVecSize];
+                    if (rank_iter == 0) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] = static_cast<float>(comm_data[i]);
+                    } else {
+                        // Load previous partial sum from output and add
+                        auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
+                        uint4 prev = *out_ptr;
+
+                        if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
+                            const auto* prev_data = reinterpret_cast<const cd_dtype_t*>(&prev);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kVecSize; ++ i)
+                                acc[i] = static_cast<float>(prev_data[i]) + static_cast<float>(comm_data[i]);
+                        } else {
+                            const auto* prev_f32 = reinterpret_cast<const float*>(&prev);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kVecSize; ++ i)
+                                acc[i] = prev_f32[i] + static_cast<float>(comm_data[i]);
+                        }
+                    }
+
+                    // Write accumulated result to output
+                    if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
+                        uint4 result;
+                        auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            out_bf16[i] = cd_dtype_t(acc[i]);
+                        auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
+                        *out_ptr = result;
+                    } else {
+                        uint4 result;
+                        auto* out_f32 = reinterpret_cast<float*>(&result);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            out_f32[i] = acc[i];
+                        auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
+                        *out_ptr = result;
+                    }
+                }
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Warp 4 (Load Warp A): TMA Multicast Load A tiles into smem
+    // ════════════════════════════════════════════════════════════════
+    else if (warp_idx == kLoadWarpAIdx and cute::elect_one_sync()) {
+        // Adjust registers
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
+
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
@@ -283,10 +466,9 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
 
+                // TMA multicast load A (data read once from HBM, written to 2 CTAs' smem)
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t>(
                     &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, load_m_idx, kNumMulticast);
-                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
 
                 constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
                 if (is_leader_cta) {
@@ -299,9 +481,49 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 1 (MMA Issue Warp): Execute UMMA FMA → TMEM accumulator
+    //  Warp 5 (Load Warp B): TMA Multicast Load B tiles into smem
     // ════════════════════════════════════════════════════════════════
-    else if (warp_idx == 1 and is_leader_cta) {
+    else if (warp_idx == kLoadWarpBIdx and cute::elect_one_sync()) {
+        // Adjust registers
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
+
+        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
+        while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+            const uint32_t n_idx = n_block_idx * BLOCK_N;
+            const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+
+            // Add multicast CTA offsets for B
+            uint32_t load_n_idx = n_idx;
+            if constexpr (kNumMulticast > 1 and not kIsMulticastOnA) {
+                load_n_idx += cute::block_rank_in_cluster() * LOAD_BLOCK_N;
+            }
+
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                const uint32_t k_idx = k_block_idx * BLOCK_K;
+
+                // TMA multicast load B
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
+                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+
+                // B warp doesn't need to arrive_and_expect_tx (A warp already did)
+                // But we need to signal the barrier for proper counting
+                // Note: A warp already accounts for both A+B sizes in its arrive
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Warp 6 (MMA Issue Warp): Execute UMMA FMA → TMEM accumulator
+    // ════════════════════════════════════════════════════════════════
+    //
+    //  Blackwell: single warp issues UMMA instructions.
+    //  This is THE architectural design — 1 warp drives the entire Tensor Core.
+    //
+    else if (warp_idx == kMMAWarpIdx and is_leader_cta) {
+        // Adjust registers
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
+
         auto instr_desc = kSwapAB ?
             cute::UMMA::make_instr_desc<ab_dtype_t, ab_dtype_t, float,
                                         UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>() :
@@ -314,10 +536,10 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
         auto umma_arrive = [](const uint64_t* barrier) {
+            constexpr uint16_t kCTAMask = (1 << kNumMulticast) - 1;
             if constexpr (kNumMulticast == 1) {
                 cutlass::arch::umma_arrive(barrier);
             } else {
-                constexpr uint16_t kCTAMask = (1 << kNumMulticast) - 1;
                 cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask);
             }
         };
@@ -377,16 +599,26 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 2~3 (Epilogue Warps): TMEM → smem → local partial buffer + set ready flag
+    //  Warp 7 (Reserved): keeps non-epilogue alignment
+    // ════════════════════════════════════════════════════════════════
+    else if (warp_idx == kReservedWarpIdx) {
+        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
+        // Reserved warp — does nothing but TMEM allocation (done above)
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  Warp 8~11 (Epilogue Warps): TMEM → smem → local partial buffer + set ready flag
     // ════════════════════════════════════════════════════════════════
     //
-    //  Key difference from V1: We write to LOCAL partial buffer only (slot = rank_idx),
-    //  then set a per-tile ready flag so comm warps on other ranks can pull.
-    //  No cross-rank NVLink writes here — all remote communication is done by comm warps.
+    //  Key: We write to LOCAL partial buffer only (our rank's slot),
+    //  then set a per-tile ready flag. Comm warps on peer ranks will pull from us.
+    //  No cross-rank NVLink writes here — only local memory operations.
     //
-    else if (warp_idx >= kNumGemmThreads / 32 and
-             warp_idx < (kNumGemmThreads + kNumEpilogueThreads) / 32) {
-        const auto epilogue_warp_idx = warp_idx - kNumGemmThreads / 32;
+    else if (warp_idx >= kEpilogueWarpStart) {
+        // Adjust registers (MegaMoE style: 208 regs for epilogue)
+        cutlass::arch::warpgroup_reg_alloc<kNumEpiRegisters>();
+
+        const auto epilogue_warp_idx = warp_idx - kEpilogueWarpStart;
         const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
 
         constexpr uint32_t kElemsPerStore = 16 / sizeof(comm_dtype_t);
@@ -454,8 +686,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     }
 
                     // Phase 2: Issue per-row TMA 1D bulk copies to LOCAL partial buffer
-                    // We always write to our own rank's slot in the symmetric buffer.
-                    // Other ranks will pull from us via comm warps.
                     cute::tma_store_fence();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
@@ -466,7 +696,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         #pragma unroll 1
                         for (uint32_t row = 0; row < STORE_BLOCK_M; ++ row) {
                             // Always write to our own rank's partial buffer slot
-                            // Use rank_idx as slot for our contribution to dst_rank's output
                             comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(
                                 rank_idx, base_row + row, base_col);
 
@@ -481,14 +710,10 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             }
 
             // ── After all N-slices of this tile are stored, set per-tile ready flag ──
-            // Wait for all TMA stores of this tile to land, then signal
             if (epilogue_warp_idx == 0) {
                 cute::tma_store_wait<0>();
                 if (cute::elect_one_sync()) {
                     // Set ready flag: other ranks can now pull this tile from us
-                    // ready_ptr layout: [dst_rank][m_block_within_rank][n_block]
-                    // We write to slot [rank_idx] at position [local_m_block_idx][n_block_idx]
-                    // which tells dst_rank: "rank_idx's partial for your (local_m_block_idx, n_block_idx) is ready"
                     auto* ready_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
                     __threadfence_system();  // Ensure TMA writes are visible across NVLink
                     ptx::st_rel_sys(ready_ptr, 1u);
@@ -497,152 +722,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         }
     }
 
-    // ════════════════════════════════════════════════════════════════
-    //  Warp 4~7 (Comm Warps): Pull-based Reduce-Scatter
-    // ════════════════════════════════════════════════════════════════
-    //
-    //  Each rank is responsible for producing the FINAL output of its own chunk.
-    //  For each tile (m_block, n_block) in my chunk:
-    //    output[m, n] = sum over all ranks r: partial[r][m_block][n_block]
-    //
-    //  My own rank's partial is already in local buffer (written by epilogue warps).
-    //  I pull (N-1) partials from peer ranks and accumulate in FP32.
-    //
-    //  Scheduling:
-    //    Comm warps iterate over my chunk's tiles (num_m_blocks_per_rank × num_n_blocks).
-    //    For each tile, they wait for ALL ranks' ready flags, then pull + reduce.
-    //    Tiles are distributed round-robin across SMs.
-    //
-    else if (warp_idx >= kCommWarpStart) {
-        const uint32_t comm_warp_local_idx = warp_idx - kCommWarpStart;
-        const uint32_t comm_thread_local_idx = comm_warp_local_idx * 32 + lane_idx;
-        const uint32_t total_comm_threads = kNumCommThreads;
-
-        // My chunk: tiles belonging to rank_idx
-        const uint32_t total_my_tiles = num_m_blocks_per_rank * num_n_blocks;
-
-        // Vectorized reduce: 16 bytes at a time
-        constexpr uint32_t kVecBytes = 16;
-        constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);
-
-        // Elements per tile
-        const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
-        const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
-
-        // Iterate over tiles assigned to this SM
-        for (uint32_t tile_idx = sm_idx; tile_idx < total_my_tiles; tile_idx += kNumSMs) {
-            const uint32_t my_m_block = tile_idx / num_n_blocks;
-            const uint32_t my_n_block = tile_idx - my_m_block * num_n_blocks;
-
-            // ── Wait for ALL ranks' ready flags for this tile ──
-            // We need partial data from all N ranks (including self)
-            // self is guaranteed ready once epilogue finishes for this tile
-            if (comm_warp_local_idx == 0 and lane_idx < kNumRanks) {
-                // Each lane polls one rank's ready flag
-                const uint32_t poll_rank = lane_idx;
-                if (poll_rank != rank_idx) {
-                    // Poll remote rank's ready flag for my tile
-                    // Remote rank stores ready at its own workspace.get_ready_ptr(poll_rank, my_m_block, my_n_block)
-                    // But we need to read from the REMOTE rank's buffer via sym_buffer mapping
-                    auto* local_ready_ptr = workspace.get_ready_ptr(poll_rank, my_m_block, my_n_block);
-                    auto* remote_ready_ptr = sym_buffer.map(local_ready_ptr, poll_rank);
-
-                    // Spin-wait with acquire semantics (30s timeout)
-                    constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
-                    const auto start_clock = clock64();
-                    while (ptx::ld_acq_sys(remote_ready_ptr) == 0u) {
-                        if (clock64() - start_clock >= kTimeoutCycles) {
-                            printf("GEMM-RS comm warp timeout: rank=%d, poll_rank=%d, tile=(%d,%d)\n",
-                                   rank_idx, poll_rank, my_m_block, my_n_block);
-                            DG_DEVICE_ASSERT(false and "Comm warp ready flag timeout");
-                        }
-                    }
-                }
-            }
-            // Sync all comm warps after polling
-            cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
-
-            // ── Pull + Reduce: accumulate all ranks' partials ──
-            // Each comm thread handles a slice of the tile's elements
-            const uint32_t base_row = my_m_block * BLOCK_M;
-            const uint32_t base_col = my_n_block * BLOCK_N;
-
-            for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += total_comm_threads) {
-                // Convert vec_offset to row/col within tile
-                const uint32_t elem_offset = vec_offset * kVecSize;
-                const uint32_t tile_row = elem_offset / BLOCK_N;
-                const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
-
-                const uint32_t global_row = base_row + tile_row;
-                const uint32_t global_col = base_col + tile_col;
-
-                if (global_row >= runtime_m_per_rank or global_col >= shape_n)
-                    continue;
-
-                // FP32 accumulator
-                float acc[kVecSize];
-                #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++ i)
-                    acc[i] = 0.0f;
-
-                // Accumulate from all ranks
-                #pragma unroll 1
-                for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
-                    // Read from src_rank's partial buffer
-                    const comm_dtype_t* partial_ptr;
-                    if (src_rank == rank_idx) {
-                        // Local: read directly
-                        partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
-                    } else {
-                        // Remote: map through sym_buffer for NVLink P2P read
-                        auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
-                        partial_ptr = sym_buffer.map(local_ptr, src_rank);
-                    }
-
-                    // Vectorized load
-                    const auto* vec_ptr = reinterpret_cast<const uint4*>(partial_ptr);
-                    uint4 data = *vec_ptr;
-                    const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
-
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i) {
-                        acc[i] += static_cast<float>(comm_data[i]);
-                    }
-                }
-
-                // Write final output
-                // Output is at: output[global_row * shape_n + global_col]
-                if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                    // Pack FP32 → BF16 and write as uint4
-                    uint4 result;
-                    auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i) {
-                        out_bf16[i] = cd_dtype_t(acc[i]);
-                    }
-                    auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
-                    *out_ptr = result;
-                } else {
-                    // FP32 output
-                    uint4 result;
-                    auto* out_f32 = reinterpret_cast<float*>(&result);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i) {
-                        out_f32[i] = acc[i];
-                    }
-                    auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
-                    *out_ptr = result;
-                }
-            }
-        }
-    }
-
     // ── Final synchronization ──
-    // All warps must finish before kernel exits.
-    // Comm warps have written final output; epilogue warps have written partials + flags.
-    // We need a grid-wide + NVLink barrier to ensure:
-    //   1. All ranks have finished pulling (so nobody reads stale ready flags next iteration)
-    //   2. Ready flags can be safely reset for next call
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
     constexpr uint32_t kFinalBarrierTag = 42;
@@ -661,7 +741,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // Deallocate tensor memory
-    if (warp_idx == 0)
+    if (warp_idx == kLoadWarpAIdx)
         Allocator().free(0, kNumTmemCols);
 
 #else

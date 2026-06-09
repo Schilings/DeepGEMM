@@ -37,6 +37,7 @@ struct GemmRSConfig {
            << ", with_accumulation=" << config.with_accumulation
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
+           << ", num_comm_threads=" << config.num_rs_threads
            << ", reduce_num_threads=" << config.reduce_num_threads << ")";
         return os;
     }
@@ -44,24 +45,36 @@ struct GemmRSConfig {
 
 // ════════════════════════════════════════════════════════════════
 //  Pull-based single-kernel GEMM + RS 配置
-//  需要额外的 comm threads 用于 pull + reduce
+//
+//  Warp layout (MegaMoE-style for Blackwell):
+//    W0~W3: Comm (Dispatch) Warps — 128T, 48 regs — pull + per-rank reduce
+//    W4: Load A Warp — 32T, 40 regs — TMA multicast load A
+//    W5: Load B Warp — 32T, 40 regs — TMA multicast load B
+//    W6: MMA Issue Warp — 32T, 40 regs — single-warp UMMA (Blackwell)
+//    W7: Reserved — 32T, 40 regs
+//    W8~W11: Epilogue Warps — 128T, 208 regs — TMEM → smem → local partial + flag
+//
+//  Total: 128 + 128 + 128 = 384 threads = 12 warps
+//  Registers: 48×128 + 40×128 + 208×128 = 6144 + 5120 + 26624 = 37888 (within SM100 max 64512)
+//
+//  TMA Multicast = 2 (2-CTA cluster):
+//    A matrix read once from HBM, multicast to 2 SMs' smem
+//    Effective 2x HBM bandwidth for A (critical for compute-bound tiles)
+//
 // ════════════════════════════════════════════════════════════════
 static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k, const int& num_sms,
                                        const int& elem_size_ab = 1, const int& num_ranks = 1) {
     const int m_per_rank = num_ranks > 1 ? m / num_ranks : m;
     const bool is_fp8 = (elem_size_ab == 1);
 
-    // Warp allocation:
-    //   W0: TMA Load (32 threads)
-    //   W1: MMA Issue (32 threads)
-    //   W2-3: Epilogue (64 threads) — TMEM → smem → local partial + set flag
-    //   W4-7: Comm Warps (128 threads) — Pull + Reduce from peer ranks
-    constexpr int num_non_epilogue_threads = 128;  // W0-W3 (GEMM control)
-    constexpr int num_epilogue_threads = 64;       // W2-W3 (Epilogue, lighter since only local write)
-    constexpr int num_rs_threads = 128;            // W4-W7 (Comm: pull + reduce)
-    // Note: num_non_epilogue_threads includes W0(TMA) + W1(MMA) + W2-3(epilogue base)
-    // kNumGemmThreads=128, kNumEpilogueThreads=64, kNumCommThreads=128
-    // Total = 320 threads = 10 warps
+    // MegaMoE-style warp allocation:
+    //   Comm Warps (W0-W3): 128 threads, 48 regs — per-rank pipelined pull + reduce
+    //   Non-Epilogue (W4-W7): 128 threads, 40 regs — TMA Load A, TMA Load B, MMA Issue, Reserved
+    //   Epilogue (W8-W11): 128 threads, 208 regs — TMEM → local partial + ready flag
+    constexpr int num_comm_threads = 128;           // W0-W3: Comm/Dispatch warps
+    constexpr int num_non_epilogue_threads = 128;   // W4-W7: Load A + Load B + MMA + Reserved
+    constexpr int num_epilogue_threads = 128;       // W8-W11: Epilogue (1 warpgroup, 4 warps)
+    // Total = 384 threads = 12 warps
 
     constexpr int block_n = 128;
     const int block_k = 128 / elem_size_ab;
@@ -70,7 +83,7 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int num_n_blocks = (n + block_n - 1) / block_n;
     auto compute_waves = [&](int bm) {
         int num_m_blocks = (m_per_rank + bm - 1) / bm;
-        int total_blocks = num_m_blocks * num_n_blocks * num_ranks;  // total across all ranks' chunks
+        int total_blocks = num_m_blocks * num_n_blocks * num_ranks;
         return static_cast<float>(total_blocks) / num_sms;
     };
 
@@ -83,18 +96,22 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
         block_m = 32;
     }
 
-    const int load_block_m = block_m;
-    const int load_block_n = block_n;
+    // TMA Multicast = 2 (2-CTA cluster, learning from MegaMoE)
+    // Always multicast on A: A is read once from HBM, delivered to 2 CTAs' smem
+    constexpr int num_multicast = 2;
+    constexpr bool is_multicast_on_a = true;
+
+    const int load_block_m = block_m / (is_multicast_on_a ? num_multicast : 1);
+    const int load_block_n = block_n / (is_multicast_on_a ? 1 : num_multicast);
     constexpr int swizzle_a_mode = 128;
     constexpr int swizzle_b_mode = 128;
     constexpr int swizzle_cd_mode = 128;
-    constexpr int num_multicast = 1;
     constexpr int reduce_num_threads = 0;  // 不需要单独的 reduce kernel
 
-    // Pipeline stages (with additional comm smem for pull+reduce)
+    // Pipeline stages (with comm fetch stages)
     constexpr int kNumTMAStoreStages = 2;
     constexpr int kNumEpilogueStages = 2;
-    constexpr int kNumCommStages = 2;
+    constexpr int kNumCommFetchStages = 2;
 
     const int store_block_m = std::min(block_m, 128);
     const int store_block_n = swizzle_cd_mode / (is_fp8 ? 1 : 2);  // sizeof(comm_dtype_t)
@@ -104,12 +121,15 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int smem_a_per_stage = load_block_m * block_k * elem_size_ab;
     const int smem_b_per_stage = load_block_n * block_k * elem_size_ab;
 
-    const int smem_comm = block_m * store_block_n * (is_fp8 ? 1 : 2) * kNumCommStages;
+    // Comm fetch buffer: full tile per stage for TMA pull
+    const int smem_comm = block_m * store_block_n * (is_fp8 ? 1 : 2) * kNumCommFetchStages;
+    // Comm fetch barriers
+    const int smem_comm_barriers = kNumCommFetchStages * 8;
 
     const int barriers_per_stage = 2;  // full + empty
     const int smem_barriers_fixed = kNumEpilogueStages * 2 * 8 + 4;  // tmem barriers + tmem ptr
 
-    const int smem_fixed = smem_cd + smem_barriers_fixed + smem_comm + 128;  // +128 for alignment
+    const int smem_fixed = smem_cd + smem_barriers_fixed + smem_comm + smem_comm_barriers + 256;  // +256 for alignment
     const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + barriers_per_stage * 8;
 
     const int num_stages = (SM100ArchSpec::smem_capacity - smem_fixed) / smem_per_stage;
@@ -117,7 +137,6 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
 
     const int smem_size = smem_fixed + num_stages * smem_per_stage;
 
-    constexpr bool is_multicast_on_a = true;
     constexpr bool swap_ab = false;
     constexpr bool with_accumulation = false;
 
@@ -126,7 +145,7 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
         load_block_m, load_block_n,
         swizzle_a_mode, swizzle_b_mode, swizzle_cd_mode,
         num_stages, smem_size,
-        num_rs_threads,
+        num_comm_threads,
         num_non_epilogue_threads, num_epilogue_threads,
         num_multicast,
         is_multicast_on_a,
