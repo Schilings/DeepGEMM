@@ -216,6 +216,43 @@ def bf16_gemm_rs_fused(y: torch.Tensor,
     )
 
 
+def bf16_gemm_rs_v2_nt(y: torch.Tensor,
+                       a: torch.Tensor,
+                       b: torch.Tensor,
+                       sym_buffer: GemmRSSymmBuffer,
+                       num_tokens_per_rank: int,
+                       compiled_dims: str = 'nk'):
+    """
+    BF16 GEMM + Reduce-Scatter V2: Pull-based single-kernel fusion with tile-level overlap.
+
+    This is the improved implementation that:
+    - Uses a single kernel (no separate reduce kernel)
+    - Achieves tile-level computation-communication overlap
+    - Uses pull-based reduce (bandwidth-optimal like NCCL ring RS)
+    - Comm warps pull from peer ranks and reduce in FP32 while GEMM warps compute
+
+    Args:
+        y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
+        a: Input matrix [total_tokens, K], dtype bfloat16
+        b: Weight matrix [N, K] (NT layout), dtype bfloat16
+        sym_buffer: Symmetric buffer (created via get_symm_buffer_for_gemm_rs)
+        num_tokens_per_rank: Actual tokens per rank for this call
+        compiled_dims: JIT compilation dimension string
+    """
+    assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_v2_nt is for SM100/B-series GPUs'
+    comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
+    _C.bf16_gemm_rs_v2_nt(
+        y, a, b,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        num_tokens_per_rank,
+        compiled_dims,
+        comm_dtype_str,
+    )
+
+
 def fp8_gemm_rs_nt(y: torch.Tensor,
                    a: Tuple[torch.Tensor, torch.Tensor],
                    b: Tuple[torch.Tensor, torch.Tensor],
