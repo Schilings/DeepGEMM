@@ -1,5 +1,9 @@
 # GEMM + Reduce-Scatter (GEMM-RS) Kernel
 
+> **⚠️ 重要**：本文档描述的是 **V1** 实现（Push + PDL 两阶段）。
+> 新版 **V2**（Pull-based 单 kernel + tile 级 overlap）已开发完成，待多卡测试。
+> V2 设计见 [GEMM_RS_V2.md](./GEMM_RS_V2.md)，开发状态见 [SESSION_MEMORY.md](./SESSION_MEMORY.md)。
+
 ## 概述
 
 DeepGEMM 提供融合了矩阵乘法（GEMM）和 Reduce-Scatter 通信的 SM100（B300）专用内核，在计算 `D = A @ B^T` 的同时将结果在多 GPU 间进行 reduce-scatter 操作，避免了单独通信的开销。
@@ -320,3 +324,21 @@ Benchmark 覆盖多种 shape（M=256~4096, N/K=512~7168）和多种 rank 数（2
 
 ### Q: 不要用 `torchrun`
 测试脚本内部用 `mp.spawn` 管理多进程，用 `torchrun` 会导致进程数翻倍。直接 `python tests/test_gemm_rs_*.py <num_gpus>` 即可。
+
+---
+
+## V2 版本（改良方案）
+
+V1 的核心问题是 **Symmetric Push 通信量 O(N)** 和 **无真正 overlap**（全量 GEMM 完成才通信），在 4+ GPU 环境下全面落后于 NCCL 分离方案。
+
+**V2 方案** 借鉴 ByteDance Flux（Pull 模式 + tile 级 overlap）和 DeepSeek MegaMoe（SM100 persistent kernel 模式），实现了：
+
+- **Pull-based 通信**: 每个 rank 主动从 peer 拉取，bandwidth-optimal
+- **单 Kernel 全融合**: 消除 PDL + reduce kernel 的 inter-kernel 开销
+- **Tile 级流水线**: Comm Warps 持续 pull+reduce，与 GEMM Warps 并行
+
+详见：
+- 设计文档: [GEMM_RS_V2.md](./GEMM_RS_V2.md)
+- API: `deep_gemm.bf16_gemm_rs_v2_nt()`
+- 测试: `tests/test_gemm_rs_v2.py`
+- Benchmark: `benchmarks/bench_gemm_rs_v2.py`

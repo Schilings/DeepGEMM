@@ -5,6 +5,17 @@
 V2 是对原始 GEMM+RS 实现的重大重构，借鉴了 ByteDance Flux 和 DeepSeek MegaMoe 的设计思想，
 在 NVIDIA Blackwell (SM100) 架构上实现了真正的**计算-通信 tile 级流水线重叠**。
 
+## 背景与动机
+
+V1 的两个致命问题：
+1. **Symmetric Push O(N)**: 每个 rank push 给 N-1 个 peer，通信量随 rank 数线性增长
+2. **无真正 overlap**: 全部 GEMM 完成 → 全局 barrier → 再启 reduce kernel
+
+V2 的目标：
+- 通信量降到 bandwidth-optimal: O((N-1)/N)
+- 实现 tile 粒度的计算-通信重叠
+- 单 kernel 完成所有工作，消除 inter-kernel 开销
+
 ## 核心改进
 
 | 维度 | V1 (Push + PDL) | V2 (Pull-based) |
@@ -15,6 +26,7 @@ V2 是对原始 GEMM+RS 实现的重大重构，借鉴了 ByteDance Flux 和 Dee
 | Overlap 粒度 | 无真正 overlap | Tile 级流水线 |
 | 同步模型 | 全局 nvlink_barrier | Per-tile ready flag |
 | 通信带宽效率 | 非 optimal | Bandwidth-optimal (= NCCL) |
+| Reduce 方式 | 单独 reduce epilogue kernel | Comm Warps 内融合 FP32 reduce |
 
 ## 架构设计
 
@@ -34,7 +46,7 @@ V2 是对原始 GEMM+RS 实现的重大重构，借鉴了 ByteDance Flux 和 Dee
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 数据流
+### 数据流（Tile 级流水线）
 
 ```
 时间 →
@@ -55,58 +67,90 @@ Comm Warps:      (waiting)      poll flag_0 →   poll flag_1 →
 ### M 维 Swizzle 调度
 
 Rank i 计算 tile 的顺序：
-1. 先计算属于 rank (i+1) 的 chunk
+1. 先计算属于 rank (i+1) 的 chunk → 写本地 partial + set flag
 2. 再计算属于 rank (i+2) 的 chunk
 3. ...
 4. 最后计算属于自己 rank i 的 chunk
 
-这确保了接收方的 Comm Warps 能尽早开始拉取数据。
+**目的**：接收方的 Comm Warps 能尽早开始从 peer 拉取数据，最大化 overlap 窗口。
 
 ### 同步机制
 
-1. **GEMM → Epilogue**: tmem_full/tmem_empty barriers (经典流水线)
-2. **Epilogue → Comm (跨 rank)**: Per-tile ready flag + `__threadfence_system`
-3. **Comm poll**: `ld_acq_sys` 自旋等待远端 ready flag
-4. **Kernel 结束**: nvlink_barrier 确保所有 rank 完成 pull，然后 reset flags
+| 同步点 | 机制 | 说明 |
+|--------|------|------|
+| GEMM → Epilogue | `tmem_full` / `tmem_empty` barriers | TMEM 流水线（经典模式） |
+| Epilogue → Comm (跨 rank) | `__threadfence_system()` + `st_rel_sys(flag, 1)` | Per-tile ready flag |
+| Comm poll (跨 rank) | `ld_acq_sys(flag)` 自旋等待 | 检测远端 tile 就绪 |
+| Kernel 结束 | `nvlink_barrier` | 确保所有 rank 完成 pull 后再 reset flags |
 
-## 通信量分析
+### 通信量分析
 
 对于 N 个 rank，每个 rank 的输出大小为 `M_per_rank × N_dim`：
 
-- **V1 (Symmetric Push)**: 每个 rank 向 N-1 个 peer 各推送一份完整 chunk
-  - 总通信量 = `(N-1) × M_per_rank × N_dim` per rank
-  - 全系统 = `N × (N-1) × chunk_size`
-
-- **V2 (All-to-1 Pull)**: 每个 rank 从 N-1 个 peer 各拉取一份 chunk
-  - 总通信量 = `(N-1) × M_per_rank × N_dim` per rank
-  - 但关键区别：**每个 rank 只读取自己需要的数据**（无冗余传输）
+- **V1 (Symmetric Push)**: 总通信量 = `N × (N-1) × chunk_size` (全系统)
+- **V2 (All-to-1 Pull)**: 总通信量 = `N × (N-1) × chunk_size / N` = `(N-1) × chunk_size`
   - 等同于 NCCL ring reduce-scatter 的 bandwidth-optimal 通信量
 
 ## 文件结构
 
 ```
-deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh  — 核心 kernel 实现
-csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp            — JIT runtime
+=== 核心实现 ===
+deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh  — 核心 kernel (~450行)
+csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp            — JIT runtime + launch
 csrc/jit_kernels/heuristics/gemm_rs.hpp                     — get_gemm_rs_v2_config()
 csrc/apis/gemm_rs.hpp                                       — C++ API: bf16_gemm_rs_v2_nt()
 deep_gemm/gemm_rs/__init__.py                               — Python API: bf16_gemm_rs_v2_nt()
-tests/test_gemm_rs_v2.py                                    — 正确性测试
-benchmarks/bench_gemm_rs_v2.py                              — 性能基准测试
+
+=== 测试 ===
+tests/test_gemm_rs_v2.py                                    — 正确性测试 (支持 2/4/8 GPU)
+benchmarks/bench_gemm_rs_v2.py                              — 三方对比: V2 vs V1 vs Separate
+```
+
+## Python API
+
+```python
+import deep_gemm
+
+# 创建对称缓冲区（与 V1 共用）
+sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(
+    group,                    # ProcessGroup
+    num_max_tokens_per_rank,  # 最大 token 数
+    hidden,                   # N 维度
+    out_dtype=torch.bfloat16,
+    comm_dtype=None,          # None=BF16, torch.float32=FP32
+)
+
+# V2 GEMM+RS
+deep_gemm.bf16_gemm_rs_v2_nt(
+    y,                    # [tokens_per_rank, N], output
+    a,                    # [total_tokens, K], input (BF16)
+    b,                    # [N, K], weight NT layout (BF16)
+    sym_buffer,           # GemmRSSymmBuffer
+    num_tokens_per_rank,  # 当前实际 token 数
+    compiled_dims='nk',   # JIT 编译维度
+)
 ```
 
 ## 运行测试
 
 ```bash
+cd /root/.local/codebuddy/DeepGEMM
+
+# 清除旧 JIT 缓存
+rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_v2*
+
 # 正确性测试 (2 GPUs)
 python tests/test_gemm_rs_v2.py 2
 
 # 正确性测试 (8 GPUs)
 python tests/test_gemm_rs_v2.py 8
 
-# 性能基准测试
+# 性能基准测试 (三方对比)
 python benchmarks/bench_gemm_rs_v2.py 2 20
 python benchmarks/bench_gemm_rs_v2.py 8 20
 ```
+
+> **注意**：不要用 `torchrun`，脚本内部用 `mp.spawn` 管理多进程。
 
 ## 预期改进
 
@@ -117,3 +161,32 @@ python benchmarks/bench_gemm_rs_v2.py 8 20
 
 相比 Separate (GEMM + NCCL RS)：
 - **所有 shape**: 预期接近或更好（无 kernel launch 间隙 + 计算通信重叠）
+
+## 调试指南
+
+### 如果 V2 正确性不过
+
+1. **检查 per-tile flag**: 加 `printf` 在 comm warps 看 flag 是否被正确设置
+2. **检查 M-Swizzle**: 确认每个 rank 的 tile 计算顺序和 flag 索引对应
+3. **检查 FP32 reduce**: 确认累加器初始化为 0，以及 rank 自己的 partial 也被加入
+4. **单步验证**: 先固定 `num_ranks=2`，关闭 M-Swizzle 测试基本逻辑
+
+### 如果 V2 Hang（死锁）
+
+1. **Comm Warps 永远等不到 flag**: 可能是 Epilogue 没有正确 `st_rel_sys`
+2. **nvlink_barrier 卡住**: 可能某 rank 提前结束 → 检查所有 rank 是否执行相同数量的 barrier
+3. **TMA Load 超时**: 远端内存地址错误 → 检查 `sym_buffer_ptrs` 的正确性
+
+### 如果性能不达预期
+
+1. **nsys profile**: `nsys profile python benchmarks/bench_gemm_rs_v2.py 2 5`
+2. **检查 SM 占用率**: 320 线程可能限制 occupancy → 考虑减少 Comm Warps
+3. **检查 NVLink 利用率**: `nvidia-smi nvlink -i 0 -s` 查看 NVLink 吞吐
+4. **Comm Warps 瓶颈**: 如果 pull 延迟高，考虑用 TMA Load 代替手动 global load
+
+## 后续扩展方向
+
+1. **TMA Load for Pull**: 用 TMA 的硬件异步 bulk load 代替 Comm Warps 的手动 load
+2. **FP8 V2**: 扩展到 FP8 输入（需要 SF 处理逻辑）
+3. **Multi-step Ring**: 参考 NCCL ring 的流水线，进一步减少延迟
+4. **Adaptive Warp Split**: 根据 compute/comm ratio 动态分配 Warp 数量
