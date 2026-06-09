@@ -3,6 +3,7 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cutlass/arch/barrier.h>
+#include <cutlass/arch/reg_reconfig.h>
 
 #include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/common/math.cuh>
