@@ -12,34 +12,32 @@
 
 DeepGEMM 的 **GEMM-RS (GEMM + Reduce-Scatter)** 融合 kernel，目标是在多 GPU NVLink 互联环境下，将 GEMM 计算与 ReduceScatter 通信重叠，实现 MoE 推理中的通信掩盖。
 
-### 版本对照
+### 当前状态
 
-| 版本 | 文件 | 状态 | 设计 |
-|------|------|------|------|
-| **V1** | `sm100_bf16_gemm_rs.cuh` | ✅ 已完成，性能不佳 | Push + 两阶段 PDL，无真正 overlap |
-| **V2** | `sm100_bf16_gemm_rs_v2.cuh` | 🔧 已写完，待多卡测试 | Pull-based 单 kernel，tile 级 overlap |
+- **设计方案**: Pull-based 单 kernel，tile 级 overlap
+- **代码状态**: 已写完，待多卡测试验证
+- **之前的尝试（Push + PDL 两阶段）**: 已验证性能不行（8GPU 仅 0.21x NCCL），保留代码作为参考但不再继续开发
 
 ---
 
-## 🚀 V2 实现概要（当前重点）
+## 🚀 当前方案概要
 
 ### 设计灵感来源
 
 1. **ByteDance Flux** — Pull 模式 + Tile 粒度 overlap + per-tile barrier
 2. **DeepSeek MegaMoe** — Persistent kernel + Warp 功能分化 + SM100 TMA 模式
 
-### V2 vs V1 核心区别
+### 核心设计
 
-| 维度 | V1 (Push + PDL) | V2 (Pull-based) |
-|------|-----------------|-----------------|
-| Kernel 数量 | 2 (GEMM + Reduce) | **1** (全融合) |
-| 通信方向 | Push (写远端) | **Pull (读远端)** |
-| 通信模型 | Symmetric Push O(N) | **All-to-1 Pull O((N-1)/N)** |
-| Overlap 粒度 | 无真正 overlap | **Tile 级流水线** |
-| 同步模型 | 全局 nvlink_barrier | **Per-tile ready flag** |
-| 通信带宽效率 | 非 optimal | **Bandwidth-optimal (= NCCL)** |
+| 维度 | 说明 |
+|------|------|
+| Kernel 数量 | **1** (全融合) |
+| 通信方向 | **Pull (读远端)** |
+| 通信模型 | **All-to-1 Pull O((N-1)/N)**, bandwidth-optimal |
+| Overlap 粒度 | **Tile 级流水线** |
+| 同步模型 | **Per-tile ready flag** (st_rel_sys / ld_acq_sys) |
 
-### V2 Warp 分工 (320 threads = 10 warps)
+### Warp 分工 (320 threads = 10 warps)
 
 ```
 W0 (32T): TMA Load — 加载 A/B tiles 到 SMEM
@@ -51,7 +49,7 @@ W4-7 (128T): Comm — Pull-based Reduce-Scatter
              - FP32 accumulate → write final output
 ```
 
-### V2 关键算法
+### 关键算法
 
 1. **M 维 Swizzle**: Rank i 优先计算 rank(i+1) 的 chunk → 使接收端能尽早开始拉取
 2. **Per-tile Ready Flag**: Epilogue 完成一个 tile 后 `st_rel_sys(flag)` 通知远端
@@ -60,27 +58,21 @@ W4-7 (128T): Comm — Pull-based Reduce-Scatter
 
 ---
 
-## 📊 V1 性能现状（作为基线参考）
+## 📊 之前尝试的结果（Push + PDL 方案，已废弃）
 
-### V1 的核心问题
+那个方案的核心问题：
+- **通信模型 = Symmetric Push O(N)**: 总通信量是 NCCL ring 的 N 倍
+- **无真正 overlap**: 全部 GEMM 完成后才做一次 nvlink_barrier → 再启 reduce kernel
+- **8 GPU 全面落后**: Geo mean 仅为 NCCL 方案的 0.21x
+- **结论：仅在 2GPU + 极小 batch 下有微弱优势，完全不实用**
 
-| 问题 | 影响 |
-|------|------|
-| **通信模型 = Symmetric Push O(N)** | 总通信量是 NCCL ring 的 N 倍 |
-| **无真正 overlap** | 全部 GEMM 完成后才做一次 nvlink_barrier → 再启 reduce kernel |
-| **8 GPU 全面落后** | Geo mean 仅为 NCCL 方案的 0.21x |
-
-### V1 Benchmark 摘要（8 GPU BF16）
-
-- 小 shape (2048×512×1024): 0.61x separate
-- 大 shape (32768×7168×2048): 0.10x separate
-- **结论：V1 仅在 2GPU + 极小 batch 下有微弱优势**
+详细数据见 [BENCHMARK_GEMM_RS.md](./BENCHMARK_GEMM_RS.md)。
 
 ---
 
 ## ⏭️ 下一步工作（多卡环境）
 
-### 优先级 P0：测试 V2 正确性
+### 优先级 P0：测试正确性
 
 ```bash
 # 清除 JIT 缓存
@@ -93,12 +85,12 @@ python tests/test_gemm_rs_v2.py 2
 python tests/test_gemm_rs_v2.py 8
 ```
 
-**预期**：V2 的 pull + reduce 应该得到与 `bf16_gemm_nt + nccl_reduce_scatter` 相同的结果（允许 FP32 累加误差）。
+**预期**：pull + reduce 应该得到与 `bf16_gemm_nt + nccl_reduce_scatter` 相同的结果（允许 FP32 累加误差）。
 
-### 优先级 P1：Benchmark V2
+### 优先级 P1：Benchmark
 
 ```bash
-# V2 性能对比 (V2 vs V1 vs Separate)
+# 性能对比 (当前方案 vs 旧方案 vs GEMM+NCCL分离)
 python benchmarks/bench_gemm_rs_v2.py 2 20
 python benchmarks/bench_gemm_rs_v2.py 4 20
 python benchmarks/bench_gemm_rs_v2.py 8 20
@@ -117,32 +109,29 @@ python benchmarks/bench_gemm_rs_v2.py 8 20
 
 - **TMA Load for Pull**: 用 TMA 硬件异步拉取代替手动 global load
 - **Ring 多步流水线**: 参考 NCCL ring 的多步 reduce 降低延迟
-- **FP8 V2 版本**: 扩展到 FP8 输入
+- **FP8 版本**: 扩展到 FP8 输入
 
 ---
 
 ## 📁 关键文件路径
 
 ```
-=== V2 实现（新）===
-deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh   # V2 核心 kernel
-csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp              # V2 JIT runtime
+=== 当前方案实现 ===
+deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh   # 核心 kernel
+csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp              # JIT runtime
 csrc/jit_kernels/heuristics/gemm_rs.hpp                       # get_gemm_rs_v2_config()
 csrc/apis/gemm_rs.hpp                                         # C++ API: bf16_gemm_rs_v2_nt()
 deep_gemm/gemm_rs/__init__.py                                 # Python API: bf16_gemm_rs_v2_nt()
-tests/test_gemm_rs_v2.py                                      # V2 正确性测试
-benchmarks/bench_gemm_rs_v2.py                                # V2 Benchmark (V2 vs V1 vs Separate)
-docs/GEMM_RS_V2.md                                            # V2 设计文档
+tests/test_gemm_rs_v2.py                                      # 正确性测试
+benchmarks/bench_gemm_rs_v2.py                                # Benchmark
 
-=== V1 实现（旧）===
-deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh      # V1 BF16 kernel (Push+PDL)
-deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_rs.cuh       # V1 FP8 kernel
-deep_gemm/include/deep_gemm/impls/sm100_reduce_epilogue.cuh   # V1 Reduce kernel (阶段2)
-csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp                 # V1 BF16 JIT
-csrc/jit_kernels/impls/sm100_fp8_gemm_rs.hpp                  # V1 FP8 JIT
-tests/test_gemm_rs_bf16.py                                    # V1 BF16 测试
-tests/test_gemm_rs_fp8.py                                     # V1 FP8 测试
-benchmarks/bench_gemm_rs.py                                   # V1 Benchmark
+=== 旧方案（Push+PDL，已废弃，仅供参考）===
+deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh      # 旧 BF16 kernel
+deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_rs.cuh       # 旧 FP8 kernel
+deep_gemm/include/deep_gemm/impls/sm100_reduce_epilogue.cuh   # 旧 Reduce kernel
+tests/test_gemm_rs_bf16.py                                    # 旧 BF16 测试
+tests/test_gemm_rs_fp8.py                                     # 旧 FP8 测试
+benchmarks/bench_gemm_rs.py                                   # 旧 Benchmark
 
 === 公共基础设施 ===
 deep_gemm/include/deep_gemm/comm/barrier.cuh                  # nvlink_barrier / grid_sync
@@ -156,7 +145,8 @@ deep_gemm/include/deep_gemm/ptx/ptx.cuh                      # PTX 内联 (st_re
 ## 🔄 Git 提交历史
 
 ```
-b18642e feat(gemm-rs): Add V2 pull-based single-kernel GEMM+RS fusion  ← 最新
+035d750 docs: update all docs for V2 development continuity
+b18642e feat(gemm-rs): Add V2 pull-based single-kernel GEMM+RS fusion  ← 当前方案
 33520d5 feat(fp8_gemm_rs): apply Plan B to FP8 kernel + add SKIP_FP8 bench option
 8054773 feat(gemm_rs): Plan B - remove per-tile fence, add kernel-end barrier + dynamic config
 80bdb23 bench: add 2/4/8 GPU results to GEMM-RS benchmark report
@@ -173,22 +163,15 @@ cd /root/.local/codebuddy/DeepGEMM
 git submodule update --init --recursive
 pip install -e . --no-build-isolation
 
-# ===== V2 测试 =====
-python tests/test_gemm_rs_v2.py 2       # V2 正确性 (2 GPU)
-python tests/test_gemm_rs_v2.py 8       # V2 正确性 (8 GPU)
-python benchmarks/bench_gemm_rs_v2.py 2 20   # V2 Benchmark (2 GPU)
-python benchmarks/bench_gemm_rs_v2.py 8 20   # V2 Benchmark (8 GPU)
-
-# ===== V1 测试（对照组）=====
-python tests/test_gemm_rs_bf16.py 2
-python tests/test_gemm_rs_bf16.py 8
-python benchmarks/bench_gemm_rs.py 8 20
-SKIP_FP8=1 python benchmarks/bench_gemm_rs.py 8 20
+# ===== 当前方案测试 =====
+python tests/test_gemm_rs_v2.py 2       # 正确性 (2 GPU)
+python tests/test_gemm_rs_v2.py 8       # 正确性 (8 GPU)
+python benchmarks/bench_gemm_rs_v2.py 2 20   # Benchmark (2 GPU)
+python benchmarks/bench_gemm_rs_v2.py 8 20   # Benchmark (8 GPU)
 
 # ===== 清除 JIT 缓存 =====
 rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_v2*
 rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_nt.*
-rm -rf ~/.deep_gemm/cache/kernel.sm100_fp8_gemm_rs_nt.*
 
 # ===== Git 操作 =====
 cd /root/.local/codebuddy/DeepGEMM
@@ -232,8 +215,8 @@ git add -A && git commit -m "描述" && git push origin main
 
 ## ⚠️ 已知风险和注意事项
 
-1. **V2 kernel 未经多卡验证** — 需要在 2+ GPU 环境测试正确性
+1. **当前 kernel 未经多卡验证** — 需要在 2+ GPU 环境测试正确性
 2. **Per-tile flag 跨 NVLink 延迟** — 如果 ld_acq_sys 自旋成本高，考虑批量 flag
 3. **320 线程 = 10 warps** — 可能影响 SM 占用率，需 profiling
 4. **M-Swizzle 调度** — 如果所有 CTA 同时写同一个远端 rank 的 flag 可能造成热点
-5. **comm_dtype** — V2 目前支持 BF16/FP32 comm，默认 BF16
+5. **comm_dtype** — 目前支持 BF16/FP32 comm，默认 BF16

@@ -1,32 +1,35 @@
-# GEMM+RS V2: Pull-based Single-Kernel Fusion with Tile-Level Overlap
+# GEMM+RS: Pull-based Single-Kernel Fusion with Tile-Level Overlap
 
 ## 概述
 
-V2 是对原始 GEMM+RS 实现的重大重构，借鉴了 ByteDance Flux 和 DeepSeek MegaMoe 的设计思想，
-在 NVIDIA Blackwell (SM100) 架构上实现了真正的**计算-通信 tile 级流水线重叠**。
+DeepGEMM 的 GEMM-RS 融合 kernel，在 NVIDIA Blackwell (SM100) 架构上实现**计算-通信 tile 级流水线重叠**。
+借鉴 ByteDance Flux 和 DeepSeek MegaMoe 的设计思想。
+
+> **状态**: 代码已完成，待多卡环境测试验证。
 
 ## 背景与动机
 
-V1 的两个致命问题：
-1. **Symmetric Push O(N)**: 每个 rank push 给 N-1 个 peer，通信量随 rank 数线性增长
-2. **无真正 overlap**: 全部 GEMM 完成 → 全局 barrier → 再启 reduce kernel
+之前尝试过 Push+PDL 两阶段方案，验证后发现性能不可接受：
+- Symmetric Push O(N) 通信量随 rank 数线性增长
+- 无真正 overlap：全部 GEMM 完成才通信
+- 8GPU 下仅 NCCL 分离方案的 0.21x
 
-V2 的目标：
+当前方案的目标：
 - 通信量降到 bandwidth-optimal: O((N-1)/N)
 - 实现 tile 粒度的计算-通信重叠
 - 单 kernel 完成所有工作，消除 inter-kernel 开销
 
-## 核心改进
+## 核心设计
 
-| 维度 | V1 (Push + PDL) | V2 (Pull-based) |
-|------|-----------------|-----------------|
-| Kernel 数量 | 2 (GEMM + Reduce) | 1 (全融合) |
-| 通信方向 | Push (写远端) | Pull (读远端) |
-| 通信模型 | Symmetric Push O(N) | All-to-1 Pull O((N-1)/N) |
-| Overlap 粒度 | 无真正 overlap | Tile 级流水线 |
-| 同步模型 | 全局 nvlink_barrier | Per-tile ready flag |
-| 通信带宽效率 | 非 optimal | Bandwidth-optimal (= NCCL) |
-| Reduce 方式 | 单独 reduce epilogue kernel | Comm Warps 内融合 FP32 reduce |
+| 维度 | 说明 |
+|------|------|
+| Kernel 数量 | 1 (全融合) |
+| 通信方向 | Pull (读远端) |
+| 通信模型 | All-to-1 Pull O((N-1)/N) |
+| Overlap 粒度 | Tile 级流水线 |
+| 同步模型 | Per-tile ready flag |
+| 通信带宽效率 | Bandwidth-optimal (= NCCL) |
+| Reduce 方式 | Comm Warps 内融合 FP32 reduce |
 
 ## 架构设计
 
@@ -87,8 +90,8 @@ Rank i 计算 tile 的顺序：
 
 对于 N 个 rank，每个 rank 的输出大小为 `M_per_rank × N_dim`：
 
-- **V1 (Symmetric Push)**: 总通信量 = `N × (N-1) × chunk_size` (全系统)
-- **V2 (All-to-1 Pull)**: 总通信量 = `N × (N-1) × chunk_size / N` = `(N-1) × chunk_size`
+- **旧方案 (Symmetric Push)**: 总通信量 = `N × (N-1) × chunk_size` (全系统)
+- **当前方案 (All-to-1 Pull)**: 总通信量 = `N × (N-1) × chunk_size / N` = `(N-1) × chunk_size`
   - 等同于 NCCL ring reduce-scatter 的 bandwidth-optimal 通信量
 
 ## 文件结构
@@ -103,7 +106,7 @@ deep_gemm/gemm_rs/__init__.py                               — Python API: bf16
 
 === 测试 ===
 tests/test_gemm_rs_v2.py                                    — 正确性测试 (支持 2/4/8 GPU)
-benchmarks/bench_gemm_rs_v2.py                              — 三方对比: V2 vs V1 vs Separate
+benchmarks/bench_gemm_rs_v2.py                              — 对比: 当前方案 vs 旧方案 vs GEMM+NCCL分离
 ```
 
 ## Python API
@@ -111,7 +114,7 @@ benchmarks/bench_gemm_rs_v2.py                              — 三方对比: V2
 ```python
 import deep_gemm
 
-# 创建对称缓冲区（与 V1 共用）
+# 创建对称缓冲区
 sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(
     group,                    # ProcessGroup
     num_max_tokens_per_rank,  # 最大 token 数
@@ -120,7 +123,7 @@ sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(
     comm_dtype=None,          # None=BF16, torch.float32=FP32
 )
 
-# V2 GEMM+RS
+# GEMM+RS
 deep_gemm.bf16_gemm_rs_v2_nt(
     y,                    # [tokens_per_rank, N], output
     a,                    # [total_tokens, K], input (BF16)
@@ -145,33 +148,23 @@ python tests/test_gemm_rs_v2.py 2
 # 正确性测试 (8 GPUs)
 python tests/test_gemm_rs_v2.py 8
 
-# 性能基准测试 (三方对比)
+# 性能基准测试
 python benchmarks/bench_gemm_rs_v2.py 2 20
 python benchmarks/bench_gemm_rs_v2.py 8 20
 ```
 
 > **注意**：不要用 `torchrun`，脚本内部用 `mp.spawn` 管理多进程。
 
-## 预期改进
-
-相比 V1：
-- **小 batch (2 GPU)**: 接近或超越 V1（省去 reduce kernel launch 开销）
-- **多 GPU (4-8)**: 显著优于 V1（bandwidth-optimal + tile overlap）
-- **大矩阵**: 计算密集时 overlap 效果最好，预期接近纯 GEMM 时延
-
-相比 Separate (GEMM + NCCL RS)：
-- **所有 shape**: 预期接近或更好（无 kernel launch 间隙 + 计算通信重叠）
-
 ## 调试指南
 
-### 如果 V2 正确性不过
+### 如果正确性不过
 
 1. **检查 per-tile flag**: 加 `printf` 在 comm warps 看 flag 是否被正确设置
 2. **检查 M-Swizzle**: 确认每个 rank 的 tile 计算顺序和 flag 索引对应
 3. **检查 FP32 reduce**: 确认累加器初始化为 0，以及 rank 自己的 partial 也被加入
 4. **单步验证**: 先固定 `num_ranks=2`，关闭 M-Swizzle 测试基本逻辑
 
-### 如果 V2 Hang（死锁）
+### 如果 Hang（死锁）
 
 1. **Comm Warps 永远等不到 flag**: 可能是 Epilogue 没有正确 `st_rel_sys`
 2. **nvlink_barrier 卡住**: 可能某 rank 提前结束 → 检查所有 rank 是否执行相同数量的 barrier
@@ -187,6 +180,6 @@ python benchmarks/bench_gemm_rs_v2.py 8 20
 ## 后续扩展方向
 
 1. **TMA Load for Pull**: 用 TMA 的硬件异步 bulk load 代替 Comm Warps 的手动 load
-2. **FP8 V2**: 扩展到 FP8 输入（需要 SF 处理逻辑）
+2. **FP8 版本**: 扩展到 FP8 输入（需要 SF 处理逻辑）
 3. **Multi-step Ring**: 参考 NCCL ring 的流水线，进一步减少延迟
 4. **Adaptive Warp Split**: 根据 compute/comm ratio 动态分配 Warp 数量
