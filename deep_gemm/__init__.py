@@ -108,12 +108,7 @@ from .ag_gemm import (
 from .gemm_rs import (
     GemmRSSymmBuffer,
     get_symm_buffer_for_gemm_rs,
-    fp8_gemm_rs_nt,
-    fp8_gemm_rs_nt_hopper,
-    bf16_gemm_rs_nt,
-    bf16_gemm_rs_fused,
     bf16_gemm_rs_v2_nt,
-    bf16_gemm_rs_nt_hopper,
 )
 
 

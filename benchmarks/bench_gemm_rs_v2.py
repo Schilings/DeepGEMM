@@ -1,10 +1,9 @@
 """
-Benchmark: GEMM-RS V2 (Pull-based) vs V1 (Push+PDL) vs Separate (GEMM + NCCL RS)
+Benchmark: GEMM-RS (Pull-based) vs Separate (GEMM + NCCL RS)
 
 Compares end-to-end latency for:
-  1. bf16_gemm_rs_v2_nt (V2: pull-based single kernel)
-  2. bf16_gemm_rs_nt (V1: push + PDL reduce)
-  3. bf16_gemm_nt + torch.distributed.reduce_scatter_tensor (separate)
+  1. bf16_gemm_rs_v2_nt (pull-based single kernel)
+  2. bf16_gemm_nt + torch.distributed.reduce_scatter_tensor (separate)
 
 Usage:
     python benchmarks/bench_gemm_rs_v2.py [num_gpus] [num_iters]
@@ -78,10 +77,10 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
     if rank_idx == 0:
         print(f"\n{'='*80}")
-        print(f"  GEMM-RS V2 Benchmark: {num_ranks} GPUs, {num_iters} iterations")
+        print(f"  GEMM-RS Benchmark: {num_ranks} GPUs, {num_iters} iterations")
         print(f"{'='*80}")
-        print(f"{'Tokens/rank':<12} {'N':<8} {'K':<8} | {'Separate':>10} {'V1(Push)':>10} {'V2(Pull)':>10} | {'V2/Sep':>8} {'V2/V1':>8}")
-        print(f"{'-'*12} {'-'*8} {'-'*8} | {'-'*10} {'-'*10} {'-'*10} | {'-'*8} {'-'*8}")
+        print(f"{'Tokens/rank':<12} {'N':<8} {'K':<8} | {'Separate':>10} {'Fused':>10} | {'Speedup':>8}")
+        print(f"{'-'*12} {'-'*8} {'-'*8} | {'-'*10} {'-'*10} | {'-'*8}")
 
     results = []
 
@@ -92,9 +91,8 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
         # Create data
         a = torch.randn((total_m, k_dim), dtype=torch.bfloat16, device=device)
         b = torch.randn((n_dim, k_dim), dtype=torch.bfloat16, device=device)
-        y_v2 = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=device)
-        y_v1 = torch.zeros_like(y_v2)
-        y_sep = torch.zeros_like(y_v2)
+        y_fused = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=device)
+        y_sep = torch.zeros_like(y_fused)
         d_full = torch.zeros((total_m, n_dim), dtype=torch.bfloat16, device=device)
 
         # Create symmetric buffer
@@ -111,28 +109,21 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
         time_separate = bench_fn(run_separate, num_iters=num_iters, barrier_group=group)
 
-        # ── Benchmark: V1 (Push + PDL) ──
-        def run_v1():
-            deep_gemm.bf16_gemm_rs_nt(y_v1, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
+        # ── Benchmark: Fused (Pull-based) ──
+        def run_fused():
+            deep_gemm.bf16_gemm_rs_v2_nt(y_fused, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
 
-        time_v1 = bench_fn(run_v1, num_iters=num_iters, barrier_group=group)
+        time_fused = bench_fn(run_fused, num_iters=num_iters, barrier_group=group)
 
-        # ── Benchmark: V2 (Pull-based) ──
-        def run_v2():
-            deep_gemm.bf16_gemm_rs_v2_nt(y_v2, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
+        # Compute speedup
+        speedup = time_separate / time_fused if time_fused > 0 else float('inf')
 
-        time_v2 = bench_fn(run_v2, num_iters=num_iters, barrier_group=group)
-
-        # Compute speedups
-        speedup_vs_sep = time_separate / time_v2 if time_v2 > 0 else float('inf')
-        speedup_vs_v1 = time_v1 / time_v2 if time_v2 > 0 else float('inf')
-
-        results.append((tokens_per_rank, n_dim, k_dim, time_separate, time_v1, time_v2, speedup_vs_sep, speedup_vs_v1))
+        results.append((tokens_per_rank, n_dim, k_dim, time_separate, time_fused, speedup))
 
         if rank_idx == 0:
             print(f"{tokens_per_rank:<12} {n_dim:<8} {k_dim:<8} | "
-                  f"{time_separate:>8.2f}ms {time_v1:>8.2f}ms {time_v2:>8.2f}ms | "
-                  f"{speedup_vs_sep:>7.2f}x {speedup_vs_v1:>7.2f}x")
+                  f"{time_separate:>8.2f}ms {time_fused:>8.2f}ms | "
+                  f"{speedup:>7.2f}x")
 
         sym_buffer.destroy()
         dist.barrier()
@@ -140,19 +131,16 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
     # Summary
     if rank_idx == 0:
         print(f"\n{'-'*80}")
-        geo_mean_vs_sep = 1.0
-        geo_mean_vs_v1 = 1.0
+        geo_mean = 1.0
         for r in results:
-            geo_mean_vs_sep *= r[6]
-            geo_mean_vs_v1 *= r[7]
-        geo_mean_vs_sep = geo_mean_vs_sep ** (1.0 / len(results))
-        geo_mean_vs_v1 = geo_mean_vs_v1 ** (1.0 / len(results))
-        print(f"  Geo mean speedup: V2/Separate = {geo_mean_vs_sep:.3f}x, V2/V1 = {geo_mean_vs_v1:.3f}x")
+            geo_mean *= r[5]
+        geo_mean = geo_mean ** (1.0 / len(results))
+        print(f"  Geo mean speedup (Fused / Separate): {geo_mean:.3f}x")
         print(f"{'='*80}\n")
 
 
 if __name__ == '__main__':
     num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     num_iters = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    print(f"Launching V2 benchmark with {num_gpus} GPUs, {num_iters} iterations...")
+    print(f"Launching GEMM-RS benchmark with {num_gpus} GPUs, {num_iters} iterations...")
     mp.spawn(run_benchmark, args=(num_gpus, num_iters), nprocs=num_gpus, join=True)

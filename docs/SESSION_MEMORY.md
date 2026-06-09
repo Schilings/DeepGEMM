@@ -116,22 +116,14 @@ python benchmarks/bench_gemm_rs_v2.py 8 20
 ## 📁 关键文件路径
 
 ```
-=== 当前方案实现 ===
+=== 核心实现 ===
 deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs_v2.cuh   # 核心 kernel
 csrc/jit_kernels/impls/sm100_bf16_gemm_rs_v2.hpp              # JIT runtime
 csrc/jit_kernels/heuristics/gemm_rs.hpp                       # get_gemm_rs_v2_config()
 csrc/apis/gemm_rs.hpp                                         # C++ API: bf16_gemm_rs_v2_nt()
 deep_gemm/gemm_rs/__init__.py                                 # Python API: bf16_gemm_rs_v2_nt()
 tests/test_gemm_rs_v2.py                                      # 正确性测试
-benchmarks/bench_gemm_rs_v2.py                                # Benchmark
-
-=== 旧方案（Push+PDL，已废弃，仅供参考）===
-deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh      # 旧 BF16 kernel
-deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_rs.cuh       # 旧 FP8 kernel
-deep_gemm/include/deep_gemm/impls/sm100_reduce_epilogue.cuh   # 旧 Reduce kernel
-tests/test_gemm_rs_bf16.py                                    # 旧 BF16 测试
-tests/test_gemm_rs_fp8.py                                     # 旧 FP8 测试
-benchmarks/bench_gemm_rs.py                                   # 旧 Benchmark
+benchmarks/bench_gemm_rs_v2.py                                # Benchmark (vs GEMM+NCCL分离)
 
 === 公共基础设施 ===
 deep_gemm/include/deep_gemm/comm/barrier.cuh                  # nvlink_barrier / grid_sync
@@ -163,7 +155,7 @@ cd /root/.local/codebuddy/DeepGEMM
 git submodule update --init --recursive
 pip install -e . --no-build-isolation
 
-# ===== 当前方案测试 =====
+# ===== 测试 =====
 python tests/test_gemm_rs_v2.py 2       # 正确性 (2 GPU)
 python tests/test_gemm_rs_v2.py 8       # 正确性 (8 GPU)
 python benchmarks/bench_gemm_rs_v2.py 2 20   # Benchmark (2 GPU)
@@ -171,7 +163,6 @@ python benchmarks/bench_gemm_rs_v2.py 8 20   # Benchmark (8 GPU)
 
 # ===== 清除 JIT 缓存 =====
 rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_v2*
-rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_nt.*
 
 # ===== Git 操作 =====
 cd /root/.local/codebuddy/DeepGEMM
