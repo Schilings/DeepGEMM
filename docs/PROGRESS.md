@@ -182,22 +182,36 @@ rank B 的 Comm warp 去远端 A 取数据时，读 A 的 `slot[B]` = `slot[rank
 
 ---
 
-#### 当前阻塞问题：多 GPU 测试环境端口冲突
+#### 已解决：多 GPU 测试环境端口冲突 ✅
 
 **问题描述**：
 在 8 卡 B300 SXM6 环境上运行 `test_gemm_rs.py` 时，`torch.distributed` 初始化始终失败，
-报错 `Address already in use`。尝试过 MASTER_PORT=8361/29501/39501 等多个端口，均被占用。
+报错 `Address already in use`。
 
-**排查过程**：
-1. 使用 `pkill -9 -f "test_gemm_rs"` 清理所有残留 Python 进程
-2. 确认 GPU 内存已释放（`nvidia-smi` 显示 8 卡均空闲）
-3. 使用 `ss -tlnp` 检查端口占用，发现有其他服务占用端口
-4. 使用 `fuser -k <port>/tcp` 尝试释放端口，仍有冲突
+**根因**：
+1. `mp.spawn` 的子进程在 `dist.destroy_process_group()` 后并未立即退出
+2. NCCL 后台线程继续占着 MASTER_PORT 和一堆 NCCL 内部端口
+3. 下次测试启动时端口仍被占用 → `EADDRINUSE`
+4. 大量僵尸进程 (`<defunct>`) 累积
+
+**修复方案（两处改进）**：
+
+1. **自动空闲端口发现**：在 `test_gemm_rs.py` 和 `test_gemm_rs_quick.py` 的主进程中，
+   使用 `socket.bind(('', 0))` 自动找空闲端口，不再依赖硬编码端口号。
+   `mp.spawn` 子进程通过环境变量继承端口。
+
+2. **强制子进程退出**：在子进程完成测试后调用 `os._exit(0)`，
+   避免 NCCL 后台线程继续占端口。
+
+**验证结果**：
+- 8 卡 `dist.init_process_group` ✅ 成功
+- 8 卡 `barrier` + `allreduce` ✅ 正确
+- 8 卡标准 GEMM (`bf16_gemm_nt`) ✅ 通过
+- GEMM-RS JIT 首次编译需要较长时间（>120s），需增大超时
 
 **下一步**：
-- 尝试使用更高端口号（如 49501、59501）
-- 或者在 `test_gemm_rs.py` 中增加自动端口扫描逻辑
-- 核心代码修改已就绪，只需验证即可
+- 增大快速测试脚本的超时时间（120s → 600s）以适应首次 JIT 编译
+- 或先单独预编译 JIT 缓存，再跑测试
 
 ---
 
@@ -372,8 +386,9 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 
 - [ ] **多 GPU 验证 multicast=2 正确性** ← 🔴 当前最高优先级
   - 代码已修改完成，编译通过
-  - 被测试环境端口冲突阻塞（`torch.distributed` init 失败）
-  - 需要解决端口问题后跑 `test_gemm_rs.py 8`
+  - 端口冲突已解决（自动端口发现 + os._exit 强制退出）
+  - 8 卡环境已验证可用（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅）
+  - 待 GEMM-RS JIT 首次编译完成后验证（需增大超时 >120s）
 - [ ] multicast=2 性能 benchmark（预期 GEMM 效率提升 ~2x）
 - [ ] 重审 warp specialization 资源分配（当前 3 warpgroup 中只有 1 个做 MMA）
 - [ ] 性能优化迭代（Comm warp TMA 化、pipeline、vectorized store 等）

@@ -216,11 +216,24 @@ def run_test(local_rank: int, num_local_ranks: int, run_all: bool = False):
     os._exit(0)
 
 
+def _find_free_port():
+    """Find a free TCP port."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
 if __name__ == '__main__':
     num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     run_all = '--all' in sys.argv
 
-    print(f"Launching GEMM-RS correctness test with {num_gpus} GPUs...")
+    # Auto-find free port to avoid EADDRINUSE
+    if os.getenv('MASTER_PORT') is None or os.getenv('MASTER_PORT') == '':
+        port = _find_free_port()
+        os.environ['MASTER_PORT'] = str(port)
+    print(f"Launching GEMM-RS correctness test with {num_gpus} GPUs (port={os.environ['MASTER_PORT']})...")
     if run_all:
         print("  Running full test suite (including extended shapes)")
 

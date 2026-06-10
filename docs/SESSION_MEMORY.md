@@ -24,7 +24,8 @@ DeepGEMM 的 **GEMM-RS (GEMM + Reduce-Scatter)** 融合 kernel，目标是在多
 - **之前的尝试（Push + PDL 两阶段）**: 已验证性能不行（8GPU 仅 0.21x NCCL），代码已删除
 - **测试和 Benchmark**: 已完善，覆盖多种 shape 和大 hidden dim 场景
 - **已修复的 Bug**: reg_dealloc 死锁、partial buffer slot 寻址、本地 ready flag race、multicast=2 scheduler
-- **当前阻塞**: 多 GPU 测试环境端口冲突（`torch.distributed` init 失败），multicast=2 验证待端口问题解决
+- **已解决**: 端口冲突问题（根因：NCCL 后台线程占端口 + 僵尸进程；修复：自动端口发现 + `os._exit(0)` 强制退出）
+- **当前阻塞**: GEMM-RS JIT 首次编译耗时 >120s，快速测试脚本超时需增大
 
 ---
 
@@ -126,7 +127,9 @@ MASTER_PORT=49501 python tests/test_gemm_rs.py 2    # 2 GPU 快速验证
 MASTER_PORT=49501 python tests/test_gemm_rs.py 8    # 8 GPU 全量验证
 ```
 
-**注意**: multicast=2 代码已修改完成并编译通过。当前被 `torch.distributed` 端口冲突阻塞。
+**注意**: multicast=2 代码已修改完成并编译通过。端口冲突已解决（自动端口发现）。
+8 卡环境已验证可用（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅）。
+待 JIT 首次编译完成后即可验证 multicast=2 正确性。
 
 ### 优先级 P1：multicast=2 性能 Benchmark
 

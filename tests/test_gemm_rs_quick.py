@@ -1,10 +1,12 @@
 """
-Minimal 2-GPU test to diagnose multi-GPU environment issues.
+Minimal multi-GPU test to diagnose GEMM-RS environment issues.
+Auto-finds a free port to avoid EADDRINUSE conflicts.
 """
 import os
 import sys
 import time
 import signal
+import socket
 
 # Set timeout to avoid infinite hang
 def timeout_handler(signum, frame):
@@ -14,17 +16,25 @@ def timeout_handler(signum, frame):
 signal.signal(signal.SIGALRM, timeout_handler)
 signal.alarm(120)  # 120 second timeout
 
+
+def find_free_port():
+    """Find a free TCP port by binding to port 0."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def worker(local_rank: int, num_gpus: int):
+def worker(local_rank: int, num_gpus: int, port: int):
     print(f"[Rank {local_rank}] Worker started, PID={os.getpid()}", flush=True)
 
     try:
         # Step 1: init dist
-        port = int(os.getenv('MASTER_PORT', '48123'))
         print(f"[Rank {local_rank}] Initializing dist on port {port}...", flush=True)
 
         dist.init_process_group(
@@ -100,9 +110,16 @@ def worker(local_rank: int, num_gpus: int):
 
 if __name__ == '__main__':
     num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+
+    # Auto-find free port (or use env var)
+    port = int(os.getenv('MASTER_PORT', '0'))
+    if port == 0:
+        port = find_free_port()
+    os.environ['MASTER_PORT'] = str(port)
+
     print(f"=== Quick GEMM-RS diagnostic test with {num_gpus} GPUs ===", flush=True)
-    print(f"    MASTER_PORT={os.getenv('MASTER_PORT', '48123')}", flush=True)
+    print(f"    MASTER_PORT={port}", flush=True)
     print(f"    PID={os.getpid()}", flush=True)
 
-    mp.spawn(worker, args=(num_gpus,), nprocs=num_gpus, join=True)
+    mp.spawn(worker, args=(num_gpus, port), nprocs=num_gpus, join=True)
     print("=== Main process: spawn completed ===", flush=True)
