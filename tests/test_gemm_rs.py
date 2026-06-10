@@ -211,6 +211,10 @@ def run_test(local_rank: int, num_local_ranks: int, run_all: bool = False):
     dist.barrier()
     dist.destroy_process_group()
 
+    # Force exit to avoid NCCL background threads holding ports after test
+    time.sleep(1)
+    os._exit(0)
+
 
 if __name__ == '__main__':
     num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2

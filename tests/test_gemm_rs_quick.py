@@ -87,6 +87,10 @@ def worker(local_rank: int, num_gpus: int):
         dist.destroy_process_group()
         print(f"[Rank {local_rank}] ALL TESTS PASSED! ✅", flush=True)
 
+        # Force exit to avoid NCCL background threads holding ports
+        time.sleep(1)
+        os._exit(0)
+
     except Exception as e:
         print(f"[Rank {local_rank}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
         import traceback
