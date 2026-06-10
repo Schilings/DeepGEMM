@@ -178,8 +178,12 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
     const uint32_t num_n_slices = BLOCK_N / STORE_BLOCK_N;
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
-    // For multicast=2 (2-CTA cluster): both CTAs in a cluster must process the same tile.
-    // Use cluster_idx so they share the same scheduling sequence.
+    const uint32_t cta_rank = cute::block_rank_in_cluster();  // 0 or 1 within cluster
+    // For multicast=2 (2-CTA cluster): each cluster processes TWO adjacent M-tiles.
+    // The scheduler assigns pairs of M-tiles to clusters. Each CTA in the cluster
+    // handles one M-tile (CTA0 → even, CTA1 → odd) but they share the same N-tile.
+    // This matches standard GEMM's 2-CTA behavior where each CTA loads different A rows
+    // and the 2SM UMMA computes UMMA_M=256 (128 rows per CTA).
     // For multicast=1: cluster_idx == blockIdx.x, kNumClusters == kNumSMs.
     constexpr uint32_t kNumClusters = kNumSMs / kNumMulticast;
     const uint32_t cluster_idx = blockIdx.x / kNumMulticast;
@@ -278,18 +282,41 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //    chunk for rank (i+2)%N next  → ...
     //    chunk for rank i (self) last  → self doesn't need remote pull for own contribution
     //
+    //  For multicast=2 (2-CTA cluster, kIsMulticastOnA=false, cluster_m=2):
+    //    The scheduler assigns M-tile PAIRS to clusters. Within each cluster:
+    //    - CTA0 (block_rank=0): gets the base m_block_idx (even tile in the pair)
+    //    - CTA1 (block_rank=1): gets m_block_idx + 1 (odd tile in the pair)
+    //    Both CTAs share the same n_block_idx.
+    //    This ensures each CTA loads DIFFERENT A rows, matching 2SM UMMA requirements.
+    //    The total number of M-tile pairs = num_m_blocks_per_rank / 2 (must be even).
+    //
+    //  For multicast=1: each CTA handles one tile independently.
+    //
     auto get_next_block = [&](uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t& iter_idx) {
-        if (block_idx >= num_m_blocks * num_n_blocks)
+        // In multicast=2 mode, each cluster handles 2 adjacent M-tiles as a pair.
+        // The block_idx enumerates "cluster-level work units" (pairs for mc=2, singles for mc=1).
+        const uint32_t m_blocks_per_cluster = kNumMulticast;  // 2 for mc=2, 1 for mc=1
+        const uint32_t num_m_pairs_per_rank = num_m_blocks_per_rank / m_blocks_per_cluster;
+        const uint32_t total_cluster_tiles = num_m_pairs_per_rank * num_n_blocks * kNumRanks;
+
+        if (block_idx >= total_cluster_tiles)
             return false;
-        const uint32_t m_rank_wave = block_idx / (num_m_blocks_per_rank * num_n_blocks);
-        const uint32_t rem = block_idx - m_rank_wave * num_m_blocks_per_rank * num_n_blocks;
-        const uint32_t local_m_block_idx = rem / num_n_blocks;
-        n_block_idx = rem - local_m_block_idx * num_n_blocks;
+
+        const uint32_t tiles_per_rank = num_m_pairs_per_rank * num_n_blocks;
+        const uint32_t m_rank_wave = block_idx / tiles_per_rank;
+        const uint32_t rem = block_idx - m_rank_wave * tiles_per_rank;
+        const uint32_t local_m_pair_idx = rem / num_n_blocks;
+        n_block_idx = rem - local_m_pair_idx * num_n_blocks;
+
         // Swizzle: compute other ranks' chunks first
         const uint32_t dst_rank = (m_rank_wave + 1 < kNumRanks) ?
             (rank_idx + m_rank_wave + 1) % kNumRanks : rank_idx;
+
+        // Each CTA in the cluster handles a different M-tile within the pair
+        const uint32_t local_m_block_idx = local_m_pair_idx * m_blocks_per_cluster + cta_rank;
         m_block_idx = dst_rank * num_m_blocks_per_rank + local_m_block_idx;
-        // Stride by kNumClusters: in multicast=2, each cluster (2 CTAs) handles one tile
+
+        // Stride by kNumClusters
         block_idx += kNumClusters;
         ++ iter_idx;
         return true;
@@ -493,11 +520,16 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t n_idx = n_block_idx * BLOCK_N;
             const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
 
-            // Add multicast CTA offsets
+            // Each CTA already has its own m_block_idx (from scheduler), so:
+            // - For A: use global_m directly (each CTA loads its own 128 A rows)
+            // - For B: split across CTAs with block_rank offset (multicast ensures both have full B)
+            // When kIsMulticastOnA=false: A is NOT split, B is split (and multicast fills both)
+            // When kIsMulticastOnA=true: A is split (and multicast fills both), B is NOT split
             uint32_t load_m_idx = global_m;
             uint32_t load_n_idx = n_idx;
             if constexpr (kNumMulticast > 1) {
-                load_m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * LOAD_BLOCK_M) : 0;
+                // No M offset needed: each CTA's m_block_idx already differs
+                // B split: each CTA loads half of B columns
                 load_n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
             }
 
