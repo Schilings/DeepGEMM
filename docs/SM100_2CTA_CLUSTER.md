@@ -57,15 +57,19 @@ CTA1:
   - 加载 B[:, Y*128+64 : (Y+1)*128]     → SMEM_B 后半 (CTA1)
 ```
 
-**TMA Multicast**：B 的两半通过 TMA multicast 分发到两个 CTA 的 SMEM，使得两个 SM 都拥有完整的 B[Y*128:(Y+1)*128]。
+**TMA `cta_group::2`**：使用 `SM100_TMA_2SM_LOAD_2D` 指令（`shared::cluster` 地址空间）。
+每个 CTA 的 TMA load 数据只写入本地 SMEM，但 2SM UMMA 可通过 cluster shared memory 跨 SM 访问。
+
+**注意**：这里不是 TMA multicast！`SM100_TMA_2SM_LOAD_2D` 没有 `multicast::cluster` 修饰。
+数据不会被硬件复制到另一个 SM。而是 2SM UMMA 硬件自动从两个 SM 的 SMEM 读取。
 
 **关键代码**（`sm100_bf16_gemm.cuh` 第 220-223 行）：
 ```c++
-// TMA load offset by block_rank_in_cluster()
-auto const n_offset = block_rank_in_cluster() * LOAD_BLOCK_N;
+// B split: each CTA loads half
+n_idx += kIsMulticastOnA ? 0 : (block_rank_in_cluster() * LOAD_BLOCK_N);
 ```
 
-每个 CTA 只加载 B 的一半列（LOAD_BLOCK_N=64），但 multicast 确保两个 CTA 的 SMEM 中都有完整的 128 列。
+每个 CTA 只加载 B 的一半列（LOAD_BLOCK_N=64），2SM UMMA 跨两个 SM 的 SMEM 拼成完整的 128 列。
 
 ---
 
