@@ -287,20 +287,19 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     };
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 0~3 (Comm/Dispatch Warps): Pull-based per-Rank Pipelined RS
+    //  Warp 0~3 (Comm/Dispatch Warps): Pull-based All-Ranks-Ready Reduce
     // ════════════════════════════════════════════════════════════════
     //
-    //  Key design (learning from Flux):
-    //    - Don't wait for ALL ranks! Process ranks one-by-one in ring order.
-    //    - For each tile, for each src_rank:
-    //        1. Wait src_rank's ready flag (just ONE rank)
-    //        2. TMA async fetch from src_rank's partial buffer → smem
-    //        3. Wait TMA completion
-    //        4. Reduce: accumulate into FP32 registers
-    //    - Write final reduced result to output
+    //  Optimized design:
+    //    - Phase 1: Wait ALL ranks' ready flags (single polling loop)
+    //    - Phase 2: All threads load from ALL ranks + FP32 accumulate in regs
+    //              + write output ONCE (no intermediate HBM storage)
     //
-    //  Ring order: start from rank (rank_idx+1)%N → matches M-Swizzle
-    //  (the rank we compute first for is the one most likely to have our data ready first)
+    //  Benefits over per-rank sequential approach:
+    //    - Only 1 barrier sync per tile (vs N syncs before)
+    //    - Only 1 HBM write per vector (vs N writes before)
+    //    - Maximum memory-level parallelism in Phase 2
+    //    - Ring order polling: rank(i+1) polled first (most likely ready)
     //
     if (warp_idx < kNumCommWarps) {
         // Adjust registers (MegaMoE style: 48 regs for comm warps)
@@ -312,15 +311,64 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         // My chunk: tiles belonging to rank_idx
         const uint32_t total_my_tiles = num_m_blocks_per_rank * num_n_blocks;
 
-        // Vectorized reduce: 16 bytes at a time
+        // ════════════════════════════════════════════════════════════════
+        //  Optimized Comm Reduce: Per-Rank Pipelined + Write-Once
+        //
+        //  Key optimization: Eliminate N-1 HBM read+write round-trips.
+        //
+        //  Original flow (per tile, per rank):
+        //    rank 0: load partial → write output
+        //    rank 1: load partial + READ output → add → WRITE output
+        //    rank 2: load partial + READ output → add → WRITE output  ...
+        //    = N P2P loads + (N-1) HBM reads + N HBM writes
+        //
+        //  Optimized flow (per tile):
+        //    for each rank: poll flag → all threads load+accumulate in regs
+        //    write output once
+        //    = N P2P loads + 0 HBM reads + 1 HBM write
+        //
+        //  Register-only accumulation:
+        //    Each thread processes a FIXED set of vector positions across the tile.
+        //    For each position, it accumulates all N ranks' data in FP32 registers.
+        //    The barrier sync is per-rank (N syncs total), same as before.
+        //    But each thread's work set is fixed — no intermediate HBM storage needed.
+        //
+        //  Key: We keep rank in the INNER loop per vector position.
+        //  This means each thread holds FP32 accumulators for ONE vector (8 floats)
+        //  and iterates over all ranks for that vector before moving to the next.
+        //  The barrier sync happens BETWEEN vector chunks (not per-vector).
+        //
+        //  Actually, the cleanest approach: keep rank in OUTER loop (preserving
+        //  per-rank pipelining), but write output only ONCE after all ranks.
+        //  We need smem-free accumulation — store partial sums back to the
+        //  SAME output location. But wait... that's what the original did!
+        //
+        //  The real optimization: The original reads output + writes output for
+        //  EVERY rank after the first. We eliminate the READ by keeping the
+        //  running sum in the output itself (write-only after first rank).
+        //  Actually... re-reading my own write is fine (L2 cached).
+        //
+        //  *** TRUE OPTIMIZATION ***:
+        //  The real bottleneck is NOT the HBM reads/writes (they're L2 cached
+        //  since we just wrote there). The real bottleneck is:
+        //  1. Sequential per-rank polling with barrier syncs
+        //  2. Not enough in-flight memory operations (low MLP)
+        //
+        //  NEW DESIGN: Wait for ALL ranks at once, then process with maximum MLP.
+        //  - Phase 1: Poll all N ranks' ready flags (warp 0 does all polls)
+        //  - Phase 2: All 128 threads process tile with all-ranks interleaved loads
+        //             maximizing memory-level parallelism (MLP)
+        // ════════════════════════════════════════════════════════════════
+
+        // Vectorized operations: 16 bytes at a time
         constexpr uint32_t kVecBytes = 16;
-        constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);
+        constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);  // 8 for bf16, 4 for fp32
 
         // Elements per tile
         const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
         const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 
-        // Iterate over tiles assigned to this SM (distributed round-robin)
+        // Iterate over tiles assigned to this SM
         for (uint32_t tile_idx = sm_idx; tile_idx < total_my_tiles; tile_idx += kNumSMs) {
             const uint32_t my_m_block = tile_idx / num_n_blocks;
             const uint32_t my_n_block = tile_idx - my_m_block * num_n_blocks;
@@ -328,133 +376,91 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t base_row = my_m_block * BLOCK_M;
             const uint32_t base_col = my_n_block * BLOCK_N;
 
-            // FP32 accumulators (per-thread, covering this thread's slice of the tile)
-            // Each thread handles vecs_per_tile / kNumCommThreads vectors
-            // We process in multiple passes to limit register usage
+            // ── Phase 1: Wait for ALL ranks' ready flags ──
+            // Warp 0, lane 0 polls all N ranks sequentially in ring order.
+            // Once all are ready, we can process the entire tile without any
+            // further synchronization, maximizing memory-level parallelism.
+            if (comm_warp_local_idx == 0 and lane_idx == 0) {
+                for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
+                    const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
+                    auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
+                    const uint32_t* poll_ptr = (src_rank != rank_idx) ?
+                        sym_buffer.map(local_ready_ptr, src_rank) : local_ready_ptr;
 
-            // ── Per-rank pipelined reduce (Flux-style) ──
-            // Process ranks in ring order starting from (rank_idx+1)
-            // This matches M-Swizzle: rank_idx computes rank (rank_idx+1)'s chunk first,
-            // so rank (rank_idx+1) is most likely to have OUR data ready first.
-
-            for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
-                const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
-
-                // ── Step 1: Wait for this specific src_rank's ready flag ──
-                // Only one warp (warp 0, lane 0) does the polling to minimize traffic
-                if (comm_warp_local_idx == 0 and lane_idx == 0) {
-                    if (src_rank != rank_idx) {
-                        // Poll remote rank's ready flag for my tile
-                        // src_rank stores my data at slot=rank_idx, so the ready flag is also at slot=rank_idx
-                        auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
-                        auto* remote_ready_ptr = sym_buffer.map(local_ready_ptr, src_rank);
-
-                        // Spin-wait with acquire semantics (30s timeout)
-                        constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
-                        const auto start_clock = clock64();
-                        while (ptx::ld_acq_sys(remote_ready_ptr) == 0u) {
-                            if (clock64() - start_clock >= kTimeoutCycles) {
-                                printf("GEMM-RS comm timeout: rank=%d, src=%d, tile=(%d,%d)\n",
-                                       rank_idx, src_rank, my_m_block, my_n_block);
-                                DG_DEVICE_ASSERT(false and "Comm warp ready flag timeout");
-                            }
-                        }
-                    } else {
-                        // Poll LOCAL ready flag for my own contribution
-                        // Epilogue on this rank may still be writing to partial buffer
-                        auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
-
-                        constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
-                        const auto start_clock = clock64();
-                        while (ptx::ld_acq_sys(local_ready_ptr) == 0u) {
-                            if (clock64() - start_clock >= kTimeoutCycles) {
-                                printf("GEMM-RS local comm timeout: rank=%d, tile=(%d,%d)\n",
-                                       rank_idx, my_m_block, my_n_block);
-                                DG_DEVICE_ASSERT(false and "Comm warp local ready flag timeout");
-                            }
+                    constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
+                    const auto start_clock = clock64();
+                    while (ptx::ld_acq_sys(poll_ptr) == 0u) {
+                        if (clock64() - start_clock >= kTimeoutCycles) {
+                            printf("GEMM-RS comm timeout: rank=%d, src=%d, tile=(%d,%d)\n",
+                                   rank_idx, src_rank, my_m_block, my_n_block);
+                            DG_DEVICE_ASSERT(false and "Comm warp ready flag timeout");
                         }
                     }
                 }
-                // Sync all comm warps after polling this rank
-                cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
+            }
+            // Single barrier sync — all comm threads wait until all flags confirmed
+            cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
 
-                // ── Step 2 & 3: Load + Reduce ──
-                // For this src_rank, load data and accumulate
-                // We process the tile in chunks to limit register pressure
+            // ── Phase 2: Reduce all ranks and write output (NO more syncs!) ──
+            // Each thread processes its assigned vector positions.
+            // For each position: load from all N ranks → FP32 accumulate → write output.
+            // No intermediate HBM storage, no barrier syncs within this phase.
+            for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
+                const uint32_t elem_offset = vec_offset * kVecSize;
+                const uint32_t tile_row = elem_offset / BLOCK_N;
+                const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
 
-                for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
-                    const uint32_t elem_offset = vec_offset * kVecSize;
-                    const uint32_t tile_row = elem_offset / BLOCK_N;
-                    const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
+                const uint32_t global_row = base_row + tile_row;
+                const uint32_t global_col = base_col + tile_col;
 
-                    const uint32_t global_row = base_row + tile_row;
-                    const uint32_t global_col = base_col + tile_col;
+                if (global_row >= runtime_m_per_rank or global_col >= shape_n)
+                    continue;
 
-                    if (global_row >= runtime_m_per_rank or global_col >= shape_n)
-                        continue;
+                // FP32 accumulators in registers (8 floats for bf16, 4 for fp32)
+                float acc[kVecSize];
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecSize; ++ i)
+                    acc[i] = 0.0f;
 
-                    // Load from src_rank's partial buffer
-                    // Each rank stores data at slot=dst_rank in its own buffer.
-                    // So to read src_rank's contribution for me (rank_idx), I read
-                    // slot=rank_idx from src_rank's buffer.
+                // Accumulate ALL ranks' contributions
+                #pragma unroll 1
+                for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
+                    const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
+
+                    // Get pointer to src_rank's partial data for this vector
                     const comm_dtype_t* partial_ptr;
                     if (src_rank == rank_idx) {
-                        // Local read: my own contribution is at slot=rank_idx in my buffer
                         partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
                     } else {
-                        // Remote P2P read: src_rank stored my data at slot=rank_idx in their buffer
-                        // Use rank_idx as slot (same offset in symmetric buffer layout)
                         auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
                         partial_ptr = sym_buffer.map(local_ptr, src_rank);
                     }
 
-                    // Vectorized load
-                    const auto* vec_ptr = reinterpret_cast<const uint4*>(partial_ptr);
-                    uint4 data = *vec_ptr;
+                    // Vectorized P2P load (16 bytes)
+                    uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
                     const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
 
-                    // Load existing accumulator (or 0 for first rank)
-                    float acc[kVecSize];
-                    if (rank_iter == 0) {
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kVecSize; ++ i)
-                            acc[i] = static_cast<float>(comm_data[i]);
-                    } else {
-                        // Load previous partial sum from output and add
-                        auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
-                        uint4 prev = *out_ptr;
+                    // FP32 accumulate (all in registers!)
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        acc[i] += static_cast<float>(comm_data[i]);
+                }
 
-                        if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                            const auto* prev_data = reinterpret_cast<const cd_dtype_t*>(&prev);
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kVecSize; ++ i)
-                                acc[i] = static_cast<float>(prev_data[i]) + static_cast<float>(comm_data[i]);
-                        } else {
-                            const auto* prev_f32 = reinterpret_cast<const float*>(&prev);
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kVecSize; ++ i)
-                                acc[i] = prev_f32[i] + static_cast<float>(comm_data[i]);
-                        }
-                    }
-
-                    // Write accumulated result to output
-                    if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                        uint4 result;
-                        auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kVecSize; ++ i)
-                            out_bf16[i] = cd_dtype_t(acc[i]);
-                        auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
-                        *out_ptr = result;
-                    } else {
-                        uint4 result;
-                        auto* out_f32 = reinterpret_cast<float*>(&result);
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kVecSize; ++ i)
-                            out_f32[i] = acc[i];
-                        auto* out_ptr = reinterpret_cast<uint4*>(output + global_row * shape_n + global_col);
-                        *out_ptr = result;
-                    }
+                // Write final result to output — ONCE per vector position
+                if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
+                    uint4 result;
+                    auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        out_bf16[i] = cd_dtype_t(acc[i]);
+                    *reinterpret_cast<uint4*>(output + global_row * shape_n + global_col) = result;
+                } else {
+                    uint4 result;
+                    auto* out_f32 = reinterpret_cast<float*>(&result);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        out_f32[i] = acc[i];
+                    *reinterpret_cast<uint4*>(output + global_row * shape_n + global_col) = result;
                 }
             }
         }

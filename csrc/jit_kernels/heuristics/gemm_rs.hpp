@@ -94,9 +94,14 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
 
     // Prefer multicast=2 with block_m=128 when we have enough tiles
     // Fall back to multicast=1 with smaller block_m for small M scenarios
+    //
+    // Blackwell 2x1SM UMMA: each CTA loads different 128 rows of A,
+    // each CTA loads half of BLOCK_N columns of B.
+    // UMMA hardware reads from both SMs' SMEM → 256 rows of A total.
+    // This corresponds to kIsMulticastOnA=false (multicast is on B dimension).
     int block_m;
     int num_multicast;
-    bool is_multicast_on_a = true;
+    bool is_multicast_on_a = false;  // 2x1SM: each CTA has full 128 rows A, splits N
 
     if (m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
         // Enough tiles for multicast=2, block_m=128
