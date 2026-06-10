@@ -98,8 +98,9 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     int num_multicast;
     bool is_multicast_on_a = true;
 
-    if (m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
+    if (false && m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
         // Enough tiles for multicast=2, block_m=128
+        // TEMPORARILY DISABLED: multicast=2 has correctness issues to fix
         block_m = 128;
         num_multicast = 2;
     } else if (m_per_rank >= 128) {

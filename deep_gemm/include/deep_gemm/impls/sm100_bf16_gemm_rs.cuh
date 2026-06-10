@@ -346,7 +346,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 if (comm_warp_local_idx == 0 and lane_idx == 0) {
                     if (src_rank != rank_idx) {
                         // Poll remote rank's ready flag for my tile
-                        auto* local_ready_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
+                        // src_rank stores my data at slot=rank_idx, so the ready flag is also at slot=rank_idx
+                        auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
                         auto* remote_ready_ptr = sym_buffer.map(local_ready_ptr, src_rank);
 
                         // Spin-wait with acquire semantics (30s timeout)
@@ -357,6 +358,20 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                                 printf("GEMM-RS comm timeout: rank=%d, src=%d, tile=(%d,%d)\n",
                                        rank_idx, src_rank, my_m_block, my_n_block);
                                 DG_DEVICE_ASSERT(false and "Comm warp ready flag timeout");
+                            }
+                        }
+                    } else {
+                        // Poll LOCAL ready flag for my own contribution
+                        // Epilogue on this rank may still be writing to partial buffer
+                        auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
+
+                        constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
+                        const auto start_clock = clock64();
+                        while (ptx::ld_acq_sys(local_ready_ptr) == 0u) {
+                            if (clock64() - start_clock >= kTimeoutCycles) {
+                                printf("GEMM-RS local comm timeout: rank=%d, tile=(%d,%d)\n",
+                                       rank_idx, my_m_block, my_n_block);
+                                DG_DEVICE_ASSERT(false and "Comm warp local ready flag timeout");
                             }
                         }
                     }
@@ -380,13 +395,17 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         continue;
 
                     // Load from src_rank's partial buffer
+                    // Each rank stores data at slot=dst_rank in its own buffer.
+                    // So to read src_rank's contribution for me (rank_idx), I read
+                    // slot=rank_idx from src_rank's buffer.
                     const comm_dtype_t* partial_ptr;
                     if (src_rank == rank_idx) {
-                        // Local read
-                        partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
+                        // Local read: my own contribution is at slot=rank_idx in my buffer
+                        partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
                     } else {
-                        // Remote P2P read via NVLink (mapped through sym_buffer)
-                        auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
+                        // Remote P2P read: src_rank stored my data at slot=rank_idx in their buffer
+                        // Use rank_idx as slot (same offset in symmetric buffer layout)
+                        auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
                         partial_ptr = sym_buffer.map(local_ptr, src_rank);
                     }
 
@@ -686,9 +705,10 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
                         #pragma unroll 1
                         for (uint32_t row = 0; row < STORE_BLOCK_M; ++ row) {
-                            // Always write to our own rank's partial buffer slot
+                            // Write to dst_rank's slot in our partial buffer
+                            // (so peer ranks can find their data at slot=their_rank in our buffer)
                             comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                rank_idx, base_row + row, base_col);
+                                dst_rank, base_row + row, base_col);
 
                             auto* src_ptr = smem_base_ptr + row * kRowBytesPerNSlice;
                             ptx::tma_store_1d(dst_ptr, src_ptr, kRowBytesPerNSlice);
@@ -705,7 +725,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 cute::tma_store_wait<0>();
                 if (cute::elect_one_sync()) {
                     // Set ready flag: other ranks can now pull this tile from us
-                    auto* ready_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
+                    // Flag is at slot=dst_rank (matching where we stored partial data)
+                    auto* ready_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
                     __threadfence_system();  // Ensure TMA writes are visible across NVLink
                     ptx::st_rel_sys(ready_ptr, 1u);
                 }
@@ -720,13 +741,16 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kFinalBarrierTag>(
         workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
 
-    // Reset ready flags for next iteration (only for my rank's slot)
+    // Reset ready flags for next iteration (all dst_rank slots in our buffer)
     {
-        const uint32_t total_flags = num_m_blocks_per_rank * num_n_blocks;
+        const uint32_t flags_per_slot = num_m_blocks_per_rank * num_n_blocks;
+        const uint32_t total_flags = kNumRanks * flags_per_slot;
         for (uint32_t flag_idx = thread_idx; flag_idx < total_flags; flag_idx += kNumThreads) {
-            const uint32_t mb = flag_idx / num_n_blocks;
-            const uint32_t nb = flag_idx - mb * num_n_blocks;
-            auto* ready_ptr = workspace.get_ready_ptr(rank_idx, mb, nb);
+            const uint32_t slot = flag_idx / flags_per_slot;
+            const uint32_t local_idx = flag_idx - slot * flags_per_slot;
+            const uint32_t mb = local_idx / num_n_blocks;
+            const uint32_t nb = local_idx - mb * num_n_blocks;
+            auto* ready_ptr = workspace.get_ready_ptr(slot, mb, nb);
             *ready_ptr = 0u;
         }
     }
