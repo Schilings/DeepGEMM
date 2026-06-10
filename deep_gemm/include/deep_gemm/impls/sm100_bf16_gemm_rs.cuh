@@ -686,23 +686,24 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t local_m = local_m_block_idx * BLOCK_M;
 
             // ── TMEM → smem → local partial buffer (via TMA bulk store) ──
-            // IMPORTANT: Both CTAs in a 2-CTA cluster execute TMEM reads and arrive at
-            // tmem_empty_barriers (required for MMA pipeline progress). Only leader CTA
-            // performs the actual TMA store to partial buffer and sets the ready flag.
+            // In multicast=2: each CTA has its OWN m_block_idx (from scheduler) and reads
+            // its own SM's TMEM (which holds that CTA's portion of the 2SM UMMA result).
+            // Both CTAs independently write to their respective partial buffer slots.
+            // No race condition because they write different m_block addresses.
+            // Both CTAs must arrive at tmem_empty_barriers for MMA pipeline progress.
             #pragma unroll
             for (uint32_t w = 0; w < kNumMWaves; ++ w) {
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumNSlices; ++ s) {
                     auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
 
-                    // Wait previous TMA stores (only leader CTA issues TMA stores)
-                    if (is_leader_cta and epilogue_warp_idx == 0)
+                    // Wait previous TMA stores
+                    if (epilogue_warp_idx == 0)
                         cute::tma_store_wait<kNumTMAStoreStages - 1>();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                    // Phase 1: TMEM → registers → smem (both CTAs do this)
-                    // Both CTAs share TMEM in 2x1SM mode, so both can read.
-                    // This is required for tmem_empty_barriers to get enough arrivals.
+                    // Phase 1: TMEM → registers → smem
+                    // Each CTA reads its own SM's TMEM (hardware-local, 128 rows per SM).
                     if (epilogue_thread_idx < STORE_BLOCK_M) {
                         auto* row_ptr = smem_base_ptr + epilogue_thread_idx * kRowBytesPerNSlice;
 
@@ -737,28 +738,24 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     }
 
                     // Phase 2: Issue per-row TMA 1D bulk copies to LOCAL partial buffer
-                    // IMPORTANT: Only leader CTA writes to avoid race condition with Comm warps.
-                    // In 2-CTA mode, both CTAs read same TMEM data. If both write + set flag,
-                    // CTA 0 may set flag before CTA 1 finishes writing → Comm reads partial data.
-                    if (is_leader_cta) {
-                        cute::tma_store_fence();
-                        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+                    // Each CTA writes its own m_block's data — no conflict between CTAs.
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                            uint32_t base_row = local_m + w * STORE_BLOCK_M;
-                            uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        uint32_t base_row = local_m + w * STORE_BLOCK_M;
+                        uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
 
-                            #pragma unroll 1
-                            for (uint32_t row = 0; row < STORE_BLOCK_M; ++ row) {
-                                // Write to dst_rank's slot in our partial buffer
-                                comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                    dst_rank, base_row + row, base_col);
+                        #pragma unroll 1
+                        for (uint32_t row = 0; row < STORE_BLOCK_M; ++ row) {
+                            // Write to dst_rank's slot in our partial buffer
+                            comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(
+                                dst_rank, base_row + row, base_col);
 
-                                auto* src_ptr = smem_base_ptr + row * kRowBytesPerNSlice;
-                                ptx::tma_store_1d(dst_ptr, src_ptr, kRowBytesPerNSlice);
-                            }
-                            cute::tma_store_arrive();
+                            auto* src_ptr = smem_base_ptr + row * kRowBytesPerNSlice;
+                            ptx::tma_store_1d(dst_ptr, src_ptr, kRowBytesPerNSlice);
                         }
+                        cute::tma_store_arrive();
                     }
 
                     tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
@@ -766,8 +763,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             }
 
             // ── After all N-slices of this tile are stored, set per-tile ready flag ──
-            // Only leader CTA sets the flag (matches the writer in Phase 2)
-            if (is_leader_cta and epilogue_warp_idx == 0) {
+            // Each CTA sets the flag for its own m_block_idx tile.
+            if (epilogue_warp_idx == 0) {
                 cute::tma_store_wait<0>();
                 if (cute::elect_one_sync()) {
                     // Set ready flag: other ranks can now pull this tile from us

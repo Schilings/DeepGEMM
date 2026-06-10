@@ -104,8 +104,13 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     int num_multicast;
     bool is_multicast_on_a = false;  // A is multicast, B is split (standard non-swap config)
 
-    if (m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
-        // Enough tiles for multicast=2, block_m=128
+    // For multicast=2 (2-CTA cluster): the scheduler assigns M-tile PAIRS to clusters.
+    // So num_m_blocks_per_rank must be even (divisible by 2).
+    const int num_m_blocks_mc2 = (m_per_rank + 128 - 1) / 128;
+    const bool m_blocks_even = (num_m_blocks_mc2 % 2 == 0);
+
+    if (m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
+        // Enough tiles for multicast=2, block_m=128, and M-blocks are even
         block_m = 128;
         num_multicast = 2;
     } else if (m_per_rank >= 128) {

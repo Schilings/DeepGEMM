@@ -284,3 +284,99 @@ c++
 // CTA0: m_block = m_block_pair_start * 2
 // CTA1: m_block = m_block_pair_start * 2 + 1
 但这需要 scheduler 调整。让我用更直接的方法——在 scheduler 中让每个 CTA 独立获取不同的 m_block。
+
+在我明白了：
+
+SM100_TMA_2SM_LOAD_2D（DeepGEMM 当前使用的）：cta_group::2 + shared::cluster = 两个 CTA 都执行 TMA，数据写入 cluster 共享 SMEM 空间
+SM100_TMA_2SM_LOAD_MULTICAST_2D：cta_group::2 + shared::cluster + multicast::cluster = 额外添加 multicast，数据自动复制到 cluster 中所有 CTA 的 SMEM
+关键区别：
+
+无 multicast（SM100_TMA_2SM_LOAD）：每个 CTA 执行 TMA，数据只写入自己的 SMEM（但在 shared::cluster 地址空间，所以另一个 CTA 也能访问）
+有 multicast（SM100_TMA_2SM_LOAD_MULTICAST）：数据被硬件复制到 cluster 中所有 CTA 的 SMEM
+回到 DeepGEMM 的 tma::copy 函数。当 num_tma_multicast > 1 时，它使用的是 SM100_TMA_2SM_LOAD_2D（不带 multicast）。这意味着：
+
+每个 CTA 执行 TMA 后，数据只在自己的 SMEM 中！ 但因为使用 shared::cluster 地址空间，2SM UMMA 可以跨两个 SM 的 SMEM 读取。
+
+这就完全说通了！在标准 GEMM 中（kIsMulticastOnA=false）：
+
+CTA0 TMA load A[m0] → CTA0 的 SMEM
+CTA1 TMA load A[m1] → CTA1 的 SMEM
+CTA0 TMA load B[n:n+64] → CTA0 的 SMEM（但因为 shared::cluster，CTA1 也能访问）
+CTA1 TMA load B[n+64:n+128] → CTA1 的 SMEM（但因为 shared::cluster，CTA0 也能访问）
+2SM UMMA 跨两个 SM 的 SMEM 读取 A[m0] + A[m1] + B[n:n+128]，计算 256×128 输出
+所以在 GEMM-RS 中也应该这样：每个 CTA 加载自己的 A 行，B 按列 split，2SM UMMA 跨两个 SM 计算。
+
+我刚才的 scheduler 修改是正确的！每个 CTA 通过 cta_rank 获得不同的 m_block_idx，加载不同 A 行。B 仍然 split（load_n_idx += block_rank * LOAD_BLOCK_N）。2SM UMMA 自动跨两个 SM 的 SMEM 计算。
+
+但等等——我修改 Load warp 时移除了 A 的 m_idx 偏移，但保留了 B 的 n_idx 偏移。让我验证这是否和标准 GEMM 一致：
+
+标准 GEMM（第 220-223 行）：
+
+c++
+复制
+插入
+新建文件
+保存
+应用
+if constexpr (kNumMulticast > 1) {
+    m_idx += kIsMulticastOnA ? (cute::block_rank_in_cluster() * load_block_m) : 0;
+    n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
+}
+当 kIsMulticastOnA=false 时：m_idx += 0（不偏移 M），n_idx += block_rank * LOAD_BLOCK_N（偏移 N）。
+
+但标准 GEMM 中两个 CTA 通过不同的 blockIdx.x 获得不同的 m_block_idx（scheduler 中用 blockIdx.x 而非 cluster_idx），所以 m_idx = m_block_idx * BLOCK_M 本身就不同。
+
+我的修改也是这样：scheduler 中通过 cta_rank 给不同的 local_m_block_idx，所以 global_m = m_block_idx * BLOCK_M 对两个 CTA 不同。不需要额外的 m_idx 偏移。✓
+
+好，但现在有一个问题：arrive_and_expect_tx 的字节数。在标准 GEMM 中：
+
+c++
+复制
+插入
+新建文件
+保存
+应用
+constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
+if (is_leader_cta) {
+    full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
+} else {
+    full_barriers[stage_idx]->arrive(0u);
+}
+kNumMulticast = 2，所以 expect 的字节 = (SMEM_A + SMEM_B) * 2。这是因为 cluster 中两个 CTA 都向同一个 barrier (leader CTA 的 barrier) 报告各自的 TMA 完成。每个 CTA 贡献 SMEM_A + SMEM_B 字节的 transaction。
+
+在我的 GEMM-RS 中也是这样写的（第 517-523 行），所以不需要改。✓
+
+现在还有 Epilogue 部分需要检查。Epilogue 中 TMEM 读取——根据上面的分析，每个 CTA 从自己 SM 的 TMEM 读自己的 128 行。但在 GEMM-RS epilogue 中（第 674 行），读取 TMEM 时用的地址是：
+
+c++
+复制
+插入
+新建文件
+保存
+应用
+uint32_t tmem_col = accum_stage_idx * UMMA_N + s * STORE_BLOCK_N + st * kElemsPerStore;
+这个 tmem_col 对两个 CTA 相同。但由于 TMEM 是每个 SM 本地的，每个 CTA 读到的是自己 SM 的 128 行数据。CTA0 读到的是 A[m0] @ B 的结果，CTA1 读到的是 A[m1] @ B 的结果。✓
+
+Epilogue 写出时（第 716-728 行）：
+
+c++
+复制
+插入
+新建文件
+保存
+应用
+uint32_t base_row = local_m + w * STORE_BLOCK_M;
+uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
+comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(dst_rank, base_row + row, base_col);
+这里 local_m = local_m_block_idx * BLOCK_M。因为两个 CTA 的 m_block_idx 不同，它们的 local_m_block_idx 也不同，所以 local_m 不同。CTA0 写 row 0..127，CTA1 写 row 128..255。✓
+
+Ready flag（第 742 行）：
+
+c++
+复制
+插入
+新建文件
+保存
+应用
+auto* ready_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
+两个 CTA 的 local_m_block_idx 不同，所以设置不同 tile 的 ready flag。✓
