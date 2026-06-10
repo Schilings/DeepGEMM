@@ -119,20 +119,66 @@ rank B 的 Comm warp 去远端 A 取数据时，读 A 的 `slot[B]` = `slot[rank
 
 ---
 
-#### Bug Fix: Multicast=2 (2-CTA Cluster) 正确性问题
+#### Bug Fix: Multicast=2 (2-CTA Cluster) 正确性问题 — 已修复
 
 **问题描述**：
 启用 multicast=2 时，大 shape（compute_waves >= 0.5）计算结果错误。
 
-**临时修复**：
-在 `csrc/jit_kernels/heuristics/gemm_rs.hpp` 中暂时禁用 multicast=2：
-```c++
-if (false && num_sms * 2 >= min_m_waves * n_waves) {
-    // multicast=2 disabled until 2-CTA cluster correctness is resolved
-}
-```
+**根因分析（深度调研后发现）**：
 
-**待后续排查**：2-CTA cooperative UMMA + RS 的交互可能有额外约束。
+通过对比标准 GEMM (`sm100_bf16_gemm.cuh`) 和 CUTLASS tutorial (`04_mma_tma_2sm_sm100.cu`)：
+
+1. **标准 GEMM 的 scheduler**：每个 CTA 用自己的 `blockIdx.x` 独立调度
+   - `next_block_idx = iter * kNumSMs + blockIdx.x`
+   - 两个 CTA（blockIdx.x = 2i, 2i+1）得到**不同的 m_block_idx**
+   - CTA0 加载 A[m0]，CTA1 加载 A[m1]（不同行！）
+   - 2SM UMMA 跨两个 SM 的 SMEM 计算 UMMA_M=256 行
+
+2. **GEMM-RS 的 scheduler（BUG）**：两个 CTA 用 `cluster_idx` 统一调度
+   - `block_idx = cluster_idx`（两个 CTA 相同！）
+   - 两个 CTA 得到**相同的 m_block_idx**
+   - CTA0 和 CTA1 加载相同的 A 行 → UMMA 产生重复的 128 行输出
+
+3. **SM100 TMA `cta_group::2` 的语义**：
+   - `SM100_TMA_2SM_LOAD_2D`：`shared::cluster` 空间 TMA，数据写入本地 SMEM（不是 multicast）
+   - `SM100_TMA_2SM_LOAD_MULTICAST_2D`：额外 `multicast::cluster`，数据复制到所有 CTA
+   - DeepGEMM 使用的是前者——两个 CTA 各自独立 TMA，数据在各自 SMEM
+
+4. **TMEM 是每 SM 本地的**：
+   - 2SM UMMA 写入时，前 128 行 → SM0 的 TMEM，后 128 行 → SM1 的 TMEM
+   - Epilogue 中每个 CTA 只能读自己 SM 的 TMEM
+
+**修复方案（3 处修改）**：
+
+1. **Scheduler (`get_next_block`)**：按 M-tile pair 分配给 cluster
+   - CTA0（cta_rank=0）：得到 pair 中第一个 M-tile
+   - CTA1（cta_rank=1）：得到 pair 中第二个 M-tile
+   ```c++
+   local_m_block_idx = local_m_pair_idx * kNumMulticast + cta_rank;
+   ```
+
+2. **TMA Load**：移除 A 的 m_idx 偏移（scheduler 已给不同 m_block_idx）
+   - 之前：`load_m_idx += block_rank * LOAD_BLOCK_M`（错误！两个 CTA 已有相同 m_block）
+   - 之后：`load_m_idx = global_m`（各 CTA 的 global_m 已不同）
+   - B 的 split 保持不变：`load_n_idx += block_rank * LOAD_BLOCK_N`
+
+3. **Epilogue**：两个 CTA 独立写出（不再限制 leader only）
+   - 每个 CTA 写自己 m_block 的数据到对应 partial buffer slot
+   - 各自设置自己 tile 的 ready flag
+   - 无冲突（写不同地址）
+
+4. **Heuristics**：multicast=2 要求 `num_m_blocks_per_rank` 为偶数
+   ```c++
+   if (m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
+       num_multicast = 2;
+   }
+   ```
+
+**修改文件**：
+- `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`：scheduler + TMA load + epilogue
+- `csrc/jit_kernels/heuristics/gemm_rs.hpp`：multicast=2 启用条件
+
+**状态**：编译通过（multicast=1），待多 GPU 验证 multicast=2 正确性。
 
 ---
 
@@ -295,7 +341,8 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 - [x] **8 GPU 正确性测试通过** ✅
 - [x] **8 GPU 性能基准测试完成** (geo_mean=0.34x，需要优化)
 - [x] **深入理解 2-CTA Cluster 计算流程** (docs/SM100_2CTA_CLUSTER.md)
-- [ ] **修复 multicast=2 (2-CTA cluster)** ← 最高优先级性能优化
+- [x] **修复 multicast=2 (2-CTA cluster)** ← 根因：scheduler 给两个 CTA 相同 m_block_idx，已改为不同
+- [ ] **多 GPU 验证 multicast=2 正确性** ← 当前优先级
 - [ ] 重审 warp specialization 资源分配
 - [ ] 性能优化迭代
 
