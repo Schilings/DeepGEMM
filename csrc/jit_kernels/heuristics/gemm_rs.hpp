@@ -46,10 +46,10 @@ struct GemmRSConfig {
 // ════════════════════════════════════════════════════════════════
 //  Pull-based single-kernel GEMM + RS 配置
 //
-//  Warp layout (MegaMoE-style for Blackwell):
+//  Warp layout (aligned with standard GEMM):
 //    W0~W3: Comm (Dispatch) Warps — 128T, 48 regs — pull + per-rank reduce
-//    W4: Load A Warp — 32T, 40 regs — TMA multicast load A
-//    W5: Load B Warp — 32T, 40 regs — TMA multicast load B
+//    W4: TMA Load Warp (A+B) — 32T, 40 regs — unified TMA multicast load
+//    W5: Reserved — 32T, 40 regs
 //    W6: MMA Issue Warp — 32T, 40 regs — single-warp UMMA (Blackwell)
 //    W7: Reserved — 32T, 40 regs
 //    W8~W11: Epilogue Warps — 128T, 208 regs — TMEM → smem → local partial + flag
@@ -98,9 +98,8 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     int num_multicast;
     bool is_multicast_on_a = true;
 
-    if (false && m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
+    if (m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
         // Enough tiles for multicast=2, block_m=128
-        // TEMPORARILY DISABLED: multicast=2 has correctness issues to fix
         block_m = 128;
         num_multicast = 2;
     } else if (m_per_rank >= 128) {

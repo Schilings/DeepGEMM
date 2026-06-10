@@ -122,16 +122,15 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t kNumThreads = kNumCommThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
     constexpr uint32_t kNumEpilogueStages = 2;
 
-    // Warp layout (MegaMoE style):
+    // Warp layout (aligned with standard GEMM):
     //   W0..W3: Comm (Dispatch) = kNumCommThreads / 32 warps
-    //   W4: Load A, W5: Load B, W6: MMA Issue, W7: Reserved
+    //   W4: TMA Load (A+B unified), W5: Reserved, W6: MMA Issue, W7: Reserved
     //   W8+: Epilogue
     constexpr uint32_t kNumCommWarps = kNumCommThreads / 32;
     constexpr uint32_t kNumNonEpiWarps = kNumNonEpilogueThreads / 32;  // 4 warps
     constexpr uint32_t kNumEpiWarps = kNumEpilogueThreads / 32;
-    constexpr uint32_t kLoadWarpAIdx = kNumCommWarps;       // W4
-    constexpr uint32_t kLoadWarpBIdx = kNumCommWarps + 1;   // W5
-    constexpr uint32_t kMMAWarpIdx = kNumCommWarps + 2;     // W6
+    constexpr uint32_t kLoadWarpIdx = kNumCommWarps;         // W4: unified TMA load (A+B)
+    constexpr uint32_t kMMAWarpIdx = kNumCommWarps + 2;      // W6
     constexpr uint32_t kReservedWarpIdx = kNumCommWarps + 3; // W7
     constexpr uint32_t kEpilogueWarpStart = kNumCommWarps + kNumNonEpiWarps;  // W8
 
@@ -191,7 +190,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     kNumMulticast > 1 ? cute::cluster_sync() : void();
 
     // ── Prefetch TMA descriptors ──
-    if (warp_idx == kLoadWarpAIdx) {
+    if (warp_idx == kLoadWarpIdx) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
     }
@@ -462,9 +461,11 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 4 (Load Warp A): TMA Multicast Load A tiles into smem
+    //  Warp 4 (TMA Load Warp): Load both A and B into smem
+    //  Aligned with standard GEMM: single warp issues both TMA loads
+    //  and does a single arrive_and_expect_tx per stage.
     // ════════════════════════════════════════════════════════════════
-    else if (warp_idx == kLoadWarpAIdx and cute::elect_one_sync()) {
+    else if (warp_idx == kLoadWarpIdx and cute::elect_one_sync()) {
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
@@ -480,13 +481,19 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                // TMA multicast load A (data read once from HBM, written to 2 CTAs' smem)
+                // Issue TMA load A
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t>(
                     &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, load_m_idx, kNumMulticast);
 
+                // Issue TMA load B
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
+                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
+
+                // Single arrive with total A+B byte count (same as standard GEMM)
                 constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
                 if (is_leader_cta) {
                     full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
@@ -497,34 +504,9 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         }
     }
 
-    // ════════════════════════════════════════════════════════════════
-    //  Warp 5 (Load Warp B): TMA Multicast Load B tiles into smem
-    // ════════════════════════════════════════════════════════════════
-    else if (warp_idx == kLoadWarpBIdx and cute::elect_one_sync()) {
-        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
-        while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
-            const uint32_t n_idx = n_block_idx * BLOCK_N;
-            const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
-
-            // Add multicast CTA offsets for B
-            uint32_t load_n_idx = n_idx;
-            if constexpr (kNumMulticast > 1 and not kIsMulticastOnA) {
-                load_n_idx += cute::block_rank_in_cluster() * LOAD_BLOCK_N;
-            }
-
-            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                empty_barriers[stage_idx]->wait(phase ^ 1);
-                const uint32_t k_idx = k_block_idx * BLOCK_K;
-
-                // TMA multicast load B
-                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
-
-                // B warp doesn't need to arrive_and_expect_tx (A warp already did)
-                // But we need to signal the barrier for proper counting
-                // Note: A warp already accounts for both A+B sizes in its arrive
-            }
-        }
+    // Warp 5: Reserved (no-op, matching standard GEMM's warp layout)
+    else if (warp_idx == (kNumCommWarps + 1)) {
+        // Intentionally empty — this warp slot is reserved for future use
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -756,7 +738,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // Deallocate tensor memory
-    if (warp_idx == kLoadWarpAIdx)
+    if (warp_idx == kLoadWarpIdx)
         Allocator().free(0, kNumTmemCols);
 
 #else
