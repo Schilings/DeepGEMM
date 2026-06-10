@@ -178,7 +178,12 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
     const uint32_t num_n_slices = BLOCK_N / STORE_BLOCK_N;
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
-    const uint32_t sm_idx = blockIdx.x;
+    // For multicast=2 (2-CTA cluster): both CTAs in a cluster must process the same tile.
+    // Use cluster_idx so they share the same scheduling sequence.
+    // For multicast=1: cluster_idx == blockIdx.x, kNumClusters == kNumSMs.
+    constexpr uint32_t kNumClusters = kNumSMs / kNumMulticast;
+    const uint32_t cluster_idx = blockIdx.x / kNumMulticast;
+    const uint32_t sm_idx = cluster_idx;  // Used for persistent scheduling stride
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
@@ -251,9 +256,12 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
     // ── Initial NVLink barrier: ensure previous iteration's data is consumed ──
+    // Note: nvlink_barrier / grid_sync need unique per-block identity (blockIdx.x),
+    // NOT cluster_idx, since all kNumSMs blocks must independently participate.
     constexpr uint32_t kInitBarrierTag = 41;
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kInitBarrierTag>(
-        workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
+        workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
+        [&]() { kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads(); }, true, true);
 
     // ── Pipeline state ──
     uint32_t stage_idx = 0, phase = 0;
@@ -281,7 +289,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         const uint32_t dst_rank = (m_rank_wave + 1 < kNumRanks) ?
             (rank_idx + m_rank_wave + 1) % kNumRanks : rank_idx;
         m_block_idx = dst_rank * num_m_blocks_per_rank + local_m_block_idx;
-        block_idx += kNumSMs;
+        // Stride by kNumClusters: in multicast=2, each cluster (2 CTAs) handles one tile
+        block_idx += kNumClusters;
         ++ iter_idx;
         return true;
     };
@@ -368,8 +377,14 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
         const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 
-        // Iterate over tiles assigned to this SM
-        for (uint32_t tile_idx = sm_idx; tile_idx < total_my_tiles; tile_idx += kNumSMs) {
+        // Iterate over tiles assigned to this cluster.
+        // For multicast=2, use both CTAs' comm warps for better parallelism:
+        // CTA 0 handles even-indexed tiles, CTA 1 handles odd-indexed tiles within
+        // this cluster's assignment. This doubles comm bandwidth utilization.
+        // For multicast=1, only one CTA exists so block_rank_in_cluster == 0 always.
+        const uint32_t comm_cta_offset = kNumMulticast > 1 ? cute::block_rank_in_cluster() : 0;
+        const uint32_t comm_cta_stride = kNumMulticast > 1 ? (kNumClusters * kNumMulticast) : kNumClusters;
+        for (uint32_t tile_idx = sm_idx * kNumMulticast + comm_cta_offset; tile_idx < total_my_tiles; tile_idx += comm_cta_stride) {
             const uint32_t my_m_block = tile_idx / num_n_blocks;
             const uint32_t my_n_block = tile_idx - my_m_block * num_n_blocks;
 
@@ -472,7 +487,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //  and does a single arrive_and_expect_tx per stage.
     // ════════════════════════════════════════════════════════════════
     else if (warp_idx == kLoadWarpIdx and cute::elect_one_sync()) {
-        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
+        uint32_t block_idx = cluster_idx, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
             const uint32_t n_idx = n_block_idx * BLOCK_N;
@@ -543,7 +558,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             }
         };
 
-        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
+        uint32_t block_idx = cluster_idx, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             auto accum_stage_idx = (iter_idx - 1) % kNumEpilogueStages;
             auto accum_phase_idx = ((iter_idx - 1) / kNumEpilogueStages) & 1;
@@ -626,7 +641,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
         uint32_t tma_stage_idx = 0;
 
-        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
+        uint32_t block_idx = cluster_idx, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             auto accum_stage_idx = (iter_idx - 1) % kNumEpilogueStages;
             auto accum_phase_idx = ((iter_idx - 1) / kNumEpilogueStages) & 1;
@@ -737,7 +752,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
     constexpr uint32_t kFinalBarrierTag = 42;
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kFinalBarrierTag>(
-        workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
+        workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
+        [&]() { kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads(); }, true, true);
 
     // Reset ready flags for next iteration (all dst_rank slots in our buffer)
     {
