@@ -294,6 +294,7 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 - [x] **2 GPU 正确性测试通过** ✅
 - [x] **8 GPU 正确性测试通过** ✅
 - [x] **8 GPU 性能基准测试完成** (geo_mean=0.34x，需要优化)
+- [x] **深入理解 2-CTA Cluster 计算流程** (docs/SM100_2CTA_CLUSTER.md)
 - [ ] **修复 multicast=2 (2-CTA cluster)** ← 最高优先级性能优化
 - [ ] 重审 warp specialization 资源分配
 - [ ] 性能优化迭代
