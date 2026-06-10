@@ -79,34 +79,47 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     constexpr int block_n = 128;
     const int block_k = 128 / elem_size_ab;
 
-    // Block M selection based on occupancy
+    // Block M selection:
+    // When multicast=2 (2-CTA cluster), UMMA 2x1SM requires each CTA to have 128 rows (LAYOUT_AD_M=128).
+    // Therefore block_m must be >= 128 when multicast is enabled.
+    // For smaller M, we disable multicast to allow block_m < 128.
     const int num_n_blocks = (n + block_n - 1) / block_n;
-    auto compute_waves = [&](int bm) {
+    auto compute_waves = [&](int bm, int mc) {
         int num_m_blocks = (m_per_rank + bm - 1) / bm;
         int total_blocks = num_m_blocks * num_n_blocks * num_ranks;
-        return static_cast<float>(total_blocks) / num_sms;
+        // With multicast, effective SM count is halved (2 CTAs per cluster share work)
+        int effective_sms = num_sms / mc;
+        return static_cast<float>(total_blocks) / effective_sms;
     };
 
+    // Prefer multicast=2 with block_m=128 when we have enough tiles
+    // Fall back to multicast=1 with smaller block_m for small M scenarios
     int block_m;
-    if (compute_waves(128) >= 1.5f) {
-        block_m = 128;
-    } else if (compute_waves(64) >= 1.5f) {
-        block_m = 64;
-    } else {
-        block_m = 32;
-    }
+    int num_multicast;
+    bool is_multicast_on_a = true;
 
-    // TMA Multicast = 2 (2-CTA cluster, learning from MegaMoE)
-    // Always multicast on A: A is read once from HBM, delivered to 2 CTAs' smem
-    constexpr int num_multicast = 2;
-    constexpr bool is_multicast_on_a = true;
+    if (m_per_rank >= 128 && compute_waves(128, 2) >= 0.5f) {
+        // Enough tiles for multicast=2, block_m=128
+        block_m = 128;
+        num_multicast = 2;
+    } else if (m_per_rank >= 128) {
+        // block_m=128 but not enough tiles for multicast=2
+        // Use multicast=1 to avoid wasting SM resources
+        block_m = 128;
+        num_multicast = 1;
+    } else {
+        // Very small M (< 128 tokens per rank): use block_m=128 anyway
+        // with multicast=1, the GEMM portion will just be underutilized
+        block_m = 128;
+        num_multicast = 1;
+    }
 
     const int load_block_m = block_m / (is_multicast_on_a ? num_multicast : 1);
     const int load_block_n = block_n / (is_multicast_on_a ? 1 : num_multicast);
     constexpr int swizzle_a_mode = 128;
     constexpr int swizzle_b_mode = 128;
     constexpr int swizzle_cd_mode = 128;
-    constexpr int reduce_num_threads = 0;  // 不需要单独的 reduce kernel
+    constexpr int reduce_num_threads = 0;  // No separate reduce kernel needed
 
     // Pipeline stages (with comm fetch stages)
     constexpr int kNumTMAStoreStages = 2;

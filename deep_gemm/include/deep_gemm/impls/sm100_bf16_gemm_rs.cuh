@@ -102,7 +102,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_b) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::TMEM::Allocator2Sm;  // Always 2-SM for multicast
+    using Allocator = cute::conditional_t<kNumMulticast == 2, cute::TMEM::Allocator2Sm, cute::TMEM::Allocator1Sm>;
     using ab_dtype_t = cutlass::bfloat16_t;
 
     // GEMM with accumulation must have FP32 output
@@ -446,9 +446,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //  Warp 4 (Load Warp A): TMA Multicast Load A tiles into smem
     // ════════════════════════════════════════════════════════════════
     else if (warp_idx == kLoadWarpAIdx and cute::elect_one_sync()) {
-        // Adjust registers
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
-
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
@@ -485,9 +482,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //  Warp 5 (Load Warp B): TMA Multicast Load B tiles into smem
     // ════════════════════════════════════════════════════════════════
     else if (warp_idx == kLoadWarpBIdx and cute::elect_one_sync()) {
-        // Adjust registers
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
-
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t n_idx = n_block_idx * BLOCK_N;
@@ -522,9 +516,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //  This is THE architectural design — 1 warp drives the entire Tensor Core.
     //
     else if (warp_idx == kMMAWarpIdx and is_leader_cta) {
-        // Adjust registers
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
-
         auto instr_desc = kSwapAB ?
             cute::UMMA::make_instr_desc<ab_dtype_t, ab_dtype_t, float,
                                         UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>() :
@@ -603,7 +594,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     //  Warp 7 (Reserved): keeps non-epilogue alignment
     // ════════════════════════════════════════════════════════════════
     else if (warp_idx == kReservedWarpIdx) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>();
         // Reserved warp — does nothing but TMEM allocation (done above)
     }
 
