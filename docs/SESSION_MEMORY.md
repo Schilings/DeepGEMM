@@ -17,12 +17,14 @@ DeepGEMM 的 **GEMM-RS (GEMM + Reduce-Scatter)** 融合 kernel，目标是在多
 - 大 hidden dimension（N = 7168，如 DeepSeek-V3）
 - 单机多卡（2/4/8 GPU NVLink 互联）
 
-### 当前状态
+### 当前状态（2026-06-10 更新）
 
 - **设计方案**: Pull-based 单 kernel，tile 级 overlap
-- **代码状态**: 已写完，待多卡测试验证
+- **代码状态**: multicast=1 已验证通过（8GPU 正确性 + benchmark），multicast=2 代码修复已完成，待多卡验证
 - **之前的尝试（Push + PDL 两阶段）**: 已验证性能不行（8GPU 仅 0.21x NCCL），代码已删除
 - **测试和 Benchmark**: 已完善，覆盖多种 shape 和大 hidden dim 场景
+- **已修复的 Bug**: reg_dealloc 死锁、partial buffer slot 寻址、本地 ready flag race、multicast=2 scheduler
+- **当前阻塞**: 多 GPU 测试环境端口冲突（`torch.distributed` init 失败），multicast=2 验证待端口问题解决
 
 ---
 
@@ -111,7 +113,7 @@ W8-W11 (128T, 208 regs): Epilogue — TMEM → smem → local partial + set flag
 
 ## ⏭️ 下一步工作
 
-### 优先级 P0：多卡正确性测试
+### 优先级 P0：验证 multicast=2 正确性 ← 当前
 
 ```bash
 cd /workspace/codebuddy/DeepGEMM
@@ -119,35 +121,32 @@ cd /workspace/codebuddy/DeepGEMM
 # 清除 JIT 缓存
 rm -rf ~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs*
 
-# 基本正确性 (2 GPU)
-python tests/test_gemm_rs.py 2
-
-# 全量正确性 (8 GPU, all shapes)
-python tests/test_gemm_rs.py 8 --all
+# 解决端口冲突后执行：
+MASTER_PORT=49501 python tests/test_gemm_rs.py 2    # 2 GPU 快速验证
+MASTER_PORT=49501 python tests/test_gemm_rs.py 8    # 8 GPU 全量验证
 ```
 
-### 优先级 P1：性能 Benchmark
+**注意**: multicast=2 代码已修改完成并编译通过。当前被 `torch.distributed` 端口冲突阻塞。
+
+### 优先级 P1：multicast=2 性能 Benchmark
 
 ```bash
-# 性能对比 (Fused vs GEMM+NCCL分离)
-python benchmarks/bench_gemm_rs.py 2 20
-python benchmarks/bench_gemm_rs.py 4 20
-python benchmarks/bench_gemm_rs.py 8 30
+# multicast=2 性能对比
+MASTER_PORT=49501 python benchmarks/bench_gemm_rs.py 8 30
 ```
 
-### 优先级 P2：根据测试结果调优
+预期 multicast=2 后 GEMM 计算效率提升 ~2x，整体 speedup 从 0.34x 提升到 0.6-0.8x。
 
-可能的问题和解决方向：
-1. **Comm Warps 带宽不足** → 用 TMA 1D Load 代替手动 P2P Read
-2. **Per-tile Flag 延迟过高** → 调整 flag 粒度（多个 tile 合一个 flag）
-3. **GEMM 算力下降** → Warp 分配比例调优
-4. **死锁/hang** → 检查 barrier 逻辑和 M-Swizzle 调度顺序
-5. **数值精度** → FP32 reduce 路径验证
+### 优先级 P2：进一步性能优化
+
+1. **Comm Warps TMA 化**: 用 TMA 1D Load 代替手动 P2P Read（带宽关键）
+2. **Warp Specialization 重审**: 当前 3 warpgroup 仅 1 个做 MMA，资源利用率低
+3. **Comm Pipeline**: 2-stage pipeline（reduce + prefetch 并行）
+4. **Vectorized Epilogue**: 合并 flag write，减少尾部延迟
+5. **寄存器优化**: 给 MMA warpgroup 更多寄存器
 
 ### 优先级 P3：进阶优化
 
-- **TMA Load for Pull**: 用 TMA 硬件异步拉取代替手动 global load
-- **Comm Pipeline**: 2-stage pipeline（reduce + prefetch 并行）
 - **Adaptive Warp Split**: 根据 compute/comm ratio 动态分配 warp 数
 - **FP8 版本**: 扩展到 FP8 输入（需 SF + UTCCP）
 - **Ring 多步流水线**: 8+ GPU 场景优化

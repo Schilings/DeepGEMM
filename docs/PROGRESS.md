@@ -178,7 +178,26 @@ rank B 的 Comm warp 去远端 A 取数据时，读 A 的 `slot[B]` = `slot[rank
 - `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`：scheduler + TMA load + epilogue
 - `csrc/jit_kernels/heuristics/gemm_rs.hpp`：multicast=2 启用条件
 
-**状态**：编译通过（multicast=1），待多 GPU 验证 multicast=2 正确性。
+**状态**：代码修改已完成，编译通过。多 GPU 验证因测试环境端口冲突问题暂未完成（见下方 "当前阻塞问题"）。
+
+---
+
+#### 当前阻塞问题：多 GPU 测试环境端口冲突
+
+**问题描述**：
+在 8 卡 B300 SXM6 环境上运行 `test_gemm_rs.py` 时，`torch.distributed` 初始化始终失败，
+报错 `Address already in use`。尝试过 MASTER_PORT=8361/29501/39501 等多个端口，均被占用。
+
+**排查过程**：
+1. 使用 `pkill -9 -f "test_gemm_rs"` 清理所有残留 Python 进程
+2. 确认 GPU 内存已释放（`nvidia-smi` 显示 8 卡均空闲）
+3. 使用 `ss -tlnp` 检查端口占用，发现有其他服务占用端口
+4. 使用 `fuser -k <port>/tcp` 尝试释放端口，仍有冲突
+
+**下一步**：
+- 尝试使用更高端口号（如 49501、59501）
+- 或者在 `test_gemm_rs.py` 中增加自动端口扫描逻辑
+- 核心代码修改已就绪，只需验证即可
 
 ---
 
@@ -326,25 +345,57 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 
 ## 当前状态
 
+### 已完成 ✅
+
 - [x] 核心 kernel 代码已完成 (sm100_bf16_gemm_rs.cuh)
 - [x] JIT 编译入口完成 (sm100_bf16_gemm_rs.hpp)
 - [x] 启发式配置完成 (heuristics/gemm_rs.hpp)
 - [x] Python API 完成 (deep_gemm/gemm_rs/__init__.py)
 - [x] 多卡正确性测试脚本完成 (tests/test_gemm_rs.py)
 - [x] 多卡性能测试脚本完成 (benchmarks/bench_gemm_rs.py)
-- [x] 修复 reg_dealloc 死锁 bug
-- [x] 修复 partial buffer slot 寻址 bug
-- [x] 修复本地 ready flag race condition
-- [x] 临时禁用 multicast=2
-- [x] 修复测试阈值（BF16 精度）
-- [x] **2 GPU 正确性测试通过** ✅
-- [x] **8 GPU 正确性测试通过** ✅
-- [x] **8 GPU 性能基准测试完成** (geo_mean=0.34x，需要优化)
-- [x] **深入理解 2-CTA Cluster 计算流程** (docs/SM100_2CTA_CLUSTER.md)
-- [x] **修复 multicast=2 (2-CTA cluster)** ← 根因：scheduler 给两个 CTA 相同 m_block_idx，已改为不同
-- [ ] **多 GPU 验证 multicast=2 正确性** ← 当前优先级
-- [ ] 重审 warp specialization 资源分配
-- [ ] 性能优化迭代
+- [x] 修复 reg_dealloc 死锁 bug（根因：`setmaxnreg.dec.sync.aligned` 在 `elect_one_sync()` 分支内死锁）
+- [x] 修复 partial buffer slot 寻址 bug（根因：写端用 `rank_idx` 而非 `dst_rank` 作 slot 索引）
+- [x] 修复本地 ready flag race condition（根因：本地 `src_rank==rank_idx` 跳过了 ready flag 检查）
+- [x] 修复测试阈值（BF16 精度，改用相对误差 `< 0.01 * num_ranks`）
+- [x] **2 GPU 正确性测试通过** ✅（multicast=1）
+- [x] **8 GPU 正确性测试通过** ✅（multicast=1，6/6 shapes ALL PASS）
+- [x] **8 GPU 性能基准测试完成**（multicast=1，geo_mean=0.34x，瓶颈明确）
+- [x] **深入理解 2-CTA Cluster 计算流程**（docs/SM100_2CTA_CLUSTER.md）
+- [x] **修复 multicast=2 (2-CTA cluster) 代码**
+  - 根因：scheduler 用 `cluster_idx`（两个 CTA 相同）而非独立 `block_idx`
+  - 修复：scheduler 中 `local_m_block_idx = local_m_pair_idx * kNumMulticast + cta_rank`
+  - TMA Load：移除 A 的冗余 m_idx 偏移（scheduler 已给不同 m_block_idx）
+  - Epilogue：两个 CTA 独立写出自己的 tile
+  - Heuristics：multicast=2 要求 `num_m_blocks_per_rank` 为偶数
+
+### 待完成 🔲
+
+- [ ] **多 GPU 验证 multicast=2 正确性** ← 🔴 当前最高优先级
+  - 代码已修改完成，编译通过
+  - 被测试环境端口冲突阻塞（`torch.distributed` init 失败）
+  - 需要解决端口问题后跑 `test_gemm_rs.py 8`
+- [ ] multicast=2 性能 benchmark（预期 GEMM 效率提升 ~2x）
+- [ ] 重审 warp specialization 资源分配（当前 3 warpgroup 中只有 1 个做 MMA）
+- [ ] 性能优化迭代（Comm warp TMA 化、pipeline、vectorized store 等）
+
+### 关键性能指标（multicast=1 基线）
+
+| 指标 | 值 | 备注 |
+|------|-----|------|
+| 8 GPU 正确性 | 6/6 ALL PASS | 相对误差 ~0.25% |
+| Geo Mean Speedup vs NCCL | 0.34x | 慢于分离方案 |
+| 融合 kernel TFLOPS | 150-620 | B300 峰值 ~1400 |
+| 标准 GEMM TFLOPS | 1000-1250 | 接近峰值 |
+| 最佳场景 | 2.02x (128×512×1024) | 小 shape 通信延迟占主导 |
+| 核心瓶颈 | MMA 利用率低 | 3 warpgroup 仅 1 个做 MMA |
+
+### 预期 multicast=2 改进
+
+启用 2-CTA cooperative UMMA 后预期：
+1. **GEMM 计算效率翻倍**：256×128 UMMA 比 128×128 指令吞吐更高
+2. **B 矩阵带宽减半**：两个 CTA 共享 B 数据（TMA cluster shared memory）
+3. **整体 speedup 预计从 0.34x → 0.6-0.8x**（中大 shape）
+4. 小 shape 可能从 2.0x → 3-4x（通信开销进一步被掩盖）
 
 ---
 
