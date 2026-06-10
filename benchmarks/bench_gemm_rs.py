@@ -42,39 +42,41 @@ from deep_gemm.utils.dist import init_dist
 #   - K=7168: attention projection dimensions
 #
 SHAPES_STANDARD = [
-    # ── Small batch (MoE inference / short sequence) ──
-    (128, 512, 1024),
-    (256, 512, 1024),
-    (256, 1024, 2048),
+    # ── Realistic LLM training shapes ──
+    # In actual training: total M = 10k-20k+, hidden_dim = 4k-8k
+    # tokens_per_rank = total_M / num_GPUs
+    # On 8 GPUs: per-rank 2k = total 16k, per-rank 4k = total 32k
 
-    # ── Medium (typical training, moderate sequence) ──
-    (512, 2048, 4096),
-    (1024, 2048, 4096),
-    (2048, 2048, 4096),
-
-    # ── Large hidden dimension (DeepSeek-V3 style, N=7168) ──
-    (256, 7168, 2048),
-    (512, 7168, 2048),
-    (1024, 7168, 2048),
+    # ── Medium (typical training batch, 8 GPU → total 8k-16k tokens) ──
+    (1024, 4096, 7168),
+    (1024, 7168, 4096),
+    (2048, 4096, 7168),
+    (2048, 7168, 4096),
     (2048, 7168, 2048),
+
+    # ── Large (long context, 8 GPU → total 32k tokens) ──
     (4096, 7168, 2048),
-
-    # ── Large K dimension (attention projections) ──
-    (256, 2048, 7168),
-    (512, 2048, 7168),
-    (1024, 2048, 7168),
-    (2048, 2048, 7168),
     (4096, 2048, 7168),
-
-    # ── Square-ish large (balanced compute/comm) ──
-    (1024, 4096, 4096),
-    (2048, 4096, 4096),
     (4096, 4096, 4096),
+    (4096, 7168, 4096),
+    (4096, 4096, 7168),
 
-    # ── Extreme large (stress test) ──
-    (4096, 7168, 7168),
+    # ── Very Large (long context, 8 GPU → total 64k tokens) ──
     (8192, 7168, 2048),
     (8192, 2048, 7168),
+    (8192, 4096, 4096),
+    (8192, 7168, 4096),
+
+    # ── Extreme (batch size 16k/rank, total 128k tokens on 8 GPU) ──
+    (16384, 7168, 2048),
+    (16384, 2048, 7168),
+    (16384, 4096, 4096),
+    (16384, 7168, 4096),
+
+    # ── Stress test ──
+    (8192, 7168, 7168),
+    (16384, 7168, 7168),
+    (20480, 7168, 2048),
 ]
 
 

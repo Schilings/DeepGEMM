@@ -26,26 +26,31 @@ from deep_gemm.utils.dist import init_dist
 
 # ─── Test shapes ───
 # (tokens_per_rank, N, K) — designed to cover typical LLM training scenarios
+# NOTE: In real LLM training, M (total tokens) is typically 10k-20k+,
+#       and hidden dimensions are 4k-8k (e.g., DeepSeek-V3 uses 7168).
+#       tokens_per_rank = total_M / num_ranks.
 SHAPES_BASIC = [
     # Small shapes (quick validation)
-    (256, 512, 1024),
-    (256, 1024, 2048),
-    # Medium shapes (typical MoE / attention intermediate)
-    (512, 2048, 4096),
-    (1024, 2048, 4096),
-    # Large hidden dim (7168 = DeepSeek-V3 style)
-    (256, 7168, 2048),
-    (512, 2048, 7168),
+    (512, 4096, 7168),
+    (1024, 7168, 4096),
+    # Medium shapes (typical MoE training, 8 GPU → total M=4k-8k)
+    (2048, 7168, 2048),
+    (2048, 4096, 7168),
+    # Large shapes (long context training, per-rank 4k = total 32k on 8 GPU)
+    (4096, 7168, 2048),
+    (4096, 2048, 7168),
 ]
 
 SHAPES_EXTENDED = [
-    # Very large M (long context training)
-    (2048, 2048, 4096),
-    (4096, 4096, 4096),
-    (4096, 7168, 2048),
-    (4096, 2048, 7168),
+    # Very large M (long context training: per-rank 8k-16k = total 64k-128k on 8 GPU)
+    (8192, 7168, 2048),
+    (8192, 2048, 7168),
+    (8192, 4096, 4096),
+    (16384, 7168, 2048),
+    (16384, 2048, 7168),
     # Stress test: large in all dimensions
-    (2048, 7168, 7168),
+    (8192, 7168, 7168),
+    (16384, 7168, 4096),
 ]
 
 
