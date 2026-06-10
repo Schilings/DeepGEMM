@@ -1,21 +1,30 @@
 """
-Debug script to simulate the SM100 BF16 GEMM scheduler behavior.
-Verifies what data each CTA in a 2-CTA cluster computes.
+Debug script to verify what data each CTA in a 2-CTA cluster computes in SM100 BF16 GEMM.
 
-Key observations from code:
-- grid_dim = kNumSMs (e.g., 128 blocks total)
-- cluster_size = 2 (every 2 adjacent blocks form a cluster)
-- scheduler.get_next_block() uses: next_block_idx = (++current_iter) * kNumSMs + blockIdx.x
-- MMA only runs on leader CTA (block_rank_in_cluster() == 0)
-- TMA load adds offset based on block_rank_in_cluster()
-- Epilogue runs on BOTH CTAs
+=== CONCLUSION from CUTLASS Tutorial 04 ===
+In SM100 2SM mode:
+- A cluster of 2 CTAs (peer CTAs) collaborates on the SAME output tile.
+- The 2SM UMMA instruction (cta_group::2) operates on data from BOTH CTAs' shared memory.
+- Only the leader CTA issues the MMA instruction, but it reads from both SMs' smem.
+- Each CTA loads a PORTION of the input data (split along M or N).
+- The result in TMEM is shared across the 2 SMs.
+- Both CTAs participate in storing the result back to global memory.
 
-This means the two CTAs in a cluster have DIFFERENT blockIdx.x and thus get
-DIFFERENT tile assignments from the scheduler!
+Key from TiledMMA layout:
+  LayoutA_TV: (_2,(_128,_16)):(_128,(_1,_256))  => 2 CTAs, each provides 128 rows of A
+  LayoutC_TV: (_2,(_128,_256)):(_128,(_1,_256))  => 2 CTAs, each stores 128 rows of C/D
 
-But wait - MMA only runs on one CTA. How does this work?
-The answer: The two CTAs load DIFFERENT parts of the data (via TMA multicast split),
-but the UMMA instruction is a 2SM instruction that operates on BOTH CTAs' shared memory.
+=== DeepGEMM Implementation Details ===
+In DeepGEMM's SM100 BF16 GEMM:
+- grid_dim = num_sms (e.g., 128)
+- cluster_size = 2
+- CUDA runtime groups every 2 adjacent blocks into a cluster: (0,1), (2,3), ...
+- Each CTA has its OWN scheduler instance per warp role
+- The scheduler assigns tiles based on: next_block_idx = (++iter) * kNumSMs + blockIdx.x
+- TWO CTAs in the same cluster get DIFFERENT block_idx from the scheduler!
+
+BUT: The hardware enforces that 2 CTAs in a cluster process together.
+So the REAL question is: what does the code actually do with these different block indices?
 """
 
 import math
@@ -26,7 +35,6 @@ def ceil_div(a, b):
 
 
 def get_num_1d_blocks_per_group(num_sms, block_m, block_n, is_multicast_on_a):
-    """Select best group size from candidates {8, 16}"""
     num_best_blocks = 0
     min_usage = float('inf')
     for candidate in [8, 16]:
@@ -41,8 +49,7 @@ def get_num_1d_blocks_per_group(num_sms, block_m, block_n, is_multicast_on_a):
 
 
 def get_swizzled_block_idx(block_idx, num_m_blocks, num_n_blocks, 
-                           num_1d_blocks_per_group, is_multicast_on_a, num_multicast):
-    """Swizzle block index into (m_block_idx, n_block_idx)"""
+                           num_1d_blocks_per_group, is_multicast_on_a):
     primary_num_blocks = num_n_blocks if is_multicast_on_a else num_m_blocks
     secondary_num_blocks = num_m_blocks if is_multicast_on_a else num_n_blocks
     num_blocks_per_group = secondary_num_blocks * num_1d_blocks_per_group
@@ -51,8 +58,6 @@ def get_swizzled_block_idx(block_idx, num_m_blocks, num_n_blocks,
     in_group_idx = block_idx % num_blocks_per_group
     num_blocks_in_group = min(num_1d_blocks_per_group, primary_num_blocks - first_block_idx)
 
-    # SM100 does NOT have the unaligned multicast fix (that's SM90 only)
-    # Convert to final M/N block indices
     if is_multicast_on_a:
         m_block_idx = in_group_idx // num_blocks_in_group
         n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group
@@ -66,12 +71,7 @@ def get_swizzled_block_idx(block_idx, num_m_blocks, num_n_blocks,
 def simulate_cluster(shape_m, shape_n, shape_k, block_m, block_n, block_k,
                      num_sms, num_multicast=2, is_multicast_on_a=False):
     """
-    Simulate what tiles are assigned to the two CTAs in a cluster.
-    
-    For SM100 with 2-CTA clusters:
-    - grid_dim = num_sms (e.g., 128)
-    - cluster_size = 2
-    - Adjacent blockIdx.x values form a cluster: (0,1), (2,3), (4,5)...
+    Simulate the full data flow for a 2-CTA cluster in DeepGEMM SM100 BF16 GEMM.
     """
     num_m_blocks = ceil_div(shape_m, block_m)
     num_n_blocks = ceil_div(shape_n, block_n)
@@ -81,8 +81,11 @@ def simulate_cluster(shape_m, shape_n, shape_k, block_m, block_n, block_k,
     
     load_block_m = block_m // (num_multicast if is_multicast_on_a else 1)
     load_block_n = block_n // (1 if is_multicast_on_a else num_multicast)
+    
+    umma_m = 128 * num_multicast  # LAYOUT_AD_M * kNumMulticast
+    umma_n = block_n if not False else block_m  # kSwapAB=false
 
-    print(f"=" * 80)
+    print(f"=" * 90)
     print(f"GEMM Configuration:")
     print(f"  Shape: M={shape_m}, N={shape_n}, K={shape_k}")
     print(f"  Block: M={block_m}, N={block_n}, K={block_k}")
@@ -90,195 +93,209 @@ def simulate_cluster(shape_m, shape_n, shape_k, block_m, block_n, block_k,
     print(f"  Cluster: num_multicast={num_multicast}, is_multicast_on_a={is_multicast_on_a}")
     print(f"  kNumSMs={num_sms}, kNum1DBlocksPerGroup={num_1d_blocks_per_group}")
     print(f"  LOAD_BLOCK_M={load_block_m}, LOAD_BLOCK_N={load_block_n}")
-    print(f"=" * 80)
+    print(f"  UMMA shape: M={umma_m}, N={umma_n}, K=16")
+    print(f"=" * 90)
     
-    # Simulate first cluster (blockIdx.x = 0 and 1)
-    print(f"\n--- Cluster 0 (blockIdx.x = 0, 1) ---")
-    print(f"{'Iter':<6}{'CTA0 block_idx':<16}{'CTA0 (m,n) tile':<20}{'CTA1 block_idx':<16}{'CTA1 (m,n) tile':<20}")
-    print("-" * 80)
+    # ================================================================
+    # TRACE: First few iterations of the first cluster (blockIdx.x = 0 and 1)
+    # ================================================================
+    print(f"\n{'='*90}")
+    print(f"TRACE: Cluster 0 (CTA0: blockIdx.x=0, CTA1: blockIdx.x=1)")
+    print(f"{'='*90}")
     
-    max_iters = min(10, ceil_div(num_blocks, num_sms))  # Show first 10 iterations
-    
-    cta0_tiles = []
-    cta1_tiles = []
+    max_iters = min(5, ceil_div(num_blocks, num_sms))
     
     for iter_idx in range(max_iters):
-        # CTA0: blockIdx.x = 0
         block_idx_0 = iter_idx * num_sms + 0
-        # CTA1: blockIdx.x = 1
         block_idx_1 = iter_idx * num_sms + 1
         
         if block_idx_0 >= num_blocks and block_idx_1 >= num_blocks:
             break
-            
-        m0, n0 = None, None
-        m1, n1 = None, None
         
+        print(f"\n--- Iteration {iter_idx} ---")
+        
+        # CTA0's scheduler
         if block_idx_0 < num_blocks:
             m0, n0 = get_swizzled_block_idx(block_idx_0, num_m_blocks, num_n_blocks,
-                                             num_1d_blocks_per_group, is_multicast_on_a, num_multicast)
-            cta0_tiles.append((m0, n0))
-        
+                                            num_1d_blocks_per_group, is_multicast_on_a)
+        else:
+            m0, n0 = None, None
+            
+        # CTA1's scheduler
         if block_idx_1 < num_blocks:
             m1, n1 = get_swizzled_block_idx(block_idx_1, num_m_blocks, num_n_blocks,
-                                             num_1d_blocks_per_group, is_multicast_on_a, num_multicast)
-            cta1_tiles.append((m1, n1))
+                                            num_1d_blocks_per_group, is_multicast_on_a)
+        else:
+            m1, n1 = None, None
         
-        tile0_str = f"m_blk={m0}, n_blk={n0}" if m0 is not None else "done"
-        tile1_str = f"m_blk={m1}, n_blk={n1}" if m1 is not None else "done"
+        print(f"  Scheduler results:")
+        print(f"    CTA0: block_idx={block_idx_0} => m_block_idx={m0}, n_block_idx={n0}")
+        print(f"    CTA1: block_idx={block_idx_1} => m_block_idx={m1}, n_block_idx={n1}")
         
-        print(f"{iter_idx:<6}{block_idx_0:<16}{tile0_str:<20}{block_idx_1:<16}{tile1_str:<20}")
-    
-    # Now show what ACTUAL data each CTA loads (with multicast offset)
-    print(f"\n--- TMA Load Addresses (with multicast offset) ---")
-    print(f"{'Iter':<6}{'CTA0 load region':<40}{'CTA1 load region':<40}")
-    print("-" * 86)
-    
-    for iter_idx in range(min(max_iters, len(cta0_tiles))):
-        if iter_idx >= len(cta0_tiles) or iter_idx >= len(cta1_tiles):
-            break
-        m0, n0 = cta0_tiles[iter_idx]
-        m1, n1 = cta1_tiles[iter_idx]
+        if m0 is None or m1 is None:
+            continue
         
-        # CTA0 (block_rank = 0)
+        # ==== TMA WARP (warp 0) - Both CTAs execute ====
+        # Code: lines 220-223
+        #   m_idx += kIsMulticastOnA ? (block_rank * load_block_m) : 0
+        #   n_idx += kIsMulticastOnA ? 0 : (block_rank * LOAD_BLOCK_N)
+        
+        # CTA0 (block_rank=0):
         m_idx_0 = m0 * block_m + (0 * load_block_m if is_multicast_on_a else 0)
         n_idx_0 = n0 * block_n + (0 if is_multicast_on_a else 0 * load_block_n)
-        
-        # CTA1 (block_rank = 1)
+        # CTA1 (block_rank=1):
         m_idx_1 = m1 * block_m + (1 * load_block_m if is_multicast_on_a else 0)
         n_idx_1 = n1 * block_n + (0 if is_multicast_on_a else 1 * load_block_n)
         
-        cta0_str = f"A[{m_idx_0}:{m_idx_0+load_block_m},:] x B[:,{n_idx_0}:{n_idx_0+load_block_n}]"
-        cta1_str = f"A[{m_idx_1}:{m_idx_1+load_block_m},:] x B[:,{n_idx_1}:{n_idx_1+load_block_n}]"
+        print(f"\n  TMA Load (warp 0):")
+        print(f"    CTA0 (rank=0): A rows [{m_idx_0}:{m_idx_0+load_block_m}], B cols [{n_idx_0}:{n_idx_0+load_block_n}]")
+        print(f"    CTA1 (rank=1): A rows [{m_idx_1}:{m_idx_1+load_block_m}], B cols [{n_idx_1}:{n_idx_1+load_block_n}]")
         
-        print(f"{iter_idx:<6}{cta0_str:<40}{cta1_str:<40}")
-    
-    # Explain the 2SM MMA execution model
-    print(f"\n--- MMA Execution Model ---")
-    print(f"  - MMA warp ONLY runs on leader CTA (block_rank_in_cluster() == 0)")
-    print(f"  - BUT it's a 2SM UMMA instruction (SM100_MMA_F16BF16_2x1SM_SS)")
-    print(f"  - The 2SM UMMA reads from BOTH CTAs' shared memory simultaneously")
-    print(f"  - UMMA shape: M={128 * num_multicast}, N={block_n}")
-    print(f"  - So UMMA computes a {128 * num_multicast}x{block_n} output tile")
-    
-    # Explain epilogue
-    print(f"\n--- Epilogue (Store back to global memory) ---")
-    print(f"  - Epilogue runs on BOTH CTAs")
-    print(f"  - Each CTA has its OWN scheduler, gets DIFFERENT tiles from get_next_block()")
-    print(f"  - But the UMMA result is in tensor memory (TMEM) which is shared across the cluster")
-    print(f"")
-    
-    # The KEY insight:
-    print(f"=== KEY INSIGHT ===")
-    print(f"  The scheduler gives each CTA a DIFFERENT tile.")
-    print(f"  - CTA0 (iter 0): processes tile (m_blk={cta0_tiles[0][0]}, n_blk={cta0_tiles[0][1]})")
-    print(f"  - CTA1 (iter 0): processes tile (m_blk={cta1_tiles[0][0]}, n_blk={cta1_tiles[0][1]})")
-    print(f"")
-    print(f"  For TMA load (warp 0): each CTA loads its own portion of data:")
-    if not is_multicast_on_a:
-        print(f"    - CTA0 loads A[m0*{block_m} : m0*{block_m}+{load_block_m}] and B[n0*{block_n} : n0*{block_n}+{load_block_n}]")
-        print(f"    - CTA1 loads A[m1*{block_m} : m1*{block_m}+{load_block_m}] and B[n1*{block_n}+{load_block_n} : n1*{block_n}+{block_n}]")
-        print(f"    - i.e., they split the N dimension: each loads half of B's columns")
-    else:
-        print(f"    - CTA0 loads A[m0*{block_m} : m0*{block_m}+{load_block_m}] (first half of M)")
-        print(f"    - CTA1 loads A[m1*{block_m}+{load_block_m} : m1*{block_m}+{block_m}] (second half of M)")
-        print(f"    - i.e., they split the M dimension: each loads half of A's rows")
-    print(f"")
-    print(f"  For MMA (warp 1, leader only): executes 2SM UMMA which reads from BOTH CTAs' smem")
-    print(f"    - Result shape: {128*num_multicast} x {block_n} (covers data from BOTH CTAs)")
-    print(f"")
-    print(f"  For Epilogue (warp 2+, both CTAs): each CTA stores its portion of the result")
-    print(f"    - CTA0: stores its tile's rows of the output")
-    print(f"    - CTA1: stores its tile's rows of the output")
-    print(f"")
-    
-    # Wait, let me re-examine. Let's check if both CTAs get SAME or DIFFERENT tiles
-    # from their respective schedulers in a single iteration
-    print(f"=== VERIFICATION: Do CTAs in same cluster process same or different tiles? ===")
-    print(f"")
-    
-    # Let's trace what happens:
-    # 1. TMA warp (warp 0): both CTAs execute get_next_block() independently
-    # 2. MMA warp (warp 1): only leader CTA executes get_next_block()
-    # 3. Epilogue warp: both CTAs execute get_next_block()
-    #
-    # Each warp has its OWN scheduler instance! So they're independent.
-    # But the MMA warp's barrier sync (full_barriers[stage_idx]->wait(phase))
-    # depends on BOTH CTAs' TMA warps arriving.
-    #
-    # This means: at iteration i, both CTAs' TMA warps must have finished loading
-    # before leader CTA's MMA warp can proceed.
-    #
-    # The TMA warp on CTA0 loads tile (m0, n0), and CTA1's TMA loads tile (m1, n1).
-    # These are DIFFERENT tiles!
-    #
-    # But the UMMA instruction reads from local smem (which has CTA0's data)
-    # AND remote smem (which has CTA1's data) via the 2SM mechanism.
-    #
-    # So what does the UMMA actually compute?
-    
-    print(f"  Each CTA has 3 independent scheduler instances (one per warp role).")
-    print(f"  Each scheduler starts with current_iter = -1 and increments independently.")
-    print(f"")
-    print(f"  === Critical Question: What does the 2SM UMMA actually compute? ===")
-    print(f"")
-    print(f"  UMMA_M = 128 * kNumMulticast = {128 * num_multicast}")
-    print(f"  This means the UMMA operates on {128*num_multicast} rows in TMEM.")
-    print(f"")
-    
-    if not is_multicast_on_a:
-        # kIsMulticastOnA = false: grouping on M, split on N
-        print(f"  Since kIsMulticastOnA=false:")
-        print(f"    - LOAD_BLOCK_M = BLOCK_M / 1 = {load_block_m} (each CTA loads full M rows of A)")
-        print(f"    - LOAD_BLOCK_N = BLOCK_N / 2 = {load_block_n} (each CTA loads half N cols of B)")
-        print(f"")
-        print(f"  TMA warp behavior (iteration 0):")
-        print(f"    CTA0 (rank=0): loads A[{cta0_tiles[0][0]*block_m}:{cta0_tiles[0][0]*block_m+load_block_m}, 0:{block_k}]")
-        print(f"                    loads B[0:{block_k}, {cta0_tiles[0][1]*block_n+0*load_block_n}:{cta0_tiles[0][1]*block_n+0*load_block_n+load_block_n}]")
-        print(f"    CTA1 (rank=1): loads A[{cta1_tiles[0][0]*block_m}:{cta1_tiles[0][0]*block_m+load_block_m}, 0:{block_k}]")
-        print(f"                    loads B[0:{block_k}, {cta1_tiles[0][1]*block_n+1*load_block_n}:{cta1_tiles[0][1]*block_n+1*load_block_n+load_block_n}]")
-        print(f"")
-        print(f"  WAIT! CTA0 and CTA1 get DIFFERENT m_block_idx from scheduler!")
-        print(f"  CTA0 m_block_idx={cta0_tiles[0][0]}, CTA1 m_block_idx={cta1_tiles[0][0]}")
-        print(f"  CTA0 n_block_idx={cta0_tiles[0][1]}, CTA1 n_block_idx={cta1_tiles[0][1]}")
-        print(f"")
-        print(f"  But the 2SM UMMA in the leader CTA reads from:")
-        print(f"    - smem_a on CTA0 (leader's local smem)")
-        print(f"    - smem_b on CTA0 (leader's local smem)")
-        print(f"    PLUS via 2SM mechanism:")
-        print(f"    - smem_a on CTA1 (peer's remote smem)")
-        print(f"    - smem_b on CTA1 (peer's remote smem)")
-        print(f"")
-        print(f"  The UMMA descriptor uses LOAD_BLOCK_M rows from smem_a,")
-        print(f"  but with UMMA_M=256 it expects 256 rows in TMEM output.")
-        print(f"  The 2SM instruction automatically concatenates:")
-        print(f"    rows [0:128) from CTA0's smem_a")  
-        print(f"    rows [128:256) from CTA1's smem_a")
-        print(f"  And for B (LOAD_BLOCK_N={load_block_n}):")
-        print(f"    cols [0:{load_block_n}) from CTA0's smem_b")
-        print(f"    cols [{load_block_n}:{block_n}) from CTA1's smem_b")
-        print(f"")
-        print(f"  So the 2SM UMMA computes:")
-        print(f"    D[0:256, 0:{block_n}] = concat(A_cta0, A_cta1) @ concat(B_cta0, B_cta1)^T")
-        print(f"")
-        print(f"  WHERE:")
-        print(f"    A_cta0 = A[{cta0_tiles[0][0]*block_m}:{cta0_tiles[0][0]*block_m+load_block_m}]  ({load_block_m} rows)")
-        print(f"    A_cta1 = A[{cta1_tiles[0][0]*block_m}:{cta1_tiles[0][0]*block_m+load_block_m}]  ({load_block_m} rows)")
-        print(f"    B_cta0 = B[{cta0_tiles[0][1]*block_n}:{cta0_tiles[0][1]*block_n+load_block_n}]  ({load_block_n} cols)")
-        print(f"    B_cta1 = B[{cta1_tiles[0][1]*block_n+load_block_n}:{cta1_tiles[0][1]*block_n+block_n}]  ({load_block_n} cols)")
-    
-    return cta0_tiles, cta1_tiles
+        # ==== MMA WARP (warp 1) - ONLY leader CTA executes ====
+        # It also calls get_next_block() independently.
+        # Since only leader CTA runs this, it gets block_idx = iter * kNumSMs + 0 = same as CTA0's TMA warp
+        print(f"\n  MMA (warp 1, leader CTA only):")
+        print(f"    Leader's scheduler: block_idx={block_idx_0} => m_block_idx={m0}, n_block_idx={n0}")
+        print(f"    Issues tcgen05.mma.cta_group::2 (2SM UMMA)")
+        print(f"    Reads from BOTH CTAs' smem:")
+        print(f"      - CTA0's smem_a: {load_block_m} rows of A starting at row {m_idx_0}")
+        print(f"      - CTA1's smem_a: {load_block_m} rows of A starting at row {m_idx_1}")
+        print(f"      - CTA0's smem_b: {load_block_n} cols of B starting at col {n_idx_0}")
+        print(f"      - CTA1's smem_b: {load_block_n} cols of B starting at col {n_idx_1}")
+        print(f"    Output in TMEM: {umma_m} rows x {umma_n} cols (shared across 2 SMs)")
+        
+        # ==== EPILOGUE WARP - Both CTAs execute ====
+        # Each CTA calls get_next_block() independently again.
+        # CTA0's epilogue warp gets the same tile as its TMA warp (same scheduler pattern).
+        # CTA1's epilogue warp gets the same tile as ITS TMA warp.
+        
+        # base_m_idx for epilogue:
+        # scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx) = m_block_idx * BLOCK_M (for Normal GEMM)
+        epi_base_m_0 = m0 * block_m  # CTA0's epilogue
+        epi_base_n_0 = n0 * block_n
+        epi_base_m_1 = m1 * block_m  # CTA1's epilogue
+        epi_base_n_1 = n1 * block_n
+        
+        print(f"\n  Epilogue (both CTAs):")
+        print(f"    CTA0: stores D[{epi_base_m_0}:{epi_base_m_0+block_m}, {epi_base_n_0}:{epi_base_n_0+block_n}]")
+        print(f"    CTA1: stores D[{epi_base_m_1}:{epi_base_m_1+block_m}, {epi_base_n_1}:{epi_base_n_1+block_n}]")
+        
+        # ==== What does the UMMA output ACTUALLY contain? ====
+        print(f"\n  === WHAT THE 2SM UMMA ACTUALLY COMPUTES ===")
+        if not is_multicast_on_a:
+            # kIsMulticastOnA=false: each CTA loads full BLOCK_M=128 rows of A, half of B
+            # CTA0 loads A[m0*128 : m0*128+128] and B[:,n0*128 : n0*128+64]
+            # CTA1 loads A[m1*128 : m1*128+128] and B[:,n1*128+64 : n1*128+128]
+            #
+            # The 2SM UMMA with UMMA_M=256 operates on 256 rows of A from TMEM perspective.
+            # The hardware concatenates:
+            #   First 128 rows from CTA0's smem_a (logical A rows [m0*128 : m0*128+128])
+            #   Next 128 rows from CTA1's smem_a (logical A rows [m1*128 : m1*128+128])
+            # And BLOCK_N=128 cols of B:
+            #   First 64 cols from CTA0's smem_b (logical B cols [n0*128 : n0*128+64])
+            #   Next 64 cols from CTA1's smem_b (logical B cols [n1*128+64 : n1*128+128])
+            
+            if m0 != m1 or n0 != n1:
+                print(f"    WARNING: CTA0 and CTA1 have DIFFERENT tile assignments!")
+                print(f"    CTA0: tile (m={m0}, n={n0}), CTA1: tile (m={m1}, n={n1})")
+                print(f"")
+                print(f"    The 2SM UMMA hardware concatenates data from both SMs:")
+                print(f"      A_combined[0:128]   = A[{m_idx_0}:{m_idx_0+load_block_m}]  (from CTA0's smem)")
+                print(f"      A_combined[128:256] = A[{m_idx_1}:{m_idx_1+load_block_m}]  (from CTA1's smem)")
+                print(f"      B_combined[0:64]    = B[{n_idx_0}:{n_idx_0+load_block_n}]  (from CTA0's smem)")
+                print(f"      B_combined[64:128]  = B[{n_idx_1}:{n_idx_1+load_block_n}]  (from CTA1's smem)")
+                print(f"")
+                print(f"    TMEM output (256 x 128 in FP32):")
+                print(f"      D[row, col] = sum_k( A_combined[row, k] * B_combined[col, k] )  for NT layout")
+                print(f"")
+                
+                # Is this mathematically correct?
+                # D[0:128, 0:64]   = A[m0*128:(m0+1)*128] @ B[n0*128:n0*128+64]^T   ✓ (CTA0's portion)
+                # D[0:128, 64:128] = A[m0*128:(m0+1)*128] @ B[n1*128+64:n1*128+128]^T
+                # D[128:256, 0:64] = A[m1*128:(m1+1)*128] @ B[n0*128:n0*128+64]^T
+                # D[128:256, 64:128] = A[m1*128:(m1+1)*128] @ B[n1*128+64:n1*128+128]^T  ✓ (CTA1's portion)
+                
+                # For this to be correct, we need n0 == n1 (same N block)!
+                # AND m0+1 == m1 (adjacent M blocks)!
+                
+                if n0 == n1 and m1 == m0 + 1:
+                    print(f"    ✓ CORRECT: CTA0 and CTA1 process ADJACENT M blocks with SAME N block")
+                    print(f"    The 2SM UMMA computes a combined {umma_m}x{block_n} tile:")
+                    print(f"      TMEM[0:128, 0:128] = A[{m0*block_m}:{(m0+1)*block_m}] @ B[{n0*block_n}:{(n0+1)*block_n}]^T")
+                    print(f"      TMEM[128:256, 0:128] = A[{m1*block_m}:{(m1+1)*block_m}] @ B[{n1*block_n}:{(n1+1)*block_n}]^T")
+                    print(f"")
+                    print(f"    After epilogue:")
+                    print(f"      CTA0 stores TMEM[0:128, :] → D[{epi_base_m_0}:{epi_base_m_0+block_m}, {epi_base_n_0}:{epi_base_n_0+block_n}]")
+                    print(f"      CTA1 stores TMEM[128:256, :] → D[{epi_base_m_1}:{epi_base_m_1+block_m}, {epi_base_n_1}:{epi_base_n_1+block_n}]")
+                    print(f"")
+                    print(f"    ★ EACH CTA processes its own independent 128x128 output tile!")
+                    print(f"    ★ The 2SM UMMA simply batches 2 adjacent tiles into one instruction!")
+                    print(f"    ★ B data is shared (multicast) - both tiles use the SAME B columns!")
+                else:
+                    print(f"    ✗ Tiles are not adjacent or don't share N - unexpected pattern!")
+                    print(f"    This would mean the UMMA computes cross products between different tiles.")
+            else:
+                print(f"    CTA0 and CTA1 have the SAME tile assignment - unexpected!")
+        else:
+            # kIsMulticastOnA=true: each CTA loads half of A (split M), full B
+            if n0 != n1:
+                print(f"    CTA0 n_block={n0}, CTA1 n_block={n1}")
+                if m0 == m1:
+                    print(f"    ✓ Same M block, different N blocks")
+                    print(f"    A is shared (multicast) - both tiles use the SAME A rows!")
+            
+    # ================================================================
+    # SUMMARY
+    # ================================================================
+    print(f"\n{'='*90}")
+    print(f"SUMMARY: How a 2-CTA cluster works in DeepGEMM SM100 BF16 GEMM")
+    print(f"{'='*90}")
+    print(f"""
+For kIsMulticastOnA=False (the common case, cluster_m=2, cluster_n=1):
+
+1. SCHEDULER: Each CTA gets a DIFFERENT tile from the scheduler.
+   - The swizzle pattern ensures adjacent block_idx values map to
+     adjacent M blocks with the SAME N block.
+   - CTA0 (block_idx=2k):   m_block = X,   n_block = Y  
+   - CTA1 (block_idx=2k+1): m_block = X+1, n_block = Y
+
+2. TMA LOAD (both CTAs):
+   - CTA0 loads: A[X*{block_m} : (X+1)*{block_m}, :] and B[:, Y*{block_n} : Y*{block_n}+{load_block_n}]
+   - CTA1 loads: A[(X+1)*{block_m} : (X+2)*{block_m}, :] and B[:, Y*{block_n}+{load_block_n} : (Y+1)*{block_n}]
+   - Each CTA loads full {load_block_m} rows of A (for its own tile)
+   - B is SPLIT: CTA0 loads first {load_block_n} cols, CTA1 loads last {load_block_n} cols
+   - Via TMA multicast, BOTH CTAs get the FULL B (each CTA's B half is multicast to the other)
+
+3. 2SM UMMA (leader CTA only):
+   - The tcgen05.mma.cta_group::2 instruction operates on BOTH SMs' shared memory
+   - It computes a {umma_m}x{umma_n} output:
+     * Rows [0:128) use CTA0's A data: A[X*{block_m} : (X+1)*{block_m}]
+     * Rows [128:256) use CTA1's A data: A[(X+1)*{block_m} : (X+2)*{block_m}]
+     * All 128 columns of B (combined from both CTAs' halves)
+   - Result is stored in TMEM (shared across both SMs)
+   - Effectively computes TWO independent {block_m}x{block_n} tiles in one shot!
+
+4. EPILOGUE (both CTAs):
+   - CTA0 reads TMEM rows [0:128) and stores to D[X*{block_m}:(X+1)*{block_m}, Y*{block_n}:(Y+1)*{block_n}]
+   - CTA1 reads TMEM rows [128:256) and stores to D[(X+1)*{block_m}:(X+2)*{block_m}, Y*{block_n}:(Y+1)*{block_n}]
+
+KEY INSIGHT:
+  The 2-CTA cluster processes TWO adjacent M-tiles that share the same N-tile.
+  The B matrix is loaded once (split across 2 CTAs, then multicast) and reused for both tiles.
+  This HALVES the B memory bandwidth requirement compared to processing tiles independently!
+  
+  From each individual CTA's perspective:
+    It still computes ONE {block_m}x{block_n} output tile.
+    The benefit is bandwidth saving from B-matrix sharing via multicast.
+""")
 
 
 def main():
-    print("=" * 80)
-    print("DEBUG: SM100 2-CTA Cluster Tile Assignment")
-    print("=" * 80)
+    print("=" * 90)
+    print("DEBUG: SM100 2-CTA Cluster Data Flow in DeepGEMM BF16 GEMM")
+    print("=" * 90)
     
-    # Typical configuration for BF16 GEMM NT on SM100
-    # Based on heuristics: BLOCK_M=128, BLOCK_N=128, BLOCK_K=64
-    # cluster_m=2, cluster_n=1 => kNumMulticast=2, kIsMulticastOnA=false
-    
+    # Case 1: Small example
     print("\n\n### Case 1: Small GEMM (M=512, N=512, K=256) ###")
     simulate_cluster(
         shape_m=512, shape_n=512, shape_k=256,
@@ -286,19 +303,12 @@ def main():
         num_sms=128, num_multicast=2, is_multicast_on_a=False
     )
     
+    # Case 2: Typical size
     print("\n\n### Case 2: Typical GEMM (M=4096, N=7168, K=2048) ###")
     simulate_cluster(
         shape_m=4096, shape_n=7168, shape_k=2048,
         block_m=128, block_n=128, block_k=64,
         num_sms=128, num_multicast=2, is_multicast_on_a=False
-    )
-    
-    # Also test with multicast on A (cluster_n > 1)
-    print("\n\n### Case 3: Multicast on A (M=4096, N=7168, K=2048) ###")
-    simulate_cluster(
-        shape_m=4096, shape_n=7168, shape_k=2048,
-        block_m=128, block_n=128, block_k=64,
-        num_sms=128, num_multicast=2, is_multicast_on_a=True
     )
 
 
