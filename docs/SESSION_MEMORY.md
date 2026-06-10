@@ -25,7 +25,11 @@ DeepGEMM 的 **GEMM-RS (GEMM + Reduce-Scatter)** 融合 kernel，目标是在多
 - **测试和 Benchmark**: 已完善，覆盖多种 shape 和大 hidden dim 场景
 - **已修复的 Bug**: reg_dealloc 死锁、partial buffer slot 寻址、本地 ready flag race、multicast=2 scheduler
 - **已解决**: 端口冲突问题（根因：NCCL 后台线程占端口 + 僵尸进程；修复：自动端口发现 + `os._exit(0)` 强制退出）
-- **当前阻塞**: GEMM-RS JIT 首次编译耗时 >120s，快速测试脚本超时需增大
+- **已解决**: JIT 编译超时（120s → 600s 可配置超时，cubin 已成功编译）
+- **当前阻塞**: 🔴 multicast=2 kernel 在 GPU 上 hang（8 卡全 100% GPU 利用率，kernel 内部 spin-wait 死循环）
+  - 所有前置检查通过（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅, sym_buffer ✅）
+  - `bf16_gemm_rs_nt()` 调用后 kernel 永不返回
+  - 需排查 mbarrier 同步 / Epilogue ready flag / Scheduler 中 multicast=2 引入的逻辑
 
 ---
 
@@ -127,9 +131,10 @@ MASTER_PORT=49501 python tests/test_gemm_rs.py 2    # 2 GPU 快速验证
 MASTER_PORT=49501 python tests/test_gemm_rs.py 8    # 8 GPU 全量验证
 ```
 
-**注意**: multicast=2 代码已修改完成并编译通过。端口冲突已解决（自动端口发现）。
-8 卡环境已验证可用（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅）。
-待 JIT 首次编译完成后即可验证 multicast=2 正确性。
+**注意**: multicast=2 代码已编译通过（cubin 已生成），但 kernel 在 GPU 上 hang。
+8 卡环境已验证可用（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅, sym_buffer ✅）。
+需排查 kernel 内部 multicast=2 相关逻辑（mbarrier / Epilogue / Scheduler）。
+可先强制 `num_multicast=1` 验证同一环境下 multicast=1 仍 PASS，缩小问题范围。
 
 ### 优先级 P1：multicast=2 性能 Benchmark
 

@@ -215,6 +215,44 @@ rank B 的 Comm warp 去远端 A 取数据时，读 A 的 `slot[B]` = `slot[rank
 
 ---
 
+#### 🔴 当前阻塞：multicast=2 Kernel 在 GPU 上 Hang（死循环）
+
+**问题描述**：
+8 卡测试中，所有前置检查点（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅, sym_buffer ✅）
+均通过，JIT 编译也成功完成（`kernel.cubin` 已生成），但 `bf16_gemm_rs_nt()` 调用后 **kernel 在 GPU
+上 hang**——8 卡 GPU 利用率全部 100%，日志停在 `sym_buffer created OK` 之后，`bf16_gemm_rs_nt OK`
+从未打印。
+
+**环境**：
+- 超时已从 120s 增大到 600s（环境变量 `TEST_TIMEOUT` 可配置）
+- JIT 缓存路径：`~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_nt.5c472d0dea2cc8e214e2e2ee491b2a40/`
+- `kernel.cubin` 已成功生成（nvcc 编译完成），但无 `.so` 文件
+
+**分析**：
+1. kernel 编译成功 → 问题不在编译，而在 kernel 执行逻辑
+2. 8 卡 GPU 全 100% 利用率 → kernel 已成功 launch，不是 CPU 侧 hang
+3. 100% GPU + 无输出 → kernel 内部某处进入了 **无限 spin-wait（死循环）**
+4. 最可能的 hang 点：
+   - **Comm Warp spin-wait**：轮询远端 ready flag 永远等不到（Epilogue 未设 flag / flag 地址错）
+   - **Epilogue 未执行**：MMA 结果未写入 partial buffer → ready flag 从未被 set
+   - **2-CTA Cluster 同步问题**：leader/follower CTA 的 mbarrier arrive/wait 不匹配
+   - **Scheduler 死锁**：两个 CTA 在 M-tile pair 分配上产生冲突
+
+**与 multicast=1 的差异**：
+multicast=1（单 CTA）时 8 卡正确性 ALL PASS。multicast=2 引入的关键变化：
+1. Scheduler: `local_m_block_idx = local_m_pair_idx * 2 + cta_rank`（CTA0/CTA1 各取不同 M-tile）
+2. TMA Load: A 不再偏移 `block_rank * LOAD_BLOCK_M`（各 CTA 的 m_block_idx 已不同）
+3. Epilogue: 两个 CTA 独立写出（不限 leader only）
+4. Heuristics: `num_multicast=2`, `load_block_n=64`（B 矩阵按 N 方向 split）
+
+**下一步排查方向**：
+- 检查 heuristics 给的配置是否正确匹配 kernel 代码中的预期
+- 对比 multicast=1 和 multicast=2 时 kernel 中的 mbarrier 初始化和 arrive/wait 逻辑
+- 检查 Epilogue 在 multicast=2 时是否正确执行到 ready flag set 点
+- 可先强制 `num_multicast=1` 验证同一环境下 multicast=1 仍然 PASS
+
+---
+
 #### Bug Fix: 8-GPU 测试阈值调整
 
 **问题描述**：
@@ -384,11 +422,11 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 
 ### 待完成 🔲
 
-- [ ] **多 GPU 验证 multicast=2 正确性** ← 🔴 当前最高优先级
-  - 代码已修改完成，编译通过
-  - 端口冲突已解决（自动端口发现 + os._exit 强制退出）
-  - 8 卡环境已验证可用（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅）
-  - 待 GEMM-RS JIT 首次编译完成后验证（需增大超时 >120s）
+- [ ] **修复 multicast=2 kernel hang** ← 🔴 当前最高优先级
+  - JIT 编译已完成（cubin 已生成），kernel launch 成功，但 GPU 上死循环
+  - 8 卡 GPU 全 100% 利用率 → kernel 内部 spin-wait 无限循环
+  - 需排查 mbarrier 同步 / Epilogue ready flag / Scheduler 逻辑
+  - 对比 multicast=1（正常 PASS）找出 multicast=2 引入的 bug
 - [ ] multicast=2 性能 benchmark（预期 GEMM 效率提升 ~2x）
 - [ ] 重审 warp specialization 资源分配（当前 3 warpgroup 中只有 1 个做 MMA）
 - [ ] 性能优化迭代（Comm warp TMA 化、pipeline、vectorized store 等）

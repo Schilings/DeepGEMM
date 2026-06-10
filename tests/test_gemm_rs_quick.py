@@ -9,12 +9,14 @@ import signal
 import socket
 
 # Set timeout to avoid infinite hang
+TIMEOUT_SECONDS = int(os.getenv('TEST_TIMEOUT', '600'))
+
 def timeout_handler(signum, frame):
-    print(f"[TIMEOUT] Test timed out after 120 seconds!", flush=True)
+    print(f"[TIMEOUT] Test timed out after {TIMEOUT_SECONDS} seconds!", flush=True)
     os._exit(1)
 
 signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(120)  # 120 second timeout
+signal.alarm(TIMEOUT_SECONDS)
 
 
 def find_free_port():
