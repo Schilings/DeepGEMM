@@ -684,10 +684,13 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     }
 
                     // Phase 2: Issue per-row TMA 1D bulk copies to LOCAL partial buffer
+                    // IMPORTANT: Only leader CTA writes to avoid race condition with Comm warps.
+                    // In 2-CTA mode, both CTAs read same TMEM data. If both write + set flag,
+                    // CTA 0 may set flag before CTA 1 finishes writing → Comm reads partial data.
                     cute::tma_store_fence();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    if (is_leader_cta and epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                         uint32_t base_row = local_m + w * STORE_BLOCK_M;
                         uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
 
@@ -709,7 +712,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             }
 
             // ── After all N-slices of this tile are stored, set per-tile ready flag ──
-            if (epilogue_warp_idx == 0) {
+            // Only leader CTA sets the flag (matches the writer in Phase 2)
+            if (is_leader_cta and epilogue_warp_idx == 0) {
                 cute::tma_store_wait<0>();
                 if (cute::elect_one_sync()) {
                     // Set ready flag: other ranks can now pull this tile from us
