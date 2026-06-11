@@ -439,18 +439,18 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
   - iter 6: 移除未使用 Comm smem → +1 pipeline stage (+16.5%, first >1x!)
 - [ ] 继续优化迭代（目标 geo_mean > 0.6x）
 
-### 关键性能指标（当前最佳 iter 16, Self-rank Direct Output）
+### 关键性能指标（当前最佳 iter 18, TMA Async Store）
 
 | 指标 | 值 | 备注 |
 |------|-----|------|
 | 8 GPU 正确性 | 6/6 ALL PASS | Max diff = 0.0 |
-| Geo Mean Speedup vs NCCL | **0.982x** | baseline 0.357x → **+175%** |
-| K=4096 shapes | **1.09-1.16x** | Fused wins! ~1150-1230T |
-| K=7168 + small N | **1.01-1.06x** | Fused wins |
-| K=7168 + large N | **0.92-0.98x** | Near parity (NCCL RS 太快) |
-| K=2048 (NVLink-bound) | **0.78-0.79x** | 架构极限：NVLink write vs short K-loop |
-| Shapes where Fused wins | **13/21** (62%) | K≥4096 基本全赢 |
-| 瓶颈分析 | K=2048: NVLink Epilogue latency | K=7168+大N: NCCL RS 只有 ~60μs，fusion 难赢 |
+| Geo Mean Speedup vs NCCL | **1.004x** | baseline 0.357x → **BREAKS 1.0x!** |
+| K=4096 shapes | **1.07-1.11x** | Fused wins! |
+| K=7168 + small N | **1.02-1.04x** | Fused wins |
+| K=7168 + large N | **0.94-0.98x** | Near parity |
+| K=2048 | **0.84-0.95x** | TMA async 大幅改善 (was 0.78x) |
+| Shapes where Fused wins | **13/21** (62%) | |
+| 瓶颈分析 | K=2048 仍是最弱 | TMA async 已解耦 NVLink latency |
 
 ### 已验证：目标场景下融合 kernel 优于分离方案
 
