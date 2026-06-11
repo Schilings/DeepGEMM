@@ -25,7 +25,7 @@
 ## 2. 项目目标
 
 在 NVIDIA Blackwell B300 SXM6 (SM100) 8-GPU 平台上实现 **GEMM + Reduce-Scatter 融合算子**，
-目标场景：大模型训练的长上下文（M_per_rank=2048~8192）、大 hidden dim（N=7168）。
+目标场景：大模型训练的长上下文（如 Megatron Sequence Parallelism），M_per_rank 通常 10K~20K+ tokens，大 hidden dim（N=7168）。
 
 ---
 
@@ -48,6 +48,8 @@
 4. 开发目标二：`benchmarks/` 目录下实现多卡性能测试，目标是训练场景的吞吐量提升
 5. 跑通所有测试和性能测试，确保多卡正确性和性能
 6. 有意义的发现和思考记录到 `docs/PROGRESS.md`，有帮助的资料也记录并 push
+7. **不要自我怀疑已确认的结论**：通过 debug、测试、CUTLASS 源码验证过的行为（如 2SM UMMA 的编程模型、TMA load 行为、scheduler tile 分配），不要在后续开发中反复质疑。如果不确定，先写个测试验证，而不是推翻重来。
+8. **关注编程模型和使用方式，不要纠结硬件实现细节**：我们只需要正确使用 Umma/TMA/Cluster 的 API 和语义，不需要操心硬件内部怎么实现的。
 
 ---
 
