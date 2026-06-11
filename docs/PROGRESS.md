@@ -422,21 +422,16 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 
 ### 待完成 🔲
 
-- [ ] **修复 multicast=2 kernel hang** ← 🔴 当前最高优先级
-  - ✅ JIT 编译修复完成（CUDA 13.0 sm_100f -gencode 问题）
-  - ✅ 确认 multicast=1 在同一 shape 下正常 PASS
-  - ✅ 确认 `block_rank_in_cluster()` 在 cluster launch 下返回正确值 (0/1)
-  - ✅ 确认标准 bf16_gemm 在 cluster=2 下正常工作
-  - 🔴 **hang 定位到 `nvlink_barrier` 中的 `grid_sync`**
-    - 初始化阶段（barrier init + TMEM alloc + cluster_sync）对 cluster 0 正常完成
-    - 但 `grid_sync` 需要所有 148 blocks 参与 — 某些 blocks 可能卡在初始化
-    - 跳过 init nvlink_barrier 后，pipeline（Load/MMA/Epilogue）开始运行
-    - 但 pipeline 后续仍然 hang（需要进一步排查）
-  - **下一步排查方向**：
-    1. 确认所有 148 blocks 都能通过 init 阶段（在 grid_sync 前打印计数）
-    2. 如果某些 blocks 卡在 TMEM alloc（Allocator2Sm），需要检查 2-CTA alloc 语义
-    3. Pipeline hang：检查 umma_arrive_multicast 是否正确释放 empty_barriers
-- [ ] multicast=2 性能 benchmark（预期 GEMM 效率提升 ~2x）
+- [x] **修复 multicast=2 kernel hang** ✅ 已修复！
+  - **根因**：`nvlink_barrier` 内的 `grid_sync` 使用 `cluster_sync()` 作为 sync_scope
+  - 在 persistent kernel（grid=148=所有 SMs）+ cluster_dim=2 模式下，
+    `cluster_sync()` 在 `grid_sync` 内部被连续调用导致某些 clusters 的 implicit
+    cluster barrier 进入死锁状态（所有 148 blocks 无法同时完成 cluster_sync）
+  - **修复**：将 `nvlink_barrier` 的 sync_scope 从 `cluster_sync()` 改为 `__syncthreads()`
+  - `__syncthreads()` 足够保证 grid_sync atomic 操作的正确性（block-local 同步）
+  - 修复还包含：JIT 编译器 `-gencode arch=compute_100f,code=sm_100f`（CUDA 13 兼容）
+  - 验证：8 GPU 正确性 6/6 ALL PASS，性能 benchmark 21 shapes 全部完成
+- [x] multicast=2 性能 benchmark ✅ 完成（见下方结果）
 - [ ] 重审 warp specialization 资源分配（当前 3 warpgroup 中只有 1 个做 MMA）
 - [ ] 性能优化迭代（Comm warp TMA 化、pipeline、vectorized store 等）
 
