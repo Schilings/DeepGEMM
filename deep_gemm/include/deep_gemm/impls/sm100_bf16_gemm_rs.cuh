@@ -772,9 +772,11 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             // NamedBarrier ensures all threads' global stores are issued.
             // threadfence_system ensures they're visible across NVLink.
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                // Set ready flag: other ranks can now pull this tile from us
+                // Set ready flag: other ranks can now pull this tile from us.
+                // st_rel_sys provides release semantics — paired with Comm warp's ld_acq_sys,
+                // this guarantees all prior stores (partial buffer) are visible to the observer.
+                // No __threadfence_system() needed (release-acquire pair is sufficient).
                 auto* ready_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
-                __threadfence_system();  // Ensure TMA writes are visible across NVLink
                 ptx::st_rel_sys(ready_ptr, 1u);
             }
         }
