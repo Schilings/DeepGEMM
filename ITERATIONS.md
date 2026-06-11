@@ -8,6 +8,28 @@
 | 1 | Distributed ready flag polling (4 warps) | 0.362x | 0.543x | ✅ +1.4% |
 | 2 | __nanosleep in polling (reverted) | 0.361x | 0.534x | ❌ no improvement |
 
+## Analysis after Iter 1-2
+
+**Key insight**: The bottleneck is NOT Comm warp efficiency. It's the GEMM pipeline throughput.
+
+Evidence:
+- Separate timing ≈ pure GEMM time (NCCL RS only ~4μs due to NVLink 900 GB/s)
+- Fused kernel = 2.1x slower than standard GEMM for same compute
+- Comm warp optimizations (polling parallelism, nanosleep) have <2% impact
+
+**Root cause**: Epilogue writes to partial buffer using per-row TMA 1D bulk copies
+(128 serial TMA store operations per tile). This is much slower than standard GEMM's
+TMA 2D store epilogue. The slow Epilogue blocks the TMEM pipeline, causing MMA to
+stall waiting for tmem_empty_barriers.
+
+**Next priority (P0)**: Replace per-row TMA 1D store with TMA 2D store for partial buffer.
+This requires:
+1. Creating a TMA tensor map descriptor for the partial buffer (in JIT runtime)
+2. Using `cute::SM90_TMA_STORE_2D::copy` in Epilogue instead of per-row ptx::tma_store_1d
+3. Adjusting partial buffer layout to match TMA 2D requirements (swizzle/alignment)
+
+Expected impact: 2x Epilogue speedup → overall geo_mean from 0.36x to ~0.6-0.7x
+
 ## Baseline
 
 - **Date**: 2026-06-11
