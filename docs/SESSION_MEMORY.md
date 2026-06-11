@@ -41,6 +41,14 @@
 | warpgroup_reg_reconfig | 运行时调整寄存器配额 | 不同角色不同寄存器数 |
 | PTX ld_acq_sys/st_rel_sys | System-scope 内存一致性 | 跨 GPU per-tile flag |
 
+### 已确认的 2-CTA Cluster 行为（不再质疑）
+
+1. **两个 CTA 的 m_block_idx 一定不同**：标准 GEMM 通过不同 blockIdx.x 调度，相邻 CTA 获得相邻 m_block_idx、相同 n_block_idx
+2. **SM100_TMA_2SM_LOAD_2D 无 multicast**：各 CTA 数据在本地 SMEM，通过 shared::cluster 允许跨 SM 访问，2SM UMMA 自动跨两个 SM 的 SMEM 读取
+3. **Load 偏移规则**：`kIsMulticastOnA=false` 时 m_idx 不偏移（scheduler 已给不同 m_block），n_idx 按 block_rank 偏移一半 N 列
+4. **TMEM 是 per-SM 本地的**：Epilogue 各 CTA 读自己 SM 的 128 行，写各自的输出行和 ready_flag
+5. **Barrier**：leader expect_tx = (SMEM_A + SMEM_B) * kNumMulticast，因为两个 CTA 都向 leader 的 barrier 报告
+
 ### 参考文章
 
 - [DeepSeek-V4 MegaMoE 详细分析 - 渣B zartbot](https://mp.weixin.qq.com/s/S-ej9ybT3sbFA8dqHLZafg)
