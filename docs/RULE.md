@@ -1,6 +1,7 @@
 # DeepGEMM GEMM+RS 开发规则
 
 > **服务器 CodeBuddy 专用**：请按以下规则和环境信息执行开发任务。
+> **⏰ 自提醒**：上下文变长时（超过 20 轮对话或开始新任务），必须重新读取本文件刷新记忆。
 
 ---
 
@@ -36,7 +37,7 @@
 ## 4. 开发规则
 
 1. 你是优秀的 CUDA 算子开发者，熟悉 Blackwell 架构、GEMM+RS 融合、通信计算 overlap
-2. **阶段性地 push 代码**到远程仓库，同时更新进度文档 `docs/PROGRESS.md`
+2. **每完成一个阶段性改动就立即 commit + push**，不要攒一批再推。服务器经常莫名其妙宕机，不 push = 代码可能丢失。同时更新进度文档 `docs/PROGRESS.md`
 3. 开发目标一：`tests/` 目录下实现多卡正确性测试
 4. 开发目标二：`benchmarks/` 目录下实现多卡性能测试，目标是训练场景的吞吐量提升
 5. 跑通所有测试和性能测试，确保多卡正确性和性能
@@ -54,6 +55,13 @@ git clone https://github.com/TongmingLAIC/AKO4ALL.git ~/.codebuddy/skills/ako4al
 
 安装后 skill 位于 `~/.codebuddy/skills/ako4all/SKILL.md`，CodeBuddy 自动识别。
 
+### 前置条件
+
+**AKO4ALL 只适用于功能已完整、正确性已验证的 kernel。** 如果 kernel 还有 bug 或功能未完成，应先修复再优化。流程：
+1. 完成功能实现 → 2. 正确性验证通过 → 3. 用 AKO4ALL 做性能优化
+
+当前 P0 阻塞：`multicast=2 hang`，需先修复，不宜使用 AKO4ALL。
+
 ### 使用
 
 重启 CodeBuddy 后，在项目目录中对话触发：
@@ -61,7 +69,40 @@ git clone https://github.com/TongmingLAIC/AKO4ALL.git ~/.codebuddy/skills/ako4al
 Optimize the kernel at ./deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh for up to 30 iterations.
 ```
 
-Agent 自动：创建 `opt/<kernel>` 分支 → 复制到 `solution/` → 生成 benchmark → 迭代优化。
+### AKO4ALL 工作方式 vs 我们的适配
+
+**AKO4ALL 默认流程**：
+1. 在同一仓库创建 `opt/<kernel>` git 分支
+2. 把 kernel 复制到 `solution/` 子目录独立迭代
+3. 自动循环：benchmark → 验证正确性 → ncu profiling → 修改 `solution/` 里的代码 → 重新测速
+4. 每轮自动 git commit，最终 `solution/` 里是最优版本
+
+> 注意：我们不用默认流程，而是直接在 main 分支原文件上迭代（见下方适配方案）。
+
+**我们的问题**：
+- 我们的 kernel 跨多个文件（`.cuh` + `.hpp` + heuristics + 编译链），不适合单文件隔离到 `solution/`
+- 服务器经常宕机，需要频繁 push 防丢代码
+- 优化完还需要从 `solution/` 搬回原位，多文件搬运容易出错
+
+**适配方案：直接在原文件位置迭代，不用 `solution/` 隔离**
+
+在触发 skill 时告诉 agent：
+```
+Optimize the kernel at deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh
+Do NOT copy to solution/. Edit the original files in place.
+Related files: csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp, deep_gemm/include/deep_gemm/gemm_rs.cuh
+Use project's existing test: python -m pytest tests/test_gemm_rs.py -v
+Use project's existing benchmark: python benchmarks/bench_gemm_rs.py
+Push after every iteration to prevent data loss from server crashes.
+```
+
+这样 agent 会：
+- 直接在 main 分支上修改原文件（不创建独立分支）
+- 用项目已有的测试和 benchmark 脚本
+- 每轮 commit + push，代码安全
+- 优化结果直接就在原文件位置，无需搬运
+
+> **防宕机策略**：每轮迭代后必须 `git push`。在 `HINTS.md` 中加入 `Push after every iteration` 指令确保执行。
 
 ### 环境要求
 
@@ -76,6 +117,7 @@ Agent 自动：创建 `opt/<kernel>` 分支 → 复制到 `solution/` → 生成
 - 语言偏好：`Preferred language: CUDA`
 - 禁止 web search：`Web search: disabled`
 - 禁止安装依赖：`No pip/apt installs`
+- **防宕机**：`Push after every iteration`
 
 ### 支持 kernel 语言
 
