@@ -11,6 +11,7 @@
 | 4 | kNumTMAStoreStages 2→3 | 0.418x | 0.786x | ✅ +7.7% |
 | 5 | Pre-compute base ptr in reduce (reverted) | 0.385x | 0.513x | ❌ -7.9% regression |
 | 6 | Remove unused Comm smem buffer (+1 pipeline stage) | 0.487x | 1.694x | ✅✅ +16.5%! First >1x! |
+| 7 | kNumTMAStoreStages 3→2, pipeline 7→8 stages | 0.601x | 2.196x | ✅✅✅ +23.4%! |
 
 ## Analysis after Iter 1-2
 
