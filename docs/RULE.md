@@ -15,9 +15,6 @@
 
 - **主仓库**：https://github.com/Schilings/DeepGEMM.git
 - **关联仓库**：https://github.com/Schilings/DeepEP.git、https://github.com/bytedance/flux.git
-- **Git 用户名**：schilings
-- **Git 邮箱**：1146830743@qq.com
-- **GitHub Token**：见环境变量 `GITHUB_TOKEN`，勿写入文件（GitHub Push Protection 会拦截）
 - **确保有 push 权限**：clone 后验证 `git push` 可正常工作
 
 ---
