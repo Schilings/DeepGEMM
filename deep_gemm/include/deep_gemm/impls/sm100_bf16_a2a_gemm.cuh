@@ -14,6 +14,7 @@
 #include <deep_gemm/layout/bf16_a2a_gemm.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
 
