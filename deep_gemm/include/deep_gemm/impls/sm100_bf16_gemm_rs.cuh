@@ -772,11 +772,12 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             // threadfence_system ensures they're visible across NVLink.
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                 // PUSH mode: set ready flag in REMOTE rank's flag array.
-                // Flag at dst_rank's buffer: slot=rank_idx (sender), tile=(m_block, n_block)
+                // NVLink preserves write ordering from same source to same destination,
+                // so partial data stores are visible before this flag store.
+                // No __threadfence_system needed.
                 auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
                 auto* remote_flag_ptr = (dst_rank != rank_idx) ?
                     reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag_ptr, dst_rank)) : local_flag_ptr;
-                __threadfence_system();  // Ensure NVLink writes are visible before flag
                 ptx::st_rel_sys(remote_flag_ptr, 1u);
             }
         }
