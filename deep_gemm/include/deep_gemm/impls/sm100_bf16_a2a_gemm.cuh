@@ -14,6 +14,7 @@
 #include <deep_gemm/layout/bf16_a2a_gemm.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
@@ -21,24 +22,30 @@ namespace deep_gemm {
 using namespace deep_gemm::sm100;
 
 // ============================================================================================
-//  sm100_bf16_a2a_gemm_nt_impl — BF16 All2All + GEMM Fusion (Ulysses SP: A2A + Wo)
+//  sm100_bf16_a2a_gemm_nt_impl — BF16 All2All + GEMM Fusion (Ulysses SP)
 // ============================================================================================
 //
-//  Communication: P2P All-to-All (each rank sends different data to each peer)
-//  Computation:   Standard BF16 GEMM (NT layout)
-//  Overlap:       Tile-level — GEMM starts processing tiles as soon as their
-//                 source rank's data arrives in the local slot buffer.
+//  5-Warp Architecture (Ring-Push + Compute Overlap):
 //
-//  Warp Layout (same as AG+GEMM):
-//    W0-W3 (128T): A2A Comm warps — P2P scatter via NVLink
-//    W4: TMA Load warp — loads A (from slots) + B, waits for slot_state
-//    W5: MMA Issue warp — UMMA tensor core
-//    W6: Reserved / TMEM allocator
-//    W7+: Epilogue warps — TMEM → smem → TMA store to output
-//
-//  Key difference from AG+GEMM:
-//    AG:  Ring relay — each step forwards one rank's data to next_rank
-//    A2A: P2P direct — rank i writes chunk[j] to rank j's slot[i] (parallel scatter)
+//  ┌────────────────────────────────────────────────────────────────────────┐
+//  │  Push Warps (W0-W3, 128T):                                            │
+//  │    Ring-push local chunks to remote ranks via NVLink.                  │
+//  │    Push order: (i+1), (i+2), ..., (i+n-1), self.                      │
+//  │    All SMs cooperate globally (strided copy). Atomic counter signal.  │
+//  │    Runs CONCURRENTLY with GEMM pipeline.                              │
+//  ├────────────────────────────────────────────────────────────────────────┤
+//  │  Load A Warp (W4, elect_one):                                         │
+//  │    Poll slot_state[src_rank] >= kNumSMs, then TMA load A from slot.  │
+//  │    Compute order: i, (i-1+n)%n, (i-2+n)%n, ..., (i+1)%n             │
+//  ├────────────────────────────────────────────────────────────────────────┤
+//  │  Load B Warp (W5, elect_one):                                         │
+//  │    TMA load B — no flag polling needed (weights always available).    │
+//  ├────────────────────────────────────────────────────────────────────────┤
+//  │  MMA Warp (W6, elect_one):  UMMA tensor core issue.                   │
+//  │  Reserved  (W7):            TMEM allocator.                           │
+//  ├────────────────────────────────────────────────────────────────────────┤
+//  │  Epilogue (W8-W11, 128T):   TMEM → smem → TMA 2D store to output.   │
+//  └────────────────────────────────────────────────────────────────────────┘
 //
 // ============================================================================================
 
@@ -78,13 +85,16 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
     constexpr uint32_t kNumA2AWarps = kNumA2AThreads / 32;
-    constexpr uint32_t kGemmWarpBase = kNumA2AWarps;
+    constexpr uint32_t kGemmWarpBase = kNumA2AWarps;   // W4
     constexpr uint32_t kNumThreads = kNumA2AThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
     constexpr uint32_t kNumTMAStoreStages = 2;
     constexpr uint32_t kNumEpilogueStages = 2;
-    DG_STATIC_ASSERT(BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64, "BF16 A2A+GEMM expects 128x128x64 tiles");
-    DG_STATIC_ASSERT(kNumA2AThreads % 32 == 0 and kNumA2AThreads >= 128, "Invalid A2A threads");
-    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128 and kNumEpilogueThreads == 128, "Invalid GEMM thread layout");
+    DG_STATIC_ASSERT(BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64,
+                     "BF16 A2A+GEMM expects 128x128x64 tiles");
+    DG_STATIC_ASSERT(kNumA2AThreads % 32 == 0 and kNumA2AThreads >= 128,
+                     "Need at least 128 push threads (4 warps)");
+    DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128 and kNumEpilogueThreads == 128,
+                     "Non-epi=128, Epi=128");
 
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
@@ -110,7 +120,7 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
         cute::prefetch_tma_descriptor(&tensor_map_d);
     }
 
-    // ── Shared memory layout (same as AG+GEMM) ──
+    // ── Shared memory layout ──
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
@@ -121,19 +131,22 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
     auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<ab_dtype_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
     });
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(
+        smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
     auto full_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
     auto tmem_full_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumStages * 2 + i; });
     auto tmem_empty_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumStages * 2 + kNumEpilogueStages + i; });
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 2 + kNumEpilogueStages * 2);
 
-    // ── Initialize barriers ──
-    if (warp_idx == kGemmWarpBase + 1 and cute::elect_one_sync()) {
+    // ── Initialize barriers (by MMA warp W6) ──
+    // full_barriers: init(2) because BOTH Load A and Load B arrive separately
+    // empty_barriers: init(1) because only MMA warp arrives
+    if (warp_idx == kGemmWarpBase + 2 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            full_barriers[i]->init(1);
-            empty_barriers[i]->init(1);
+            full_barriers[i]->init(2);   // Load A + Load B each arrive
+            empty_barriers[i]->init(1);  // MMA arrives
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
@@ -141,7 +154,7 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
             tmem_empty_barriers[i]->init(kNumUMMAStoreThreads);
         }
         cutlass::arch::fence_barrier_init();
-    } else if (warp_idx == kGemmWarpBase + 2) {
+    } else if (warp_idx == kGemmWarpBase + 3) {
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     __syncthreads();
@@ -154,64 +167,56 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
         workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
 
     // ════════════════════════════════════════════════════════════════
-    //  W0-W3: All-to-All Communication Warps (P2P Direct Scatter)
+    //  W0-W3 (128T): Push Warps — Ring-push to remote ranks
     // ════════════════════════════════════════════════════════════════
     //
-    //  Each rank has local_x[num_ranks, M_per_rank, K].
-    //  Chunk j (= local_x[j]) must be sent to rank j's slot[rank_idx].
+    //  Push order: (i+1), (i+2), ..., (i+n-1), then self (i).
+    //  Remote pushes go FIRST so remote ranks get data ASAP.
+    //  Self copy goes LAST (GEMM computes self first anyway).
     //
-    //  P2P Direct: all ranks write concurrently to their destinations.
-    //  No ring relay needed — NVLink Gen5 is fully connected.
+    //  All SMs cooperate globally with strided copy for each chunk.
+    //  Each SM atomicAdd(1) to remote flag when its portion is done.
+    //  Slot ready when flag == kNumSMs.
     //
-    constexpr uint32_t kA2AGridSyncIndex = 1;
-    auto a2a_sync_scope = []() { cutlass::arch::NamedBarrier::sync(kNumA2AThreads, 1); };
     if (warp_idx < kNumA2AWarps) {
-        // ── P2P All-to-All with grid_sync for correctness ──
-        // copy_16B distributes work across ALL SMs' comm threads globally.
-        // grid_sync ensures all SMs complete their share before flag is set.
-        auto copy_16B = [&](void* dst, const void* src, const uint64_t& num_bytes) {
-            auto* dst_vec = reinterpret_cast<uint4*>(dst);
-            const auto* src_vec = reinterpret_cast<const uint4*>(src);
-            const uint64_t num_vecs = num_bytes / sizeof(uint4);
-            const uint64_t global_thread_idx = static_cast<uint64_t>(sm_idx) * kNumA2AThreads + thread_idx;
-            const uint64_t global_num_threads = static_cast<uint64_t>(kNumSMs) * kNumA2AThreads;
-            for (uint64_t i = global_thread_idx; i < num_vecs; i += global_num_threads)
-                dst_vec[i] = src_vec[i];
-        };
-
         const uint64_t chunk_bytes = static_cast<uint64_t>(runtime_m_per_rank) * shape_k * sizeof(nv_bfloat16);
+        const uint64_t num_vecs = chunk_bytes / sizeof(uint4);
+        const uint64_t global_idx_base = static_cast<uint64_t>(sm_idx) * kNumA2AThreads + (warp_idx * 32u + lane_idx);
+        const uint64_t global_total = static_cast<uint64_t>(kNumSMs) * kNumA2AThreads;
 
-        // ── Interleaved All-to-All: self + all remotes in one loop ──
-        // Send self-data and all remote data without pausing between steps.
-        // Grid sync + flag after EACH step for correctness, but minimized.
         #pragma unroll 1
         for (uint32_t step = 0; step < kNumRanks; ++ step) {
-            const uint32_t dst_rank = (rank_idx + step) % kNumRanks;
-            const void* src = workspace.get_local_x_ptr(dst_rank);
+            // Push order: (i+1), (i+2), ..., (i+n-1), i
+            const uint32_t dst_rank = (rank_idx + 1 + step) % kNumRanks;
 
-            if (dst_rank == rank_idx) {
-                // Self-copy: local → local slot
-                copy_16B(workspace.get_slot_x_ptr(rank_idx), src, chunk_bytes);
-                comm::grid_sync<kNumSMs, kA2AGridSyncIndex>(workspace, sm_idx, thread_idx, a2a_sync_scope);
-                if (sm_idx == 0 and thread_idx == 0)
+            const auto* src_vec = workspace.template get_local_x_ptr<uint4>(dst_rank);
+            auto* dst_vec = reinterpret_cast<uint4*>(
+                dst_rank == rank_idx
+                    ? workspace.get_slot_x_ptr(rank_idx)
+                    : sym_buffer.map(workspace.get_slot_x_ptr(rank_idx), dst_rank));
+
+            // Global strided copy: all SMs cooperate for max bandwidth
+            for (uint64_t i = global_idx_base; i < num_vecs; i += global_total)
+                dst_vec[i] = src_vec[i];
+
+            // Per-SM sync (only push threads, not cross-SM)
+            cutlass::arch::NamedBarrier::sync(kNumA2AThreads, 1);
+
+            // Atomic counter signal
+            if (dst_rank != rank_idx)
+                __threadfence_system();
+            if (thread_idx == 0) {
+                if (dst_rank == rank_idx)
                     ptx::red_add_rel(workspace.get_slot_state_ptr(rank_idx), 1);
-            } else {
-                // Remote P2P: local → remote slot via NVLink
-                auto* local_slot_ptr = workspace.get_slot_x_ptr(rank_idx);
-                auto* remote_slot_ptr = sym_buffer.map(local_slot_ptr, dst_rank);
-                copy_16B(remote_slot_ptr, src, chunk_bytes);
-                comm::grid_sync<kNumSMs, kA2AGridSyncIndex>(workspace, sm_idx, thread_idx, a2a_sync_scope);
-                if (sm_idx == 0 and thread_idx == 0) {
-                    __threadfence_system();
-                    auto* remote_state = sym_buffer.map(workspace.get_slot_state_ptr(rank_idx), dst_rank);
-                    *remote_state = 1;
-                }
+                else
+                    ptx::red_add_rel(sym_buffer.map(workspace.get_slot_state_ptr(rank_idx), dst_rank), 1);
             }
         }
+        // Push warps done — idle until kernel finishes
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  GEMM Pipeline (identical to AG+GEMM)
+    //  GEMM Pipeline — compute order: i, (i-1+n)%n, ..., (i+1)%n
     // ════════════════════════════════════════════════════════════════
 
     uint32_t stage_idx = 0, phase = 0;
@@ -220,32 +225,45 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
     };
+
+    // Tile scheduling: compute order = (i, i-1, i-2, ..., i+1)
+    // Self-rank tiles first (always ready), then reverse ring.
     auto get_next_block = [&](uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t& iter_idx) {
-        const uint32_t num_m_blocks = ceil_div(shape_m, BLOCK_M);
+        const uint32_t num_m_blocks_per_rank = ceil_div(runtime_m_per_rank, BLOCK_M);
         const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
-        if (block_idx >= num_m_blocks * num_n_blocks)
+        const uint32_t tiles_per_rank = num_m_blocks_per_rank * num_n_blocks;
+        const uint32_t total_tiles = tiles_per_rank * kNumRanks;
+
+        if (block_idx >= total_tiles)
             return false;
-        m_block_idx = block_idx / num_n_blocks;
-        n_block_idx = block_idx - m_block_idx * num_n_blocks;
+
+        // Map block_idx to (rank_step, within_rank_tile)
+        const uint32_t rank_step = block_idx / tiles_per_rank;
+        const uint32_t within = block_idx % tiles_per_rank;
+
+        // Compute order: rank_idx, (rank_idx-1+n)%n, (rank_idx-2+n)%n, ...
+        const uint32_t src_rank = (rank_idx + kNumRanks - rank_step) % kNumRanks;
+
+        const uint32_t local_m_block = within / num_n_blocks;
+        n_block_idx = within - local_m_block * num_n_blocks;
+        m_block_idx = src_rank * num_m_blocks_per_rank + local_m_block;
+
         block_idx += kNumSMs;
         ++ iter_idx;
         return true;
     };
 
-    // ── TMA Load Warp (W4): loads A from slots + B ──
+    // ── W4: Load A Warp — poll flag + TMA load A ──
     if (warp_idx == kGemmWarpBase and cute::elect_one_sync()) {
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
-            // Which slot does this M-tile come from?
             const uint32_t src_rank = global_m / runtime_m_per_rank;
             const uint32_t local_m = global_m - src_rank * runtime_m_per_rank;
 
-            // Wait for this rank's data to arrive in our slot
-            while (ptx::ld_acq_sys(workspace.get_slot_state_ptr(src_rank)) == 0);
+            // Poll: wait until all SMs finished pushing this slot
+            while (ptx::ld_acq_sys(workspace.get_slot_state_ptr(src_rank)) < kNumSMs);
 
-            const uint32_t n_idx = n_block_idx * BLOCK_N;
-            // TMA coordinate: slot_m indexes into the concatenated slots buffer
             const uint32_t slot_m = src_rank * shape_m_per_rank + local_m;
             const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
@@ -253,15 +271,29 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t>(
                     &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, slot_m, 1);
-                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 1);
-                full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+                full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
             }
         }
     }
 
-    // ── MMA Issue Warp (W5) ──
-    else if (warp_idx == kGemmWarpBase + 1 and is_leader_cta) {
+    // ── W5: Load B Warp — TMA load B (no flag polling) ──
+    else if (warp_idx == kGemmWarpBase + 1 and cute::elect_one_sync()) {
+        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
+        while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+            const uint32_t n_idx = n_block_idx * BLOCK_N;
+            const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                const uint32_t k_idx = k_block_idx * BLOCK_K;
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
+                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 1);
+                full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
+            }
+        }
+    }
+
+    // ── W6: MMA Issue Warp — UMMA tensor core ──
+    else if (warp_idx == kGemmWarpBase + 2 and is_leader_cta) {
         auto instr_desc = cute::UMMA::make_instr_desc<ab_dtype_t, ab_dtype_t, float,
                                                        UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
         auto a_desc = make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
@@ -302,7 +334,9 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
         }
     }
 
-    // ── Epilogue Warps (W8-W11): TMEM → smem → TMA store to output ──
+    // ── W7: Reserved / TMEM allocator (idle after init) ──
+
+    // ── W8-W11: Epilogue — TMEM → smem → TMA 2D store to output ──
     else if (warp_idx >= (kNumA2AThreads + kNumNonEpilogueThreads) / 32 and
                warp_idx < (kNumA2AThreads + kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
         const auto epilogue_warp_idx = warp_idx - (kNumA2AThreads + kNumNonEpilogueThreads) / 32;

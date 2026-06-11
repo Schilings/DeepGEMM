@@ -1,90 +1,99 @@
-# All2All + GEMM 融合算子设计
+# A2A+GEMM 融合算子设计 (Ulysses SP: All2All + Wo GEMM)
 
-## 目标场景
+## 场景
 
-**Ulysses Sequence Parallelism** — Attention 计算后的 All2All + Wo GEMM：
-
-```
-Attention 输出: x[seq/tp, num_heads, head_dim]  (每 rank 有部分 sequence，所有 heads)
-                    ↓
-            All2All (head 维度 → sequence 维度重分布)
-                    ↓
-Wo GEMM 输入: x'[seq, num_heads/tp, head_dim]  (每 rank 有所有 sequence，部分 heads)
-              = x'[seq, K]  where K = num_heads/tp * head_dim
-                    ↓
-            Wo GEMM: x'[seq, K] × Wo[K, N]
-                    ↓
-输出: y[seq, N]  (每 rank 独立，无需 reduce)
-```
-
-## 与 AG+GEMM 的对比
-
-| | AG+GEMM | A2A+GEMM |
-|--|---------|----------|
-| 通信 pattern | rank i 广播 x[i] 给所有 rank | rank i 发 x[i→j] 给 rank j (各不同) |
-| 数据到达 | per-rank: rank j 的整块 M 数据 | per-rank: rank j 发来的一块 M 数据 |
-| A 矩阵组装 | slots[rank] = 同一数据的不同 M slice | slots[rank] = 不同 rank 发来的不同 M slice |
-| B 矩阵 | 所有 rank 相同的 [N, K] | 所有 rank 相同的 Wo[K, N] |
-| 输出 | 各 rank 取不同 M slice | 各 rank 得到完整 [seq, N] |
-| GEMM 触发 | slot[j] ready → 算 M[j*M/tp : (j+1)*M/tp, :] | slot[j] ready → 算 M[j*seq/tp : (j+1)*seq/tp, :] |
-
-**结论：实现几乎完全相同**，只是 Comm warps 的数据搬运逻辑不同（scatter vs broadcast）。
-
-## 通信 Warps 设计
-
-AG+GEMM 的 Comm warps 执行 Ring All-Gather：
-- Step 0: local copy x → slot[rank_idx]
-- Step k: 从 prev_rank 拷贝 slot[src] → next_rank 的 slot[src]
-
-A2A+GEMM 的 Comm warps 执行 P2P All-to-All：
-- 每个 rank 有 tp 份数据，第 j 份要发给 rank j
-- 实现方式 1 (P2P Direct): rank i 直接 NVLink write 到 rank j 的 slot[i]
-- 实现方式 2 (Ring): Ring All-to-All (类似 NCCL)
-
-**推荐 P2P Direct**（NVLink Gen5 全连接，无需 ring relay）：
-```
-for dst_rank in range(num_ranks):
-    if dst_rank == rank_idx:
-        local copy: input[dst_rank] → slot[rank_idx]  (本地)
-    else:
-        NVLink write: input[dst_rank] → remote slot[rank_idx] on dst_rank
-    set slot_state[rank_idx] = 1 on dst_rank
-```
-
-## 内存布局
+Ulysses Sequence Parallelism: Attention 输出后做 All2All（head→sequence 重分布）+ Wo GEMM。
 
 ```
-Workspace per rank:
-┌──────────────────────────────────────────┐
-│ barrier_signals (32B)                     │
-│ slot[0]: 来自 rank 0 的数据 [M/tp, K]     │
-│ slot[1]: 来自 rank 1 的数据 [M/tp, K]     │
-│ ...                                       │
-│ slot[tp-1]: 来自 rank tp-1 的数据          │
-│ slot_state[0..tp-1]: ready flags          │
-└──────────────────────────────────────────┘
-
-输入 (per rank):
-  x[M, K]  where M = seq (total), K = num_heads * head_dim
-  其中 x 被切成 tp 份 (每份 M/tp × K)，第 j 份要发给 rank j
-
-输出:
-  y[M, N]  (各 rank 独立)
+Attention → x[seq/tp, all_heads, dim]
+         → All2All → x'[seq, heads/tp, dim]
+         → Wo GEMM → y[seq, hidden]
 ```
 
-## Tile 调度
+## 核心设计：Ring-Push + Compute Overlap
 
-与 AG+GEMM 完全相同：
-- 固定遍历所有 (m_block, n_block) tiles
-- TMA Load warp 在加载 tile 前检查 slot_state[src_rank]
-- src_rank = m_block_idx / (M/tp / BLOCK_M)
+### Rank 层次调度
 
-## 实现计划
+对于 n 个 ranks，rank i：
 
-1. 基于 `sm100_bf16_ag_gemm.cuh` 复制创建 `sm100_bf16_a2a_gemm.cuh`
-2. 修改 Comm warps: Ring All-Gather → P2P All-to-All scatter
-3. 修改 Workspace 布局: 输入数据分 tp 份
-4. 创建 JIT runtime `sm100_bf16_a2a_gemm.hpp`
-5. 创建 Python API `deep_gemm/a2a_gemm/__init__.py`
-6. 创建测试 `tests/test_a2a_gemm.py`
-7. 创建 benchmark `benchmarks/bench_a2a_gemm.py`
+**计算顺序**（GEMM pipeline）：`i, (i-1+n)%n, (i-2+n)%n, ..., (i+1)%n`
+- 先算 self（无通信依赖，零等待）
+- 再按逆序算远端数据（先到的先算）
+
+**通信顺序**（Push warps）：`(i+1)%n, (i+2)%n, ..., (i+n-1)%n, i`
+- 先 push 远端（越早到达越好）
+- self copy 最后做（反正 GEMM 先算 self）
+
+### 4 Ranks 示例 (rank 0)
+
+**通信**:
+```
+Step 0: push local_x[1] → rank 1 的 slot[0]
+Step 1: push local_x[2] → rank 2 的 slot[0]
+Step 2: push local_x[3] → rank 3 的 slot[0]
+Step 3: local_x[0] → 本地 slot[0] (self copy)
+```
+
+**计算**（src_rank 顺序: 0, 3, 2, 1）:
+```
+Round 0: src_rank=0 (self, 无等待)   → m_blocks (0,1), n_blocks (0..3)
+Round 1: src_rank=3 (等 slot[3])     → m_blocks (6,7), n_blocks (0..3)
+Round 2: src_rank=2 (等 slot[2])     → m_blocks (4,5), n_blocks (0..3)
+Round 3: src_rank=1 (等 slot[1])     → m_blocks (2,3), n_blocks (0..3)
+```
+
+### 为什么这个顺序最优
+
+通信和计算形成完美流水线对齐：
+- Rank 3 第一个 push 给 rank 0 → rank 0 第二轮算 rank 3
+- Rank 2 第二个 push 给 rank 0 → rank 0 第三轮算 rank 2
+- Rank 1 最后 push 给 rank 0 → rank 0 最后算 rank 1
+
+**先到的数据先被计算！**
+
+## 5 类 Warp 架构
+
+| Warp | 线程数 | 角色 | 调度依据 |
+|------|--------|------|---------|
+| W0-W3 | 128T | **Push** | 通信顺序，全 SM 协作 strided copy，atomic counter signal |
+| W4 | 32T | **Load A** | 计算顺序，poll slot_state → TMA load A from slot |
+| W5 | 32T | **Load B** | 计算顺序，无脑 TMA load B（不等 flag） |
+| W6 | 32T | **MMA Issue** | UMMA tensor core |
+| W7 | 32T | **Reserved** | TMEM allocator |
+| W8-W11 | 128T | **Epilogue** | TMEM → smem → TMA 2D store to output |
+
+总线程 = 128 + 128 + 128 = **384T = 12 warps**
+
+### Load A vs Load B 分离
+
+- Load A 依赖通信（poll slot_state[src_rank] >= kNumSMs）
+- Load B 不依赖通信（权重矩阵始终可用）
+- 分离后 B 可以提前加载，不被 A 的 polling 阻塞
+
+### Push Warps 工作方式
+
+- 按 chunk 粒度（整个 M_per_rank × K 矩阵块）
+- 所有 SM 的 push warps 全局 strided 协作搬运
+- 每搬完一个 chunk，每个 SM 的 thread 0 做 `red_add_rel(remote_flag, 1)`
+- 当 flag == kNumSMs 时该 slot 完全 ready
+- Push warps 完成后 idle，不影响 GEMM pipeline
+
+### Flag 机制
+
+- `slot_state[src_rank]`: uint32_t atomic counter
+- Push: 每个 SM 写完一个 chunk 后 `red_add_rel(flag, 1)`
+- Load A: `while (ld_acq_sys(slot_state[src_rank]) < kNumSMs)` 轮询
+- Self-rank: push warps 做完 self-copy 后 flag 自然到 kNumSMs
+
+## 时间线
+
+```
+Push:   [push→rank1][push→rank2][push→rank3][self]  ← 全程与 GEMM 并行
+GEMM:   [self tiles ][rank3 tiles][rank2 tiles][rank1 tiles]
+         ↑零等待      ↑rank3 先到   ↑rank2 第二   ↑rank1 最后
+```
+
+## multicast
+
+暂时 multicast=1（单 CTA），后续可加 2-CTA cluster。
+2-CTA 时 Load A 需要等 256 行（2×BLOCK_M）ready。
