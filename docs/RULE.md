@@ -116,7 +116,9 @@ Push after every iteration to prevent data loss from server crashes.
 
 - NVIDIA GPU + CUDA PyTorch
 - Python >= 3.10
-- `ncu`（Nsight Compute）— 推荐，缺失时仍可运行但不做 profiling
+- **`ncu`（Nsight Compute）— 必须安装**，AKO4ALL 依赖 ncu 做 kernel profiling
+  - 安装脚本：`bash dev/startup/install_ncu.sh`（自动检测 + 多回退方案）
+  - 手动安装：`apt install -y nsight-compute-cli`（NVIDIA devtools repo 已配置时）
 - Git
 
 ### HINTS.md 常用配置
