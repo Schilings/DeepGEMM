@@ -10,6 +10,7 @@
 | 3 | Parallel TMA store (128 threads) | 0.388x | 0.538x | ✅ +7.2% |
 | 4 | kNumTMAStoreStages 2→3 | 0.418x | 0.786x | ✅ +7.7% |
 | 5 | Pre-compute base ptr in reduce (reverted) | 0.385x | 0.513x | ❌ -7.9% regression |
+| 6 | Remove unused Comm smem buffer (+1 pipeline stage) | 0.487x | 1.694x | ✅✅ +16.5%! First >1x! |
 
 ## Analysis after Iter 1-2
 

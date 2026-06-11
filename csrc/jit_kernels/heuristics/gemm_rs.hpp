@@ -145,10 +145,9 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int smem_a_per_stage = load_block_m * block_k * elem_size_ab;
     const int smem_b_per_stage = load_block_n * block_k * elem_size_ab;
 
-    // Comm fetch buffer: full tile per stage for TMA pull
-    const int smem_comm = block_m * store_block_n * (is_fp8 ? 1 : 2) * kNumCommFetchStages;
-    // Comm fetch barriers
-    const int smem_comm_barriers = kNumCommFetchStages * 8;
+    // Comm fetch buffer: currently unused (comm warps do direct P2P global loads)
+    const int smem_comm = 0;
+    const int smem_comm_barriers = 0;
 
     const int barriers_per_stage = 2;  // full + empty
     const int smem_barriers_fixed = kNumEpilogueStages * 2 * 8 + 4;  // tmem barriers + tmem ptr

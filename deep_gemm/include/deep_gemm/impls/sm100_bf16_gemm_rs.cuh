@@ -157,10 +157,10 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;
     constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols>();
 
-    // Comm warp smem: buffer for TMA fetching remote tiles (per-rank pipeline)
-    // One full tile per stage: BLOCK_M × STORE_BLOCK_N elements in comm_dtype_t
-    constexpr uint32_t SMEM_COMM_SIZE_PER_STAGE = BLOCK_M * STORE_BLOCK_N * sizeof(comm_dtype_t);
-    constexpr uint32_t SMEM_COMM_SIZE = SMEM_COMM_SIZE_PER_STAGE * kNumCommFetchStages;
+    // Comm warp smem: currently unused (comm warps do direct P2P global loads)
+    // Kept as zero to maximize pipeline stages for TMA A/B loads.
+    constexpr uint32_t SMEM_COMM_SIZE_PER_STAGE = 0;
+    constexpr uint32_t SMEM_COMM_SIZE = 0;
 
     // Register budget validation (MegaMoE style)
     constexpr uint32_t kNumCommRegisters = 48;
