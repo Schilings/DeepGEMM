@@ -100,6 +100,13 @@ from .ag_gemm import (
     bf16_ag_gemm_nt_hopper,
 )
 
+# A2A+GEMM kernels (Ulysses SP)
+from .a2a_gemm import (
+    BF16A2AGemmSymmBuffer,
+    get_symm_buffer_for_a2a_gemm,
+    bf16_a2a_gemm_nt,
+)
+
 
 
 
