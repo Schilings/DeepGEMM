@@ -418,16 +418,14 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t base_row = my_m_block * BLOCK_M;
             const uint32_t base_col = my_n_block * BLOCK_N;
 
-            // ── Phase 1: Wait for ALL ranks' ready flags ──
-            // Distributed polling: each comm warp's lane 0 handles a subset of ranks.
-            // This parallelizes the NVLink P2P flag reads across 4 warps.
+            // ── Phase 1: Wait for ALL ranks' ready flags (PUSH mode: flags are LOCAL) ──
+            // In push mode, remote ranks write flags INTO our local buffer.
+            // All flags are local reads — no NVLink latency!
             if (lane_idx == 0) {
-                // Each of the 4 comm warps polls kNumRanks/4 ranks (round-robin assignment)
                 for (uint32_t rank_iter = comm_warp_local_idx; rank_iter < kNumRanks; rank_iter += kNumCommWarps) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
-                    auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
-                    const uint32_t* poll_ptr = (src_rank != rank_idx) ?
-                        sym_buffer.map(local_ready_ptr, src_rank) : local_ready_ptr;
+                    // Poll LOCAL flag: src_rank's slot in OUR flag array
+                    auto* poll_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
 
                     constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
                     const auto start_clock = clock64();
@@ -440,7 +438,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     }
                 }
             }
-            // All comm threads sync after distributed polling completes
+            // All comm threads sync after polling completes
             cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
 
             // ── Phase 2: Reduce all ranks and write output (NO more syncs!) ──
@@ -464,21 +462,17 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 for (uint32_t i = 0; i < kVecSize; ++ i)
                     acc[i] = 0.0f;
 
-                // Accumulate ALL ranks' contributions
+                // Accumulate ALL ranks' contributions (PUSH mode: all reads are LOCAL)
+                // Each rank's partial data has been pushed into our local buffer at slot[src_rank]
                 #pragma unroll 1
                 for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
 
-                    // Get pointer to src_rank's partial data for this vector
-                    const comm_dtype_t* partial_ptr;
-                    if (src_rank == rank_idx) {
-                        partial_ptr = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
-                    } else {
-                        auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
-                        partial_ptr = sym_buffer.map(local_ptr, src_rank);
-                    }
+                    // LOCAL read: src_rank's slot in OUR partial buffer
+                    const comm_dtype_t* partial_ptr =
+                        workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
 
-                    // Vectorized P2P load (16 bytes)
+                    // Vectorized LOCAL HBM load (16 bytes) — no NVLink!
                     uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
                     const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
 
@@ -746,7 +740,9 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         constexpr uint32_t kVecsPerRow = STORE_BLOCK_N / kVecElems;
                         constexpr uint32_t kTotalVecs = STORE_BLOCK_M * kVecsPerRow;
 
-                        // Each thread handles multiple vectors across the tile
+                        // Each thread handles multiple vectors across the tile.
+                        // PUSH mode: write to REMOTE rank's buffer (dst_rank receives our partial)
+                        // We write to dst_rank's buffer at slot[rank_idx] (our rank's slot in their buffer)
                         for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
                             const uint32_t row = vid / kVecsPerRow;
                             const uint32_t col_vec = vid - row * kVecsPerRow;
@@ -756,10 +752,13 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                                 smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
                             uint4 data = *src;
 
-                            // Store to global partial buffer
-                            comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                dst_rank, base_row + row, base_col + col_vec * kVecElems);
-                            *reinterpret_cast<uint4*>(dst_ptr) = data;
+                            // Store to REMOTE rank's partial buffer:
+                            // dst_rank's buffer, slot = rank_idx (sender's slot), at (row, col)
+                            auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(
+                                rank_idx, base_row + row, base_col + col_vec * kVecElems);
+                            auto* remote_ptr = (dst_rank != rank_idx) ?
+                                sym_buffer.map(local_ptr, dst_rank) : local_ptr;
+                            *reinterpret_cast<uint4*>(remote_ptr) = data;
                         }
                     }
 
@@ -772,12 +771,13 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             // NamedBarrier ensures all threads' global stores are issued.
             // threadfence_system ensures they're visible across NVLink.
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                // Set ready flag: other ranks can now pull this tile from us.
-                // st_rel_sys provides release semantics — paired with Comm warp's ld_acq_sys,
-                // this guarantees all prior stores (partial buffer) are visible to the observer.
-                // No __threadfence_system() needed (release-acquire pair is sufficient).
-                auto* ready_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
-                ptx::st_rel_sys(ready_ptr, 1u);
+                // PUSH mode: set ready flag in REMOTE rank's flag array.
+                // Flag at dst_rank's buffer: slot=rank_idx (sender), tile=(m_block, n_block)
+                auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
+                auto* remote_flag_ptr = (dst_rank != rank_idx) ?
+                    reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag_ptr, dst_rank)) : local_flag_ptr;
+                __threadfence_system();  // Ensure NVLink writes are visible before flag
+                ptx::st_rel_sys(remote_flag_ptr, 1u);
             }
         }
     }

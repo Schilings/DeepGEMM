@@ -16,6 +16,7 @@
 | 9 | Replace TMA 1D store with vectorized global STG | 0.654x | 2.087x | ✅✅ +8.8%! 6/21 wins! |
 | 10 | Reduce CD stages 2→1 (reverted) | 0.540x | 2.324x | ❌ -17.4% (need double-buffer for TMEM→smem) |
 | 11 | Remove __threadfence_system (use release-acquire) | 0.62x | ~3.7x | ✅ neutral/slight improvement |
+| 12 | **v2 PUSH-BASED** (Flux-inspired architecture change) | **0.927x** | **7.0x** | ✅✅✅✅ +42%! BREAKTHROUGH! |
 
 ## Analysis after Iter 1-2
 
