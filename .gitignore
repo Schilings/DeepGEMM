@@ -26,3 +26,6 @@ deep_gemm/*.so
 # SSH scripts
 koala-ssh.ps1
 koala-ssh.bat
+
+# Dev directory
+dev/
