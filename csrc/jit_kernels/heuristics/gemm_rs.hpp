@@ -44,15 +44,15 @@ struct GemmRSConfig {
 };
 
 // ════════════════════════════════════════════════════════════════
-//  Pull-based single-kernel GEMM + RS 配置
+//  Push-based single-kernel GEMM + RS 配置
 //
-//  Warp layout (aligned with standard GEMM):
-//    W0~W3: Comm (Dispatch) Warps — 128T, 48 regs — pull + per-rank reduce
+//  Warp layout (MegaMoE style):
+//    W0~W3: Comm (Dispatch) Warps — 128T, 48 regs — poll local flags + reduce + write output
 //    W4: TMA Load Warp (A+B) — 32T, 40 regs — unified TMA multicast load
 //    W5: Reserved — 32T, 40 regs
 //    W6: MMA Issue Warp — 32T, 40 regs — single-warp UMMA (Blackwell)
 //    W7: Reserved — 32T, 40 regs
-//    W8~W11: Epilogue Warps — 128T, 208 regs — TMEM → smem → local partial + flag
+//    W8~W11: Epilogue Warps — 128T, 208 regs — TMEM → smem → NVLink push + flag
 //
 //  Total: 128 + 128 + 128 = 384 threads = 12 warps
 //  Registers: 48×128 + 40×128 + 208×128 = 6144 + 5120 + 26624 = 37888 (within SM100 max 64512)
@@ -68,11 +68,11 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const bool is_fp8 = (elem_size_ab == 1);
 
     // MegaMoE-style warp allocation:
-    //   Comm Warps (W0-W3): 128 threads, 48 regs — per-rank pipelined pull + reduce
-    //   Non-Epilogue (W4-W7): 128 threads, 40 regs — TMA Load A, TMA Load B, MMA Issue, Reserved
-    //   Epilogue (W8-W11): 128 threads, 208 regs — TMEM → local partial + ready flag
+    //   Comm Warps (W0-W3): 128 threads, 48 regs — poll local flags + vectorized reduce + write
+    //   Non-Epilogue (W4-W7): 128 threads, 40 regs — TMA Load A+B, MMA Issue, Reserved
+    //   Epilogue (W8-W11): 128 threads, 208 regs — TMEM → smem → NVLink push store
     constexpr int num_comm_threads = 128;           // W0-W3: Comm/Dispatch warps
-    constexpr int num_non_epilogue_threads = 128;   // W4-W7: Load A + Load B + MMA + Reserved
+    constexpr int num_non_epilogue_threads = 128;   // W4-W7: Load + MMA + Reserved
     constexpr int num_epilogue_threads = 128;       // W8-W11: Epilogue (1 warpgroup, 4 warps)
     // Total = 384 threads = 12 warps
 

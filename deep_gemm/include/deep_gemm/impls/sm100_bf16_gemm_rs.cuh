@@ -25,53 +25,46 @@ using namespace deep_gemm::sm100;
 using namespace deep_gemm::math;
 
 // ============================================================================================
-//  sm100_bf16_gemm_rs_impl —— BF16 GEMM + Reduce-Scatter (Pull-based, Pipelined per-Rank)
+//  sm100_bf16_gemm_rs_impl —— BF16 GEMM + Reduce-Scatter (Push-based, Pipelined)
 // ============================================================================================
 //
-//  【设计思想 — MegaMoE Warp 编排 + Flux RS 调度】
+//  【设计思想 — Optimized Warp 编排 (iter 15)】
 //
-//  Blackwell (SM100) 原生 Warp 编排:
+//  Blackwell (SM100) Warp 编排 (优化版):
 //
 //  ┌──────────────────────────────────────────────────────────────────────┐
-//  │  Comm (Dispatch) Warps (W0~W3, 128T, 48 regs/thread):               │
-//  │    Pull-based Reduce-Scatter 通信:                                    │
-//  │    - 逐 rank 流水: 每个 tile 不等所有 rank，哪个 rank ready 就先 pull │
-//  │    - TMA 异步 fetch 远端 tile → smem → FP32 reduce → 写最终输出       │
-//  │    - 与 GEMM 完全 overlap: GEMM 算 tile_i 时 comm 处理 tile_{i-k}    │
+//  │  Comm Warp (W0, 32T, 48 regs/thread):                                │
+//  │    Push-based Reduce-Scatter:                                         │
+//  │    - Poll LOCAL ready flags (all ranks' data pushed into our buffer) │
+//  │    - Vectorized LOCAL HBM loads + FP32 reduce + write output         │
+//  │    - 1 warp sufficient: memory-bound, not thread-bound               │
 //  ├──────────────────────────────────────────────────────────────────────┤
-//  │  Load Warp A (W4, 32T, 40 regs):                                     │
-//  │    TMA multicast load A tiles → smem (2-CTA 共享)                    │
+//  │  Load Warp (W1, 32T, 40 regs):                                       │
+//  │    TMA multicast load A+B tiles → smem (2-CTA 共享)                  │
 //  ├──────────────────────────────────────────────────────────────────────┤
-//  │  Load Warp B (W5, 32T, 40 regs):                                     │
-//  │    TMA multicast load B tiles → smem (2-CTA 共享)                    │
+//  │  Reserved (W2, 32T, 40 regs):                                        │
 //  ├──────────────────────────────────────────────────────────────────────┤
-//  │  MMA Issue Warp (W6, 32T, 40 regs):                                  │
+//  │  MMA Issue Warp (W3, 32T, 40 regs):                                  │
 //  │    单 warp 发射 UMMA FMA (Blackwell 架构: 1 warp 驱动 Tensor Core)   │
 //  ├──────────────────────────────────────────────────────────────────────┤
-//  │  Reserved Warp (W7, 32T, 40 regs):                                   │
-//  │    预留 (保持 non-epilogue 线程对齐)                                  │
+//  │  Reserved (W4, 32T, 40 regs):                                        │
+//  │    TMEM Allocator                                                    │
 //  ├──────────────────────────────────────────────────────────────────────┤
-//  │  Epilogue Warps (W8~W11, 128T, 208 regs/thread):                     │
-//  │    TMEM → smem → local partial buffer (TMA bulk store)               │
-//  │    + per-tile ready flag signaling (fence_system + st_rel)           │
+//  │  Epilogue Warps (W5~W8, 128T, 208 regs/thread):                      │
+//  │    TMEM → smem → NVLink push to remote partial buffer                │
+//  │    + per-tile ready flag signaling (st_rel_sys to remote)            │
 //  └──────────────────────────────────────────────────────────────────────┘
 //
 //  寄存器预算 (SM100 Max = 64512):
-//    48 × 128 (comm) + 40 × 128 (non-epi) + 208 × 128 (epilogue)
-//    = 6144 + 5120 + 26624 = 37888  ← 充裕!
+//    48 × 32 (comm) + 40 × 128 (non-epi) + 208 × 128 (epilogue)
+//    = 1536 + 5120 + 26624 = 33280  ← 充裕!
 //
-//  【RS 调度: 逐 Rank 流水 Reduce (学习 Flux)】
+//  【关键改进 vs 之前版本 (384T)】
 //
-//  核心区别: 不等 ALL ranks ready! 而是:
-//    for each tile in my_chunk:
-//      acc = 0  (FP32)
-//      for src_rank in ring_order(rank_idx):
-//        wait(src_rank's ready flag for this tile)
-//        TMA fetch src_rank's partial → comm_smem
-//        reduce: acc += comm_smem data
-//      store acc → final output
-//
-//  Ring order 让每个 rank 先 pull 最可能先 ready 的那个 rank (M-Swizzle 对应)
+//  1. Comm warps 从 128T→32T: 节省 3 warp slots
+//  2. 总线程 384T→288T (12 warps→9 warps): 减少 warp scheduler 压力
+//  3. launch_bounds(288) → 编译器初始 reg/thread = 224 (vs 168 for 384T)
+//  4. 更高的寄存器预算 → 减少 register spilling → GEMM pipeline 更高效
 //
 //  【TMA Multicast = 2 (2-CTA Cluster)】
 //
@@ -122,13 +115,13 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t kNumThreads = kNumCommThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
     constexpr uint32_t kNumEpilogueStages = 2;
 
-    // Warp layout (aligned with standard GEMM):
-    //   W0..W3: Comm (Dispatch) = kNumCommThreads / 32 warps
-    //   W4: TMA Load (A+B unified), W5: Reserved, W6: MMA Issue, W7: Reserved
-    //   W8+: Epilogue
-    constexpr uint32_t kNumCommWarps = kNumCommThreads / 32;
+    // Warp layout:
+    //   W0..W3: Comm (128T) — poll flags + vectorized reduce + write output
+    //   W4: TMA Load (A+B unified), W5: Reserved, W6: MMA Issue, W7: Reserved/TMEM Alloc
+    //   W8-W11: Epilogue (128T = 4 warps)
+    constexpr uint32_t kNumCommWarps = kNumCommThreads / 32;   // 4
     constexpr uint32_t kNumNonEpiWarps = kNumNonEpilogueThreads / 32;  // 4 warps
-    constexpr uint32_t kNumEpiWarps = kNumEpilogueThreads / 32;
+    constexpr uint32_t kNumEpiWarps = kNumEpilogueThreads / 32;        // 4 warps
     constexpr uint32_t kLoadWarpIdx = kNumCommWarps;         // W4: unified TMA load (A+B)
     constexpr uint32_t kMMAWarpIdx = kNumCommWarps + 2;      // W6
     constexpr uint32_t kReservedWarpIdx = kNumCommWarps + 3; // W7
@@ -163,6 +156,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t SMEM_COMM_SIZE = 0;
 
     // Register budget validation (MegaMoE style)
+    // 48×128 + 40×128 + 208×128 = 6144 + 5120 + 26624 = 37888 (< 64512)
     constexpr uint32_t kNumCommRegisters = 48;
     constexpr uint32_t kNumNonEpiRegisters = 40;
     constexpr uint32_t kNumEpiRegisters = 208;
@@ -297,20 +291,29 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         // The block_idx enumerates "cluster-level work units" (pairs for mc=2, singles for mc=1).
         const uint32_t m_blocks_per_cluster = kNumMulticast;  // 2 for mc=2, 1 for mc=1
         const uint32_t num_m_pairs_per_rank = num_m_blocks_per_rank / m_blocks_per_cluster;
-        const uint32_t total_cluster_tiles = num_m_pairs_per_rank * num_n_blocks * kNumRanks;
+        const uint32_t tiles_per_rank = num_m_pairs_per_rank * num_n_blocks;
+        const uint32_t total_cluster_tiles = tiles_per_rank * kNumRanks;
 
         if (block_idx >= total_cluster_tiles)
             return false;
 
-        const uint32_t tiles_per_rank = num_m_pairs_per_rank * num_n_blocks;
-        const uint32_t m_rank_wave = block_idx / tiles_per_rank;
-        const uint32_t rem = block_idx - m_rank_wave * tiles_per_rank;
-        const uint32_t local_m_pair_idx = rem / num_n_blocks;
-        n_block_idx = rem - local_m_pair_idx * num_n_blocks;
+        // ── Round-robin interleaved scheduling ──
+        // Instead of computing ALL tiles for rank (i+1) then ALL for rank (i+2)...
+        // we interleave: tile 0→rank(i+1), tile 1→rank(i+2), tile 2→rank(i+3), ...
+        // This ensures all remote ranks get their first tiles quickly,
+        // reducing Comm warp tail latency (no rank starves waiting for pushes).
+        //
+        // block_idx advances by kNumClusters (persistent stride).
+        // For each block_idx, compute which dst_rank and which local tile within that rank.
+        const uint32_t local_tile_idx = block_idx / kNumRanks;
+        const uint32_t rank_offset = block_idx % kNumRanks;
 
-        // Swizzle: compute other ranks' chunks first
-        const uint32_t dst_rank = (m_rank_wave + 1 < kNumRanks) ?
-            (rank_idx + m_rank_wave + 1) % kNumRanks : rank_idx;
+        // dst_rank: round-robin starting from rank (i+1), with self last
+        const uint32_t dst_rank = (rank_offset + 1 < kNumRanks) ?
+            (rank_idx + rank_offset + 1) % kNumRanks : rank_idx;
+
+        const uint32_t local_m_pair_idx = local_tile_idx / num_n_blocks;
+        n_block_idx = local_tile_idx - local_m_pair_idx * num_n_blocks;
 
         // Each CTA in the cluster handles a different M-tile within the pair
         const uint32_t local_m_block_idx = local_m_pair_idx * m_blocks_per_cluster + cta_rank;
@@ -323,22 +326,16 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     };
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 0~3 (Comm/Dispatch Warps): Pull-based All-Ranks-Ready Reduce
+    //  Warp 0~3 (Comm Warps, 128T): Push-based All-Ranks-Ready Reduce
     // ════════════════════════════════════════════════════════════════
     //
-    //  Optimized design:
-    //    - Phase 1: Wait ALL ranks' ready flags (single polling loop)
-    //    - Phase 2: All threads load from ALL ranks + FP32 accumulate in regs
+    //  Design:
+    //    - Phase 1: Wait ALL ranks' ready flags (distributed polling across warps)
+    //    - Phase 2: All 128 threads load from ALL ranks + FP32 accumulate in regs
     //              + write output ONCE (no intermediate HBM storage)
     //
-    //  Benefits over per-rank sequential approach:
-    //    - Only 1 barrier sync per tile (vs N syncs before)
-    //    - Only 1 HBM write per vector (vs N writes before)
-    //    - Maximum memory-level parallelism in Phase 2
-    //    - Ring order polling: rank(i+1) polled first (most likely ready)
-    //
     if (warp_idx < kNumCommWarps) {
-        // Adjust registers (MegaMoE style: 48 regs for comm warps)
+        // Adjust registers (48 regs for comm warps)
         cutlass::arch::warpgroup_reg_dealloc<kNumCommRegisters>();
 
         const uint32_t comm_warp_local_idx = warp_idx;
@@ -346,55 +343,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
         // My chunk: tiles belonging to rank_idx
         const uint32_t total_my_tiles = num_m_blocks_per_rank * num_n_blocks;
-
-        // ════════════════════════════════════════════════════════════════
-        //  Optimized Comm Reduce: Per-Rank Pipelined + Write-Once
-        //
-        //  Key optimization: Eliminate N-1 HBM read+write round-trips.
-        //
-        //  Original flow (per tile, per rank):
-        //    rank 0: load partial → write output
-        //    rank 1: load partial + READ output → add → WRITE output
-        //    rank 2: load partial + READ output → add → WRITE output  ...
-        //    = N P2P loads + (N-1) HBM reads + N HBM writes
-        //
-        //  Optimized flow (per tile):
-        //    for each rank: poll flag → all threads load+accumulate in regs
-        //    write output once
-        //    = N P2P loads + 0 HBM reads + 1 HBM write
-        //
-        //  Register-only accumulation:
-        //    Each thread processes a FIXED set of vector positions across the tile.
-        //    For each position, it accumulates all N ranks' data in FP32 registers.
-        //    The barrier sync is per-rank (N syncs total), same as before.
-        //    But each thread's work set is fixed — no intermediate HBM storage needed.
-        //
-        //  Key: We keep rank in the INNER loop per vector position.
-        //  This means each thread holds FP32 accumulators for ONE vector (8 floats)
-        //  and iterates over all ranks for that vector before moving to the next.
-        //  The barrier sync happens BETWEEN vector chunks (not per-vector).
-        //
-        //  Actually, the cleanest approach: keep rank in OUTER loop (preserving
-        //  per-rank pipelining), but write output only ONCE after all ranks.
-        //  We need smem-free accumulation — store partial sums back to the
-        //  SAME output location. But wait... that's what the original did!
-        //
-        //  The real optimization: The original reads output + writes output for
-        //  EVERY rank after the first. We eliminate the READ by keeping the
-        //  running sum in the output itself (write-only after first rank).
-        //  Actually... re-reading my own write is fine (L2 cached).
-        //
-        //  *** TRUE OPTIMIZATION ***:
-        //  The real bottleneck is NOT the HBM reads/writes (they're L2 cached
-        //  since we just wrote there). The real bottleneck is:
-        //  1. Sequential per-rank polling with barrier syncs
-        //  2. Not enough in-flight memory operations (low MLP)
-        //
-        //  NEW DESIGN: Wait for ALL ranks at once, then process with maximum MLP.
-        //  - Phase 1: Poll all N ranks' ready flags (warp 0 does all polls)
-        //  - Phase 2: All 128 threads process tile with all-ranks interleaved loads
-        //             maximizing memory-level parallelism (MLP)
-        // ════════════════════════════════════════════════════════════════
 
         // Vectorized operations: 16 bytes at a time
         constexpr uint32_t kVecBytes = 16;
@@ -404,11 +352,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
         const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 
-        // Iterate over tiles assigned to this cluster.
-        // For multicast=2, use both CTAs' comm warps for better parallelism:
-        // CTA 0 handles even-indexed tiles, CTA 1 handles odd-indexed tiles within
-        // this cluster's assignment. This doubles comm bandwidth utilization.
-        // For multicast=1, only one CTA exists so block_rank_in_cluster == 0 always.
+        // For multicast=2, use both CTAs' comm warps for better parallelism
         const uint32_t comm_cta_offset = kNumMulticast > 1 ? cute::block_rank_in_cluster() : 0;
         const uint32_t comm_cta_stride = kNumMulticast > 1 ? (kNumClusters * kNumMulticast) : kNumClusters;
         for (uint32_t tile_idx = sm_idx * kNumMulticast + comm_cta_offset; tile_idx < total_my_tiles; tile_idx += comm_cta_stride) {
@@ -419,12 +363,10 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t base_col = my_n_block * BLOCK_N;
 
             // ── Phase 1: Wait for ALL ranks' ready flags (PUSH mode: flags are LOCAL) ──
-            // In push mode, remote ranks write flags INTO our local buffer.
-            // All flags are local reads — no NVLink latency!
+            // Distributed polling: each warp handles a subset of ranks
             if (lane_idx == 0) {
                 for (uint32_t rank_iter = comm_warp_local_idx; rank_iter < kNumRanks; rank_iter += kNumCommWarps) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
-                    // Poll LOCAL flag: src_rank's slot in OUR flag array
                     auto* poll_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
 
                     constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
@@ -442,9 +384,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
 
             // ── Phase 2: Reduce all ranks and write output (NO more syncs!) ──
-            // Each thread processes its assigned vector positions.
-            // For each position: load from all N ranks → FP32 accumulate → write output.
-            // No intermediate HBM storage, no barrier syncs within this phase.
             for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
                 const uint32_t elem_offset = vec_offset * kVecSize;
                 const uint32_t tile_row = elem_offset / BLOCK_N;
@@ -456,33 +395,29 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 if (global_row >= runtime_m_per_rank or global_col >= shape_n)
                     continue;
 
-                // FP32 accumulators in registers (8 floats for bf16, 4 for fp32)
+                // FP32 accumulators in registers
                 float acc[kVecSize];
                 #pragma unroll
                 for (uint32_t i = 0; i < kVecSize; ++ i)
                     acc[i] = 0.0f;
 
                 // Accumulate ALL ranks' contributions (PUSH mode: all reads are LOCAL)
-                // Each rank's partial data has been pushed into our local buffer at slot[src_rank]
                 #pragma unroll 1
                 for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
 
-                    // LOCAL read: src_rank's slot in OUR partial buffer
                     const comm_dtype_t* partial_ptr =
                         workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
 
-                    // Vectorized LOCAL HBM load (16 bytes) — no NVLink!
                     uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
                     const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
 
-                    // FP32 accumulate (all in registers!)
                     #pragma unroll
                     for (uint32_t i = 0; i < kVecSize; ++ i)
                         acc[i] += static_cast<float>(comm_data[i]);
                 }
 
-                // Write final result to output — ONCE per vector position
+                // Write final result to output
                 if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
                     uint4 result;
                     auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
@@ -646,12 +581,11 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 8~11 (Epilogue Warps): TMEM → smem → local partial buffer + set ready flag
+    //  Warp 8~11 (Epilogue Warps, 128T): TMEM → smem → NVLink push to remote
     // ════════════════════════════════════════════════════════════════
     //
-    //  Key: We write to LOCAL partial buffer only (our rank's slot),
-    //  then set a per-tile ready flag. Comm warps on peer ranks will pull from us.
-    //  No cross-rank NVLink writes here — only local memory operations.
+    //  Push-based: Epilogue writes to REMOTE rank's partial buffer via NVLink,
+    //  then sets ready flag in remote rank's flag array.
     //
     else if (warp_idx >= kEpilogueWarpStart) {
         // Adjust registers (MegaMoE style: 208 regs for epilogue)

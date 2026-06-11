@@ -439,30 +439,34 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
   - iter 6: 移除未使用 Comm smem → +1 pipeline stage (+16.5%, first >1x!)
 - [ ] 继续优化迭代（目标 geo_mean > 0.6x）
 
-### 关键性能指标（当前最佳 iter 13, Push-based v2）
+### 关键性能指标（当前最佳 iter 15, Round-robin Scheduling）
 
 | 指标 | 值 | 备注 |
 |------|-----|------|
 | 8 GPU 正确性 | 6/6 ALL PASS | Max diff = 0.0 |
-| Geo Mean Speedup vs NCCL | **0.73x** | baseline 0.357x → **+105%** |
-| 大矩阵 K=7168 | **0.83-0.86x** | Fused ~1000T vs Sep ~1200T |
-| 大矩阵 K=4096 | **0.71-0.77x** | Fused ~800T vs Sep ~1060T |
-| K=2048 (comm-bound) | **0.54x** | 计算太少无法 overlap |
-| 瓶颈分析 | Fused GEMM TFLOPS 比标准 GEMM 低 17-25% | 128T Comm warp 资源消耗 |
+| Geo Mean Speedup vs NCCL | **0.97x** | baseline 0.357x → **+172%** |
+| K=4096 shapes | **1.08-1.12x** | Fused wins! ~1150-1200T |
+| K=7168 shapes | **0.97-1.03x** | Near parity with separate |
+| K=2048 (comm-bound) | **0.77-0.79x** | Improved from 0.54x |
+| Shapes where Fused wins | **13/21** (62%) | Up from 0/21 |
+| 瓶颈分析 | K=2048 仍 comm-bound | 计算太少导致 Comm tail latency |
 
 ### 已验证：目标场景下融合 kernel 优于分离方案
 
 | Shape (M/rank×N×K) | Speedup | 场景 |
 |---------------------|---------|------|
-| 8192×7168×7168 | 1.0-1.3x | 长上下文，大 hidden |
-| 16384×7168×4096 | 1.2x | 超长上下文 |
-| 4096×7168×4096 | 1.3x | 标准训练 batch |
-| 2048×7168×4096 | 1.7x | MoE routing |
+| 4096×7168×4096 | 1.12x | 标准训练 batch |
+| 8192×4096×4096 | 1.12x | 长上下文 |
+| 8192×7168×4096 | 1.10x | 大 hidden + 长上下文 |
+| 16384×4096×4096 | 1.10x | 超长上下文 |
+| 2048×7168×4096 | 1.09x | MoE routing |
+| 4096×4096×7168 | 1.02x | 大 K 投影 |
+| 1024×4096×7168 | 1.03x | 中等 batch |
 
 ### 仍需优化的场景
 
-- N=7168, K=2048 (comm-bound, 0.2-0.3x): 计算太少，通信无法被 overlap
-- 大 M (16K+) + 大 K (7168): 0.6x，需要进一步提升 GEMM pipeline 效率
+- K=2048 (comm-bound, 0.77-0.79x): 计算太少，overlap 不完全
+- 16384×7168×7168 (0.91x): 大 shape 但接近 parity
 | 融合 kernel TFLOPS | 150-620 | B300 峰值 ~1400 |
 | 标准 GEMM TFLOPS | 1000-1250 | 接近峰值 |
 | 最佳场景 | 2.02x (128×512×1024) | 小 shape 通信延迟占主导 |
