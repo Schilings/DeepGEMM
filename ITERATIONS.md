@@ -6,6 +6,7 @@
 |------|-----------|-----------------|------------|--------|
 | baseline | multicast=2, current code | 0.357x | 0.525x (16384×7168×7168) | ✅ |
 | 1 | Distributed ready flag polling (4 warps) | 0.362x | 0.543x | ✅ +1.4% |
+| 2 | __nanosleep in polling (reverted) | 0.361x | 0.534x | ❌ no improvement |
 
 ## Baseline
 
