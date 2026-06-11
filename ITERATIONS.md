@@ -21,6 +21,7 @@
 | 14 | Direct TMEM→remote (bypass smem, reverted) | 0.469x | 0.656x | ❌ -36% (smem staging needed for parallelism) |
 | 15 | **Round-robin interleaved tile scheduling** | **0.970x** | 1.12x | ✅✅✅ +33%! 13/21 shapes >1x! |
 | 16 | Self-rank direct output write (bypass partial) | **0.982x** | 1.16x | ✅ +1.2%, K=4096 best 1.16x |
+| 17 | TMA async store for NVLink writes (reverted) | N/A | N/A | ❌ NaN: cp.async.bulk.wait_group lacks `.read` semantics for NVLink visibility |
 
 ## Analysis after Iter 1-2
 

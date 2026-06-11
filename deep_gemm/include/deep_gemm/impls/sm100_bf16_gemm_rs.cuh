@@ -638,7 +638,9 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 for (uint32_t s = 0; s < kNumNSlices; ++ s) {
                     auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
 
-                    // Sync before reusing smem CD buffer (ensure prior global stores completed)
+                    // Wait for prior TMA store to release this smem CD buffer (double-buffered)
+                    // tma_store_wait<N-1> allows N-1 groups in flight (1 for double-buffer)
+                    ptx::tma_store_wait<kNumTMAStoreStages - 1>();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     // Phase 1: TMEM → registers → smem
@@ -674,65 +676,54 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                     }
 
-                    // Phase 2: smem → global store (vectorized, parallel)
-                    // For self-rank tiles (dst_rank == rank_idx): write directly to OUTPUT
-                    // For remote tiles: push to remote rank's partial buffer via NVLink
+                    // Phase 2: smem → global via TMA async store (NON-BLOCKING!)
+                    // Each thread issues TMA store for its own rows (parallel TMA issue).
+                    // cp.async.bulk is per-thread — multiple threads can issue simultaneously.
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     {
                         uint32_t base_row = local_m + w * STORE_BLOCK_M;
                         uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
-                        constexpr uint32_t kVecElems = 16 / sizeof(comm_dtype_t);
-                        constexpr uint32_t kVecsPerRow = STORE_BLOCK_N / kVecElems;
-                        constexpr uint32_t kTotalVecs = STORE_BLOCK_M * kVecsPerRow;
 
-                        if (dst_rank == rank_idx) {
-                            // Self-rank: write directly to output (no NVLink, no partial buffer!)
-                            for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
-                                const uint32_t row = vid / kVecsPerRow;
-                                const uint32_t col_vec = vid - row * kVecsPerRow;
+                        cute::tma_store_fence();  // fence: smem writes visible to TMA engine
 
-                                auto* src = reinterpret_cast<const uint4*>(
-                                    smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
-                                uint4 data = *src;
+                        // Distribute rows across all epilogue threads for parallel TMA issue
+                        for (uint32_t row = epilogue_thread_idx; row < STORE_BLOCK_M; row += kNumUMMAStoreThreads) {
+                            const uint32_t global_row = base_row + row;
+                            if (global_row >= runtime_m_per_rank) break;
 
-                                const uint32_t global_row = base_row + row;
-                                const uint32_t global_col = base_col + col_vec * kVecElems;
-                                if (global_row < runtime_m_per_rank and global_col < shape_n) {
-                                    *reinterpret_cast<uint4*>(output + global_row * shape_n + global_col) = data;
-                                }
-                            }
-                        } else {
-                            // Remote rank: push to remote partial buffer via NVLink
-                            for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
-                                const uint32_t row = vid / kVecsPerRow;
-                                const uint32_t col_vec = vid - row * kVecsPerRow;
+                            auto* smem_row = smem_base_ptr + row * kRowBytesPerNSlice;
 
-                                auto* src = reinterpret_cast<const uint4*>(
-                                    smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
-                                uint4 data = *src;
-
+                            if (dst_rank == rank_idx) {
+                                auto* dst = reinterpret_cast<void*>(
+                                    output + global_row * shape_n + base_col);
+                                ptx::tma_store_1d(dst, smem_row, kRowBytesPerNSlice);
+                            } else {
                                 auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                    rank_idx, base_row + row, base_col + col_vec * kVecElems);
+                                    rank_idx, global_row, base_col);
                                 auto* remote_ptr = sym_buffer.map(local_ptr, dst_rank);
-                                *reinterpret_cast<uint4*>(remote_ptr) = data;
+                                ptx::tma_store_1d(remote_ptr, smem_row, kRowBytesPerNSlice);
                             }
                         }
+
+                        cute::tma_store_arrive();  // commit this group of TMA stores
                     }
 
                     tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
                 }
             }
 
-            // ── After all N-slices of this tile are stored, set per-tile ready flag ──
+            // ── Wait ALL TMA stores complete, then set ready flag ──
+            // tma_store_wait<0>: no groups allowed in flight = all done
+            ptx::tma_store_wait<0>();
+            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                 if (dst_rank != rank_idx) {
-                    // Remote tiles: set ready flag in REMOTE rank's flag array via NVLink
                     auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
                     auto* remote_flag_ptr = reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag_ptr, dst_rank));
                     ptx::st_rel_sys(remote_flag_ptr, 1u);
                 } else {
-                    // Self-rank tiles: set LOCAL flag (Comm needs to know output is ready)
                     auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
                     ptx::st_rel_sys(local_flag_ptr, 1u);
                 }
