@@ -695,7 +695,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     // Phase 1: TMEM → registers → smem
-                    // Each CTA reads its own SM's TMEM (hardware-local, 128 rows per SM).
                     if (epilogue_thread_idx < STORE_BLOCK_M) {
                         auto* row_ptr = smem_base_ptr + epilogue_thread_idx * kRowBytesPerNSlice;
 
@@ -722,38 +721,30 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         }
                     }
 
-                    // Release TMEM stage — BOTH CTAs must arrive to satisfy
-                    // tmem_empty_barriers init count of kNumMulticast * kNumUMMAStoreThreads
+                    // Release TMEM stage
                     if (w == kNumMWaves - 1 and s == kNumNSlices - 1) {
                         ptx::tcgen05_before_thread_sync();
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                     }
 
-                    // Phase 2: Copy smem → global partial buffer using vectorized stores.
-                    // Direct STG is simpler and avoids TMA engine queueing overhead.
+                    // Phase 2: smem → remote global store (vectorized, parallel)
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     {
                         uint32_t base_row = local_m + w * STORE_BLOCK_M;
                         uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
-                        constexpr uint32_t kVecElems = 16 / sizeof(comm_dtype_t);  // 8 for bf16
+                        constexpr uint32_t kVecElems = 16 / sizeof(comm_dtype_t);
                         constexpr uint32_t kVecsPerRow = STORE_BLOCK_N / kVecElems;
                         constexpr uint32_t kTotalVecs = STORE_BLOCK_M * kVecsPerRow;
 
-                        // Each thread handles multiple vectors across the tile.
-                        // PUSH mode: write to REMOTE rank's buffer (dst_rank receives our partial)
-                        // We write to dst_rank's buffer at slot[rank_idx] (our rank's slot in their buffer)
                         for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
                             const uint32_t row = vid / kVecsPerRow;
                             const uint32_t col_vec = vid - row * kVecsPerRow;
 
-                            // Load from smem
                             auto* src = reinterpret_cast<const uint4*>(
                                 smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
                             uint4 data = *src;
 
-                            // Store to REMOTE rank's partial buffer:
-                            // dst_rank's buffer, slot = rank_idx (sender's slot), at (row, col)
                             auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(
                                 rank_idx, base_row + row, base_col + col_vec * kVecElems);
                             auto* remote_ptr = (dst_rank != rank_idx) ?
