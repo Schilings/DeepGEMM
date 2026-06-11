@@ -7,7 +7,7 @@
 > 2. 每个新任务开始前或上下文变长时，重新读取 docs/RULE.md 刷新记忆
 > 3. AKO4ALL 优化时：不用 solution/ 隔离，不创建 opt/ 分支，直接在 main 分支原文件迭代，用项目已有测试和 benchmark，每轮 push
 > 4. 开发目标一：tests/ 多卡正确性测试；目标二：benchmarks/ 多卡性能测试
-> 5. 当前 P0：multicast=2 hang，需先修复
+> 5. 当前状态和 P0 任务见 docs/PROGRESS.md「当前状态」章节，需要实时更新
 
 ---
 
@@ -133,33 +133,7 @@ Triton、CUDA、C++、TileLang、CuTe DSL、Python 等
 
 ---
 
-## 6. 当前状态与最高优先级任务
-
-### 已完成
-
-- [x] Pull-based 单 kernel 融合方案代码 (sm100_bf16_gemm_rs.cuh)
-- [x] JIT 编译 + 启发式 + Python API
-- [x] multicast=1: 8 GPU 正确性 6/6 ALL PASS
-- [x] multicast=1: 8 GPU benchmark (geo_mean=0.34x vs NCCL)
-- [x] 修复 4 个 bug: reg_dealloc 死锁 / slot 寻址 / ready flag race / 测试阈值
-- [x] 修复 multicast=2 scheduler + TMA load + epilogue
-
-### 当前阻塞 — P0
-
-- [ ] **multicast=2 kernel hang**：JIT 编译成功，kernel launch 成功，但 GPU 上死循环（8卡全 100%）
-  - 需排查 mbarrier 同步 / Epilogue ready flag / multicast=2 专有逻辑
-  - 可先强制 `num_multicast=1` 验证基线仍 PASS
-
-### 后续优化 — P1/P2
-
-- [ ] multicast=2 benchmark（预期 GEMM 效率 ~2x）
-- [ ] Comm Warps TMA 化（TMA 1D Load 代替手动 P2P Read）
-- [ ] Warp specialization 重审（3 warpgroup 仅 1 个做 MMA）
-- [ ] Comm Pipeline（2-stage: reduce + prefetch 并行）
-
----
-
-## 7. 核心文件路径
+## 6. 核心文件路径
 
 ```
 === 核心实现 ===
@@ -187,7 +161,7 @@ docs/RULE.md              # 本文件
 
 ---
 
-## 8. 运行命令速查
+## 7. 运行命令速查
 
 ```bash
 # 安装
@@ -214,7 +188,7 @@ git add -A && git commit -m "描述" && git push
 
 ---
 
-## 9. 开发环境
+## 8. 开发环境
 
 - **目标 GPU**: 8× NVIDIA B300 SXM6 (SM100, 80GB HBM3e)
 - **NVLink**: Gen5 (900 GB/s 双向)
