@@ -439,15 +439,16 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
   - iter 6: 移除未使用 Comm smem → +1 pipeline stage (+16.5%, first >1x!)
 - [ ] 继续优化迭代（目标 geo_mean > 0.6x）
 
-### 关键性能指标（当前最佳 iter 11, AKO4ALL 优化后）
+### 关键性能指标（当前最佳 iter 13, Push-based v2）
 
 | 指标 | 值 | 备注 |
 |------|-----|------|
 | 8 GPU 正确性 | 6/6 ALL PASS | Max diff = 0.0 |
-| Geo Mean Speedup vs NCCL | **~0.65x** | baseline 0.357x → **+83%** |
-| Best Speedup | **2-4x** | 小 M shapes |
-| 目标场景 (7168×4096/7168) | **1.0-1.7x** | LLM 训练典型 shapes 已超过分离方案 |
-| Fused wins (>1.0x) | **5-6/21 shapes** | 大 K / 中等 M shapes |
+| Geo Mean Speedup vs NCCL | **0.73x** | baseline 0.357x → **+105%** |
+| 大矩阵 K=7168 | **0.83-0.86x** | Fused ~1000T vs Sep ~1200T |
+| 大矩阵 K=4096 | **0.71-0.77x** | Fused ~800T vs Sep ~1060T |
+| K=2048 (comm-bound) | **0.54x** | 计算太少无法 overlap |
+| 瓶颈分析 | Fused GEMM TFLOPS 比标准 GEMM 低 17-25% | 128T Comm warp 资源消耗 |
 
 ### 已验证：目标场景下融合 kernel 优于分离方案
 
