@@ -1,8 +1,107 @@
 # SM100 2-CTA Cluster BF16 GEMM 计算流程详解
 
-> **最后更新**: 2026-06-10
+> **最后更新**: 2026-06-11
 > **验证脚本**: `debug_cluster_tiles.py`
 > **参考 CUTLASS Tutorial**: `third-party/cutlass/examples/cute/tutorial/blackwell/04_mma_tma_2sm_sm100.cu`
+
+---
+
+## 🧠 从宏观到微观：为什么之前 AI 总在自我怀疑
+
+之前 AI 反复纠结的核心原因：**没有建立从「整个计算在做什么」到「每个硬件单元负责什么」的完整图景**。下面从三层彻底讲清楚。
+
+### 第 1 层：整个计算在做什么？（矩阵乘法视角）
+
+GEMM 就是 `C[M, N] = A[M, K] @ B[K, N]`。把大矩阵切成 tile 后：
+```
+每个 output tile 是 128×128 的 C 子矩阵
+= 128 行 A @ 128 列 B 的转置
+```
+
+**2SM UMMA 做的事**：把两个相邻的 128×128 output tile 合并成一条 256×128 的指令一起算。
+```
+传统方式（2 条独立指令）：
+  CTA0: A[m0:m0+128, :] @ B[:, n0:n0+128] → 128×128 tile_0
+  CTA1: A[m1:m1+128, :] @ B[:, n0:n0+128] → 128×128 tile_1
+
+2SM UMMA（1 条协作指令）：
+  合并: A[m0:m0+256, :] @ B[:, n0:n0+128] → 256×128 大 tile
+  = tile_0 (上 128 行) + tile_1 (下 128 行)
+```
+
+**关键洞察**：2SM UMMA 的 256 行 = 两个 CTA 各自的 128 行拼在一起。它们共享同一组 B 列，但各自有不同的 A 行。
+
+### 第 2 层：Scheduler 怎么给每个 Block 分配 tile？（调度逻辑）
+
+持久化调度模型：所有 SM 反复取 tile，直到所有 tile 算完。
+
+```c++
+// 每个 CTA 每次迭代获取的线性 block_idx
+const auto next_block_idx = (++current_iter) * kNumSMs + blockIdx.x;
+//                                                 ↑ 总 SM 数    ↑ 每个 CTA 唯一
+```
+
+**blockIdx.x 是什么？** 在 2-CTA cluster 模式下：
+- 同一个 cluster 的 2 个 CTA 有**不同的** `blockIdx.x`（硬件保证）
+- 比如 cluster 0 的 CTA0=blockIdx.x 0，CTA1=blockIdx.x 1
+
+**线性 block_idx → (m_block_idx, n_block_idx) 的映射**（`get_swizzled_block_idx`）：
+
+当 `kIsMulticastOnA=false`（我们的默认配置）：
+```
+M 是主维度 (primary)，N 是副维度 (secondary)
+m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group   ← 相邻 in_group_idx → 相邻 m
+n_block_idx = in_group_idx / num_blocks_in_group                     ← 同组内 n 相同
+```
+
+**实例**（假设 num_m_blocks=8, num_n_blocks=4, kNumSMs=4, cluster_m=2）：
+
+| iter | blockIdx.x | block_idx | m_block | n_block | cluster |
+|------|-----------|-----------|---------|---------|---------|
+| 0 | 0 | 0 | 0 | 0 | CTA0 |
+| 0 | 1 | 1 | 1 | 0 | CTA1 ← 和 CTA0 共享 n_block=0，m_block 差 1 |
+| 0 | 2 | 2 | 2 | 0 | CTA0 |
+| 0 | 3 | 3 | 3 | 0 | CTA1 |
+| 1 | 0 | 4 | 4 | 0 | ... |
+| ... | | | | | |
+
+**核心**：`blockIdx.x` 差 1 的两个 CTA，`m_block_idx` 差 1，`n_block_idx` 相同 → 正好组成 2-CTA cluster 所需的「相邻 M-tile，共享 N-tile」。
+
+### 第 3 层：2 个 CTA 怎么协作？（硬件执行视角）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    2-CTA Cluster                         │
+│                                                         │
+│   CTA0 (SM0)              CTA1 (SM1)                    │
+│   m_block=X               m_block=X+1                   │
+│   n_block=Y               n_block=Y                     │
+│                                                         │
+│   ① TMA Load:            ① TMA Load:                    │
+│     A[X*128:(X+1)*128]     A[(X+1)*128:(X+2)*128]       │
+│     → SMEM_A@SM0           → SMEM_A@SM1                 │
+│     B[:,Y*128:Y*128+64]    B[:,Y*128+64:(Y+1)*128]      │
+│     → SMEM_B前半@SM0       → SMEM_B后半@SM1             │
+│                                                         │
+│   ② UMMA (仅 CTA0/warp1 发射):                          │
+│     2SM UMMA 硬件自动读取两个 SM 的 SMEM:                │
+│     SMEM_A@SM0 + SMEM_A@SM1 → 合并 256 行 A             │
+│     SMEM_B@SM0 + SMEM_B@SM1 → 拼接完整 128 列 B         │
+│     → 计算 256×128 输出                                  │
+│                                                         │
+│   ③ Epilogue (各自独立):                                 │
+│     TMEM[0:128] → D[X*128:(X+1)*128]                    │
+│                     TMEM[128:256] → D[(X+1)*128:(X+2)*128]│
+└─────────────────────────────────────────────────────────┘
+```
+
+### 之前 AI 纠结的三个问题 → 确切答案
+
+| 纠结点 | 答案 | 依据 |
+|--------|------|------|
+| 两个 CTA 的 m_block_idx 相同还是不同？ | **不同**。blockIdx.x 不同 → block_idx 不同 → m_block_idx 不同 | scheduler 用 blockIdx.x，不用 cluster_idx |
+| A 行加载：要不要偏移？ | **不需要额外偏移**。scheduler 已给不同 m_block_idx，各自 `m_idx = m_block_idx * BLOCK_M` 就不同 | 标准 GEMM 第 220-223 行确认 |
+| B 列加载：怎么 split？ | **block_rank_in_cluster() 偏移 LOAD_BLOCK_N**。CTA0 加载前 64 列，CTA1 加载后 64 列 | 标准 GEMM `n_idx += block_rank * LOAD_BLOCK_N` |
 
 ---
 
