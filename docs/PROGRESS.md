@@ -483,6 +483,43 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 
 ---
 
+## A2A+GEMM (Ulysses SP: All2All + Wo GEMM)
+
+### 设计思想
+
+详见 `docs/A2A_GEMM_DESIGN.md`。
+
+5 类 warp 架构：
+- Push Warps (W0-W3): ring-push 到远端
+- Load A Warp (W4): poll flag + TMA load A
+- Load B Warp (W5): 无脑 TMA load B
+- MMA Warp (W6): UMMA
+- Epilogue (W8-W11): TMA 2D store
+
+计算顺序：`i, (i-1+n)%n, ..., (i+1)%n`（self 先算）
+通信顺序：`(i+1), (i+2), ..., (i+n-1), self`（remote 先 push）
+
+### 当前状态
+
+- 8 GPU 正确性：6/6 ALL PASS（max_diff = 0.0，精确匹配）
+- Geo Mean：0.772x
+- Fused TFLOPS：650-855T vs Sep 930-1160T
+- 瓶颈：384T launch_bounds 导致 GEMM 吞吐量降低 25-30%
+
+### 文件列表
+
+| 文件 | 作用 |
+|------|------|
+| `deep_gemm/include/deep_gemm/impls/sm100_bf16_a2a_gemm.cuh` | Kernel |
+| `deep_gemm/include/deep_gemm/layout/bf16_a2a_gemm.cuh` | Workspace 布局 |
+| `csrc/jit_kernels/impls/sm100_bf16_a2a_gemm.hpp` | JIT runtime |
+| `csrc/apis/a2a_gemm.hpp` | C++ API |
+| `deep_gemm/a2a_gemm/__init__.py` | Python API |
+| `tests/test_a2a_gemm.py` | 正确性测试 |
+| `benchmarks/bench_a2a_gemm.py` | 性能 benchmark |
+
+---
+
 ## 参考资料
 
 1. **ByteDance Flux** (flux/ 目录): Pull-based RS with per-tile flags, Comm warp specialization
