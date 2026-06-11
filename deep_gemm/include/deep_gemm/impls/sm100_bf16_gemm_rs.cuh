@@ -419,11 +419,11 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t base_col = my_n_block * BLOCK_N;
 
             // ── Phase 1: Wait for ALL ranks' ready flags ──
-            // Warp 0, lane 0 polls all N ranks sequentially in ring order.
-            // Once all are ready, we can process the entire tile without any
-            // further synchronization, maximizing memory-level parallelism.
-            if (comm_warp_local_idx == 0 and lane_idx == 0) {
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
+            // Distributed polling: each comm warp's lane 0 handles a subset of ranks.
+            // This parallelizes the NVLink P2P flag reads across 4 warps.
+            if (lane_idx == 0) {
+                // Each of the 4 comm warps polls kNumRanks/4 ranks (round-robin assignment)
+                for (uint32_t rank_iter = comm_warp_local_idx; rank_iter < kNumRanks; rank_iter += kNumCommWarps) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
                     auto* local_ready_ptr = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
                     const uint32_t* poll_ptr = (src_rank != rank_idx) ?
@@ -440,7 +440,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     }
                 }
             }
-            // Single barrier sync — all comm threads wait until all flags confirmed
+            // All comm threads sync after distributed polling completes
             cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
 
             // ── Phase 2: Reduce all ranks and write output (NO more syncs!) ──

@@ -5,6 +5,7 @@
 | Iter | Direction | Geo Mean Speedup | Best Shape | Status |
 |------|-----------|-----------------|------------|--------|
 | baseline | multicast=2, current code | 0.357x | 0.525x (16384×7168×7168) | ✅ |
+| 1 | Distributed ready flag polling (4 warps) | 0.362x | 0.543x | ✅ +1.4% |
 
 ## Baseline
 
