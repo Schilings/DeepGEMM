@@ -24,6 +24,23 @@
 | 17 | TMA async store, single-thread issue (reverted) | N/A | 0.741x | ❌ 128 per-row tma_store_1d by 1 thread too slow |
 | 18 | **TMA async store, multi-thread parallel issue** | **1.004x** | 1.11x | ✅✅✅ BREAKS 1.0x! K=2048: 0.78→0.84-0.95x |
 
+## Profiling 发现 (iter 18 后)
+
+**Fused GEMM 比标准 GEMM 慢 46.6%**（4096×4096×4096: 1169T vs 1714T）
+
+| 因素 | 标准 GEMM | Fused GEMM-RS | 影响 |
+|------|-----------|---------------|------|
+| 总线程 | 256T (8 warps) | 384T (12 warps) | 128T Comm 占 4 warp slots |
+| 寄存器/线程 | 64512/256=252 | 64512/384=168 | **33% less regs → register spilling** |
+| Epilogue store | TMA 2D (1次) | Per-row TMA 1D (128次) | Store 效率较低 |
+| 额外同步 | 无 | nvlink_barrier ×2 | Grid-level sync overhead |
+| Warp scheduler | 8 warps (全给 GEMM) | 12 warps (4 idle Comm) | Scheduler bandwidth 被稀释 |
+
+**最大嫌疑**：`__launch_bounds__(384, 1)` 导致编译器给每线程只分配 168 寄存器（vs 标准 252），
+register spilling 严重拖慢 GEMM pipeline。这是 fusion kernel 性能不及预期的根本原因。
+
+**优化方向**：减少 register spilling，或减少总线程数（但之前 288T 实验 0.23x 说明需要保持编译器行为一致）。
+
 ## Analysis after Iter 1-2
 
 **Key insight**: The bottleneck is NOT Comm warp efficiency. It's the GEMM pipeline throughput.

@@ -450,7 +450,7 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 | K=7168 + large N | **0.94-0.98x** | Near parity |
 | K=2048 | **0.84-0.95x** | TMA async 大幅改善 (was 0.78x) |
 | Shapes where Fused wins | **13/21** (62%) | |
-| 瓶颈分析 | K=2048 仍是最弱 | TMA async 已解耦 NVLink latency |
+| 瓶颈分析 | Fused GEMM 比标准慢 46.6% | 384T launch_bounds → 168 regs/thread → register spilling |
 
 ### 已验证：目标场景下融合 kernel 优于分离方案
 
