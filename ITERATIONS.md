@@ -20,6 +20,7 @@
 | 13 | Remove __threadfence_system in push epilogue | **0.732x** | 0.88x | ✅ +6.7%, worst 0.54x |
 | 14 | Direct TMEM→remote (bypass smem, reverted) | 0.469x | 0.656x | ❌ -36% (smem staging needed for parallelism) |
 | 15 | **Round-robin interleaved tile scheduling** | **0.970x** | 1.12x | ✅✅✅ +33%! 13/21 shapes >1x! |
+| 16 | Self-rank direct output write (bypass partial) | **0.982x** | 1.16x | ✅ +1.2%, K=4096 best 1.16x |
 
 ## Analysis after Iter 1-2
 
