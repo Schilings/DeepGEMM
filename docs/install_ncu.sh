@@ -30,10 +30,10 @@ else
     echo "NVIDIA devtools 仓库已存在，跳过"
 fi
 
-# 3. 安装 nsight-compute
+# 3. 安装 nsight-compute (优先 nsight-compute 包，CUDA 13+ 已不提供 nsight-compute-cli)
 echo "安装 nsight-compute..."
-apt install -y nsight-compute-cli 2>/dev/null || \
-apt install -y nsight-compute 2>/dev/null || {
+apt install -y nsight-compute 2>/dev/null || \
+apt install -y nsight-compute-cli 2>/dev/null || {
     echo "⚠️  apt 安装失败，尝试从 CUDA toolkit 获取..."
     # 回退方案：检查 CUDA 自带的 ncu
     if [ -f /usr/local/cuda/bin/ncu ]; then
