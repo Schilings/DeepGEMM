@@ -697,9 +697,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 for (uint32_t s = 0; s < kNumNSlices; ++ s) {
                     auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
 
-                    // Wait previous TMA stores
-                    if (epilogue_warp_idx == 0)
-                        cute::tma_store_wait<kNumTMAStoreStages - 1>();
+                    // Wait previous TMA stores (each thread waits its own bulk group)
+                    cute::tma_store_wait<kNumTMAStoreStages - 1>();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     // Phase 1: TMEM → registers → smem
@@ -738,20 +737,19 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     }
 
                     // Phase 2: Issue per-row TMA 1D bulk copies to LOCAL partial buffer
-                    // Each CTA writes its own m_block's data — no conflict between CTAs.
+                    // Parallelized: each epilogue thread handles a subset of rows.
+                    // cp.async.bulk is per-thread, so multiple threads can issue in parallel.
                     cute::tma_store_fence();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
-                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    {
                         uint32_t base_row = local_m + w * STORE_BLOCK_M;
                         uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
 
-                        #pragma unroll 1
-                        for (uint32_t row = 0; row < STORE_BLOCK_M; ++ row) {
-                            // Write to dst_rank's slot in our partial buffer
+                        // Distribute rows across epilogue threads (128 threads, 128 rows → 1 row each)
+                        for (uint32_t row = epilogue_thread_idx; row < STORE_BLOCK_M; row += kNumUMMAStoreThreads) {
                             comm_dtype_t* dst_ptr = workspace.get_partial_ptr<comm_dtype_t>(
                                 dst_rank, base_row + row, base_col);
-
                             auto* src_ptr = smem_base_ptr + row * kRowBytesPerNSlice;
                             ptx::tma_store_1d(dst_ptr, src_ptr, kRowBytesPerNSlice);
                         }
@@ -764,14 +762,14 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
             // ── After all N-slices of this tile are stored, set per-tile ready flag ──
             // Each CTA sets the flag for its own m_block_idx tile.
-            if (epilogue_warp_idx == 0) {
-                cute::tma_store_wait<0>();
-                if (cute::elect_one_sync()) {
-                    // Set ready flag: other ranks can now pull this tile from us
-                    auto* ready_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
-                    __threadfence_system();  // Ensure TMA writes are visible across NVLink
-                    ptx::st_rel_sys(ready_ptr, 1u);
-                }
+            // All threads must wait their stores, then one thread sets the flag.
+            cute::tma_store_wait<0>();
+            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                // Set ready flag: other ranks can now pull this tile from us
+                auto* ready_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
+                __threadfence_system();  // Ensure TMA writes are visible across NVLink
+                ptx::st_rel_sys(ready_ptr, 1u);
             }
         }
     }
