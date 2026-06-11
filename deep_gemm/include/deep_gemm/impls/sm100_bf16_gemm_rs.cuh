@@ -362,8 +362,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             const uint32_t base_row = my_m_block * BLOCK_M;
             const uint32_t base_col = my_n_block * BLOCK_N;
 
-            // ── Phase 1: Wait for ALL ranks' ready flags (PUSH mode: flags are LOCAL) ──
-            // Distributed polling: each warp handles a subset of ranks
+            // ── Phase 1: Wait for ALL ranks' ready flags ──
+            // Including self-rank (ensures Epilogue finished writing output before Comm reads it)
             if (lane_idx == 0) {
                 for (uint32_t rank_iter = comm_warp_local_idx; rank_iter < kNumRanks; rank_iter += kNumCommWarps) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
@@ -383,7 +383,9 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             // All comm threads sync after polling completes
             cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
 
-            // ── Phase 2: Reduce all ranks and write output (NO more syncs!) ──
+            // ── Phase 2: Reduce N-1 remote ranks + existing output (self-rank) ──
+            // Output already contains self-rank's contribution (written by Epilogue).
+            // Load output value + accumulate N-1 remote partials → write back.
             for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
                 const uint32_t elem_offset = vec_offset * kVecSize;
                 const uint32_t tile_row = elem_offset / BLOCK_N;
@@ -395,15 +397,26 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 if (global_row >= runtime_m_per_rank or global_col >= shape_n)
                     continue;
 
-                // FP32 accumulators in registers
-                float acc[kVecSize];
-                #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++ i)
-                    acc[i] = 0.0f;
+                // Load self-rank's contribution from output (already there from Epilogue)
+                auto* out_ptr = output + global_row * shape_n + global_col;
+                uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
 
-                // Accumulate ALL ranks' contributions (PUSH mode: all reads are LOCAL)
+                float acc[kVecSize];
+                if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
+                    const auto* self_bf16 = reinterpret_cast<const cd_dtype_t*>(&self_data);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        acc[i] = static_cast<float>(self_bf16[i]);
+                } else {
+                    const auto* self_f32 = reinterpret_cast<const float*>(&self_data);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        acc[i] = self_f32[i];
+                }
+
+                // Accumulate N-1 remote ranks' contributions from local partial buffer
                 #pragma unroll 1
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks; ++ rank_iter) {
+                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
 
                     const comm_dtype_t* partial_ptr =
@@ -417,21 +430,21 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         acc[i] += static_cast<float>(comm_data[i]);
                 }
 
-                // Write final result to output
+                // Write final reduced result to output
                 if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
                     uint4 result;
                     auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
                     #pragma unroll
                     for (uint32_t i = 0; i < kVecSize; ++ i)
                         out_bf16[i] = cd_dtype_t(acc[i]);
-                    *reinterpret_cast<uint4*>(output + global_row * shape_n + global_col) = result;
+                    *reinterpret_cast<uint4*>(out_ptr) = result;
                 } else {
                     uint4 result;
                     auto* out_f32 = reinterpret_cast<float*>(&result);
                     #pragma unroll
                     for (uint32_t i = 0; i < kVecSize; ++ i)
                         out_f32[i] = acc[i];
-                    *reinterpret_cast<uint4*>(output + global_row * shape_n + global_col) = result;
+                    *reinterpret_cast<uint4*>(out_ptr) = result;
                 }
             }
         }
@@ -661,7 +674,9 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                     }
 
-                    // Phase 2: smem → remote global store (vectorized, parallel)
+                    // Phase 2: smem → global store (vectorized, parallel)
+                    // For self-rank tiles (dst_rank == rank_idx): write directly to OUTPUT
+                    // For remote tiles: push to remote rank's partial buffer via NVLink
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     {
@@ -671,19 +686,37 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         constexpr uint32_t kVecsPerRow = STORE_BLOCK_N / kVecElems;
                         constexpr uint32_t kTotalVecs = STORE_BLOCK_M * kVecsPerRow;
 
-                        for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
-                            const uint32_t row = vid / kVecsPerRow;
-                            const uint32_t col_vec = vid - row * kVecsPerRow;
+                        if (dst_rank == rank_idx) {
+                            // Self-rank: write directly to output (no NVLink, no partial buffer!)
+                            for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
+                                const uint32_t row = vid / kVecsPerRow;
+                                const uint32_t col_vec = vid - row * kVecsPerRow;
 
-                            auto* src = reinterpret_cast<const uint4*>(
-                                smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
-                            uint4 data = *src;
+                                auto* src = reinterpret_cast<const uint4*>(
+                                    smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
+                                uint4 data = *src;
 
-                            auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                rank_idx, base_row + row, base_col + col_vec * kVecElems);
-                            auto* remote_ptr = (dst_rank != rank_idx) ?
-                                sym_buffer.map(local_ptr, dst_rank) : local_ptr;
-                            *reinterpret_cast<uint4*>(remote_ptr) = data;
+                                const uint32_t global_row = base_row + row;
+                                const uint32_t global_col = base_col + col_vec * kVecElems;
+                                if (global_row < runtime_m_per_rank and global_col < shape_n) {
+                                    *reinterpret_cast<uint4*>(output + global_row * shape_n + global_col) = data;
+                                }
+                            }
+                        } else {
+                            // Remote rank: push to remote partial buffer via NVLink
+                            for (uint32_t vid = epilogue_thread_idx; vid < kTotalVecs; vid += kNumUMMAStoreThreads) {
+                                const uint32_t row = vid / kVecsPerRow;
+                                const uint32_t col_vec = vid - row * kVecsPerRow;
+
+                                auto* src = reinterpret_cast<const uint4*>(
+                                    smem_base_ptr + row * kRowBytesPerNSlice + col_vec * 16);
+                                uint4 data = *src;
+
+                                auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(
+                                    rank_idx, base_row + row, base_col + col_vec * kVecElems);
+                                auto* remote_ptr = sym_buffer.map(local_ptr, dst_rank);
+                                *reinterpret_cast<uint4*>(remote_ptr) = data;
+                            }
                         }
                     }
 
@@ -692,18 +725,17 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             }
 
             // ── After all N-slices of this tile are stored, set per-tile ready flag ──
-            // Each CTA sets the flag for its own m_block_idx tile.
-            // NamedBarrier ensures all threads' global stores are issued.
-            // threadfence_system ensures they're visible across NVLink.
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                // PUSH mode: set ready flag in REMOTE rank's flag array.
-                // NVLink preserves write ordering from same source to same destination,
-                // so partial data stores are visible before this flag store.
-                // No __threadfence_system needed.
-                auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
-                auto* remote_flag_ptr = (dst_rank != rank_idx) ?
-                    reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag_ptr, dst_rank)) : local_flag_ptr;
-                ptx::st_rel_sys(remote_flag_ptr, 1u);
+                if (dst_rank != rank_idx) {
+                    // Remote tiles: set ready flag in REMOTE rank's flag array via NVLink
+                    auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
+                    auto* remote_flag_ptr = reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag_ptr, dst_rank));
+                    ptx::st_rel_sys(remote_flag_ptr, 1u);
+                } else {
+                    // Self-rank tiles: set LOCAL flag (Comm needs to know output is ready)
+                    auto* local_flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
+                    ptx::st_rel_sys(local_flag_ptr, 1u);
+                }
             }
         }
     }
