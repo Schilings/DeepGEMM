@@ -432,15 +432,20 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
   - 修复还包含：JIT 编译器 `-gencode arch=compute_100f,code=sm_100f`（CUDA 13 兼容）
   - 验证：8 GPU 正确性 6/6 ALL PASS，性能 benchmark 21 shapes 全部完成
 - [x] multicast=2 性能 benchmark ✅ 完成（见下方结果）
-- [ ] 重审 warp specialization 资源分配（当前 3 warpgroup 中只有 1 个做 MMA）
-- [ ] 性能优化迭代（Comm warp TMA 化、pipeline、vectorized store 等）
+- [x] 性能优化迭代（AKO4ALL，6 iterations）
+  - iter 1: 分布式 polling (+1.4%)
+  - iter 3: 并行 TMA store (+7.2%)
+  - iter 4: kNumTMAStoreStages 2→3 (+7.7%)
+  - iter 6: 移除未使用 Comm smem → +1 pipeline stage (+16.5%, first >1x!)
+- [ ] 继续优化迭代（目标 geo_mean > 0.6x）
 
-### 关键性能指标（multicast=1 基线）
+### 关键性能指标（当前最佳 iter 6）
 
 | 指标 | 值 | 备注 |
 |------|-----|------|
-| 8 GPU 正确性 | 6/6 ALL PASS | 相对误差 ~0.25% |
-| Geo Mean Speedup vs NCCL | 0.34x | 慢于分离方案 |
+| 8 GPU 正确性 | 6/6 ALL PASS | Max diff = 0.0 |
+| Geo Mean Speedup vs NCCL | **0.487x** | baseline 0.357x → +36% |
+| Best Speedup | **1.694x** | 首次超过分离方案！|
 | 融合 kernel TFLOPS | 150-620 | B300 峰值 ~1400 |
 | 标准 GEMM TFLOPS | 1000-1250 | 接近峰值 |
 | 最佳场景 | 2.02x (128×512×1024) | 小 shape 通信延迟占主导 |
