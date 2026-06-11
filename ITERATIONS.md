@@ -13,6 +13,7 @@
 | 6 | Remove unused Comm smem buffer (+1 pipeline stage) | 0.487x | 1.694x | ✅✅ +16.5%! First >1x! |
 | 7 | kNumTMAStoreStages 3→2, pipeline 7→8 stages | 0.601x | 2.196x | ✅✅✅ +23.4%! |
 | 8 | STORE_BLOCK_N=128 + 1 store stage (reverted) | 0.528x | 1.328x | ❌ -12.1% |
+| 9 | Replace TMA 1D store with vectorized global STG | 0.654x | 2.087x | ✅✅ +8.8%! 6/21 wins! |
 
 ## Analysis after Iter 1-2
 
