@@ -133,7 +133,7 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     constexpr int reduce_num_threads = 0;  // No separate reduce kernel needed
 
     // Pipeline stages (with comm fetch stages)
-    constexpr int kNumTMAStoreStages = 2;
+    constexpr int kNumTMAStoreStages = 3;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumCommFetchStages = 2;
 

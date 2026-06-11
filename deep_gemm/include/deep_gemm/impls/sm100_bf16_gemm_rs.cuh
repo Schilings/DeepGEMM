@@ -118,7 +118,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     constexpr uint32_t WAVE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M;
-    constexpr uint32_t kNumTMAStoreStages = 2;
+    constexpr uint32_t kNumTMAStoreStages = 3;
     constexpr uint32_t kNumThreads = kNumCommThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
     constexpr uint32_t kNumEpilogueStages = 2;
 

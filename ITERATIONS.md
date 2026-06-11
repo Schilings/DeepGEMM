@@ -8,6 +8,7 @@
 | 1 | Distributed ready flag polling (4 warps) | 0.362x | 0.543x | ✅ +1.4% |
 | 2 | __nanosleep in polling (reverted) | 0.361x | 0.534x | ❌ no improvement |
 | 3 | Parallel TMA store (128 threads) | 0.388x | 0.538x | ✅ +7.2% |
+| 4 | kNumTMAStoreStages 2→3 | 0.418x | 0.786x | ✅ +7.7% |
 
 ## Analysis after Iter 1-2
 
