@@ -2,6 +2,12 @@
 
 > **服务器 CodeBuddy 专用**：请按以下规则和环境信息执行开发任务。
 > **⏰ 自提醒**：上下文变长时（超过 20 轮对话或开始新任务），必须重新读取本文件刷新记忆。
+> **🧠 首次使用时**：读取本文件后，立即用 update_memory 工具将以下核心规则存入 Memory（标题："DeepGEMM 开发核心规则"），确保后续对话自动记住：
+> 1. 每完成阶段性改动立即 commit + push，服务器经常宕机，不push=代码可能丢失。同时更新 docs/PROGRESS.md
+> 2. 每个新任务开始前或上下文变长时，重新读取 docs/RULE.md 刷新记忆
+> 3. AKO4ALL 优化时：不用 solution/ 隔离，不创建 opt/ 分支，直接在 main 分支原文件迭代，用项目已有测试和 benchmark，每轮 push
+> 4. 开发目标一：tests/ 多卡正确性测试；目标二：benchmarks/ 多卡性能测试
+> 5. 当前 P0：multicast=2 hang，需先修复
 
 ---
 
