@@ -265,7 +265,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t kInitBarrierTag = 41;
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kInitBarrierTag>(
         workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
-        [&]() { kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads(); }, true, true);
+        [&]() { __syncthreads(); }, true, true);
 
     // ── Pipeline state ──
     uint32_t stage_idx = 0, phase = 0;
@@ -782,7 +782,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     constexpr uint32_t kFinalBarrierTag = 42;
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kFinalBarrierTag>(
         workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
-        [&]() { kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads(); }, true, true);
+        [&]() { __syncthreads(); }, true, true);
 
     // Reset ready flags for next iteration (all dst_rank slots in our buffer)
     {
