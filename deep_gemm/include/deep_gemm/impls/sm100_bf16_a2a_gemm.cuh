@@ -163,9 +163,11 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
     //  P2P Direct: all ranks write concurrently to their destinations.
     //  No ring relay needed — NVLink Gen5 is fully connected.
     //
-    constexpr uint32_t kA2AGridSyncIndex = 1;
-    auto a2a_sync_scope = []() { cutlass::arch::NamedBarrier::sync(kNumA2AThreads, 1); };
     if (warp_idx < kNumA2AWarps) {
+        // ── P2P All-to-All: no grid_sync needed! ──
+        // NVLink preserves write ordering from same source to same destination,
+        // so data stores are visible before the flag store (st_rel_sys).
+        // All destinations can be written in parallel without synchronization.
         auto copy_16B = [&](void* dst, const void* src, const uint64_t& num_bytes) {
             auto* dst_vec = reinterpret_cast<uint4*>(dst);
             const auto* src_vec = reinterpret_cast<const uint4*>(src);
@@ -178,37 +180,32 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
 
         const uint64_t chunk_bytes = static_cast<uint64_t>(runtime_m_per_rank) * shape_k * sizeof(nv_bfloat16);
 
-        // Phase 1: Self-copy (local chunk → local slot)
-        // Rank i's chunk[rank_idx] stays local → slot[rank_idx]
+        // Self-copy: local chunk → local slot (no NVLink, fast)
         copy_16B(workspace.get_slot_x_ptr(rank_idx), workspace.get_local_x_ptr(rank_idx), chunk_bytes);
-        comm::grid_sync<kNumSMs, kA2AGridSyncIndex>(workspace, sm_idx, thread_idx, a2a_sync_scope);
+        // Self flag: use NamedBarrier instead of grid_sync (only comm warps)
+        cutlass::arch::NamedBarrier::sync(kNumA2AThreads, 1);
         if (sm_idx == 0 and thread_idx == 0)
             ptx::red_add_rel(workspace.get_slot_state_ptr(rank_idx), 1);
 
-        // Phase 2: P2P scatter — send chunk[dst_rank] to each remote rank
-        // We iterate over all other ranks and push our data to their slot[rank_idx].
+        // P2P scatter to all remote ranks — NO grid_sync between steps!
+        // Each step writes to a different dst_rank. NVLink write ordering
+        // guarantees data visibility before flag (st_rel_sys).
         #pragma unroll 1
         for (uint32_t step = 0; step + 1 < kNumRanks; ++ step) {
-            // dst_rank: which remote rank to send to
             const uint32_t dst_rank = (rank_idx + 1 + step) % kNumRanks;
-
-            // Source: our local chunk destined for dst_rank
             const void* src = workspace.get_local_x_ptr(dst_rank);
-
-            // Destination: slot[rank_idx] on dst_rank (via NVLink)
             auto* local_slot_ptr = workspace.get_slot_x_ptr(rank_idx);
             auto* remote_slot_ptr = sym_buffer.map(local_slot_ptr, dst_rank);
 
             copy_16B(remote_slot_ptr, src, chunk_bytes);
 
-            // Grid sync to ensure all SMs finished this step's writes
-            comm::grid_sync<kNumSMs, kA2AGridSyncIndex>(workspace, sm_idx, thread_idx, a2a_sync_scope);
+            // Sync comm warps only (not grid sync!) before setting flag
+            cutlass::arch::NamedBarrier::sync(kNumA2AThreads, 1);
 
-            // Signal: set slot_state[rank_idx] on dst_rank
+            // Set remote flag with release semantics
             if (sm_idx == 0 and thread_idx == 0) {
-                __threadfence_system();
                 auto* remote_state = sym_buffer.map(workspace.get_slot_state_ptr(rank_idx), dst_rank);
-                *remote_state = 1;
+                ptx::st_rel_sys(remote_state, 1u);
             }
         }
     }
