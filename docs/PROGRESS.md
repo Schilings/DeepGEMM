@@ -423,10 +423,19 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 ### 待完成 🔲
 
 - [ ] **修复 multicast=2 kernel hang** ← 🔴 当前最高优先级
-  - JIT 编译已完成（cubin 已生成），kernel launch 成功，但 GPU 上死循环
-  - 8 卡 GPU 全 100% 利用率 → kernel 内部 spin-wait 无限循环
-  - 需排查 mbarrier 同步 / Epilogue ready flag / Scheduler 逻辑
-  - 对比 multicast=1（正常 PASS）找出 multicast=2 引入的 bug
+  - ✅ JIT 编译修复完成（CUDA 13.0 sm_100f -gencode 问题）
+  - ✅ 确认 multicast=1 在同一 shape 下正常 PASS
+  - ✅ 确认 `block_rank_in_cluster()` 在 cluster launch 下返回正确值 (0/1)
+  - ✅ 确认标准 bf16_gemm 在 cluster=2 下正常工作
+  - 🔴 **hang 定位到 `nvlink_barrier` 中的 `grid_sync`**
+    - 初始化阶段（barrier init + TMEM alloc + cluster_sync）对 cluster 0 正常完成
+    - 但 `grid_sync` 需要所有 148 blocks 参与 — 某些 blocks 可能卡在初始化
+    - 跳过 init nvlink_barrier 后，pipeline（Load/MMA/Epilogue）开始运行
+    - 但 pipeline 后续仍然 hang（需要进一步排查）
+  - **下一步排查方向**：
+    1. 确认所有 148 blocks 都能通过 init 阶段（在 grid_sync 前打印计数）
+    2. 如果某些 blocks 卡在 TMEM alloc（Allocator2Sm），需要检查 2-CTA alloc 语义
+    3. Pipeline hang：检查 umma_arrive_multicast 是否正确释放 empty_barriers
 - [ ] multicast=2 性能 benchmark（预期 GEMM 效率提升 ~2x）
 - [ ] 重审 warp specialization 资源分配（当前 3 warpgroup 中只有 1 个做 MMA）
 - [ ] 性能优化迭代（Comm warp TMA 化、pipeline、vectorized store 等）
