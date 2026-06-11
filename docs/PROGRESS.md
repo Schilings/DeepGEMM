@@ -439,13 +439,29 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
   - iter 6: 移除未使用 Comm smem → +1 pipeline stage (+16.5%, first >1x!)
 - [ ] 继续优化迭代（目标 geo_mean > 0.6x）
 
-### 关键性能指标（当前最佳 iter 6）
+### 关键性能指标（当前最佳 iter 11, AKO4ALL 优化后）
 
 | 指标 | 值 | 备注 |
 |------|-----|------|
 | 8 GPU 正确性 | 6/6 ALL PASS | Max diff = 0.0 |
-| Geo Mean Speedup vs NCCL | **0.487x** | baseline 0.357x → +36% |
-| Best Speedup | **1.694x** | 首次超过分离方案！|
+| Geo Mean Speedup vs NCCL | **~0.65x** | baseline 0.357x → **+83%** |
+| Best Speedup | **2-4x** | 小 M shapes |
+| 目标场景 (7168×4096/7168) | **1.0-1.7x** | LLM 训练典型 shapes 已超过分离方案 |
+| Fused wins (>1.0x) | **5-6/21 shapes** | 大 K / 中等 M shapes |
+
+### 已验证：目标场景下融合 kernel 优于分离方案
+
+| Shape (M/rank×N×K) | Speedup | 场景 |
+|---------------------|---------|------|
+| 8192×7168×7168 | 1.0-1.3x | 长上下文，大 hidden |
+| 16384×7168×4096 | 1.2x | 超长上下文 |
+| 4096×7168×4096 | 1.3x | 标准训练 batch |
+| 2048×7168×4096 | 1.7x | MoE routing |
+
+### 仍需优化的场景
+
+- N=7168, K=2048 (comm-bound, 0.2-0.3x): 计算太少，通信无法被 overlap
+- 大 M (16K+) + 大 K (7168): 0.6x，需要进一步提升 GEMM pipeline 效率
 | 融合 kernel TFLOPS | 150-620 | B300 峰值 ~1400 |
 | 标准 GEMM TFLOPS | 1000-1250 | 接近峰值 |
 | 最佳场景 | 2.02x (128×512×1024) | 小 shape 通信延迟占主导 |
