@@ -249,8 +249,7 @@ static void sm100_bf16_ag_gemm_nt(const torch::Tensor& d,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_ag_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size,
-                                  config.num_multicast,
-                                  false /* disable PDL for mc2 debugging */)
+                                  config.num_multicast)
     };
 
     const auto code = SM100BF16AGGemmRuntime::generate(args);
