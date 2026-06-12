@@ -13,6 +13,7 @@ struct BF16AGGemmWorkspace {
     uint32_t num_slots;
 
     static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    static constexpr uint32_t kNumReadyChunksPerSlot = 4;
 
     CUTLASS_HOST_DEVICE
     BF16AGGemmWorkspace(void* base,
@@ -32,7 +33,7 @@ struct BF16AGGemmWorkspace {
         num_bytes += kNumBarrierSignalBytes;
         num_bytes += get_num_token_bytes_per_rank();
         num_bytes += num_slots * get_num_token_bytes_per_rank();
-        num_bytes += num_slots * sizeof(uint32_t) * 4;
+        num_bytes += static_cast<uint64_t>(num_slots) * sizeof(uint32_t) * kNumReadyChunksPerSlot;
         return math::align<uint64_t>(num_bytes, 16);
     }
 
@@ -60,9 +61,9 @@ struct BF16AGGemmWorkspace {
         return math::advance_ptr<dtype_t>(base_ptr, static_cast<uint64_t>(token_idx) * hidden * sizeof(nv_bfloat16));
     }
 
-    CUTLASS_DEVICE uint32_t* get_slot_state_ptr(const uint32_t& slot_idx = 0) const {
+    CUTLASS_DEVICE uint32_t* get_slot_state_ptr(const uint32_t& slot_idx = 0, const uint32_t& chunk_idx = 0) const {
         auto* base_ptr = math::advance_ptr<uint32_t>(get_slot_x_ptr(num_slots, 0), 0);
-        return base_ptr + slot_idx * 4;
+        return base_ptr + slot_idx * kNumReadyChunksPerSlot + chunk_idx;
     }
 };
 

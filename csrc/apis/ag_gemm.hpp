@@ -168,7 +168,7 @@ static void bf16_ag_gemm_nt(const torch::Tensor& d,
         num_ranks, num_max_tokens_per_rank, k, num_slots);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     const auto [x, slots_x] = slice(sym_buffer);
-    sm100_bf16_ag_gemm_nt(d, slots_x, b, sym_buffer_ptrs, rank_idx,
+    sm100_bf16_ag_gemm_nt(d, slots_x, b, sym_buffer, sym_buffer_ptrs, rank_idx,
                           num_max_tokens_per_rank, num_tokens, num_slots, n, k, compiled_dims);
 #else
     DG_HOST_UNREACHABLE("BF16 AG+GEMM requires TensorMap support");

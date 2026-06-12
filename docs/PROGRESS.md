@@ -520,6 +520,20 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 
 ---
 
+## AG GEMM（新迭代，Flux 风格重构）
+
+- 迭代记录：`docs/AG_GEMM_ITERATION.md`
+- 启动时间：2026-06-12
+- 当前方向：把 `sm100_bf16_ag_gemm.cuh` 从 **in-kernel NVLink ring-push** 改成 **host-side comm stream + compute-only GEMM kernel**
+- 当前阶段：Phase 1 骨架已落地
+  - BF16 AG workspace 改成 `slot + chunk` ready-flag 语义
+  - BF16 AG GEMM kernel 去掉 AG warps，改成只等待 chunk-ready 再 TMA load A
+  - JIT runtime 接入 `cudaMemcpyAsync + cuStreamWriteValue32` 的 host-side 通信编排
+  - launch 配置从 `384T` 改为 `256T`
+- 下一步：补 `AG GEMM` 正确性测试与 benchmark，验证 Flux 风格重构后的正确性和性能
+
+---
+
 ## 参考资料
 
 1. **ByteDance Flux** (flux/ 目录): Pull-based RS with per-tile flags, Comm warp specialization

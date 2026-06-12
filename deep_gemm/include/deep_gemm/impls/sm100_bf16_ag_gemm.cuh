@@ -8,7 +8,6 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 
-#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/layout/bf16_ag_gemm.cuh>
@@ -33,6 +32,8 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
                            const uint32_t shape_n,
                            const uint32_t shape_k,
                            const uint32_t num_slots,
+                           const uint32_t ready_chunk_rows,
+                           const uint32_t num_ready_chunks,
                            const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -56,12 +57,13 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
     constexpr uint32_t kNumAGWarps = kNumAGThreads / 32;
     constexpr uint32_t kGemmWarpBase = kNumAGWarps;
-    constexpr uint32_t kNumThreads = kNumAGThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
     constexpr uint32_t kNumTMAStoreStages = 2;
     constexpr uint32_t kNumEpilogueStages = 2;
+    constexpr uint32_t kNumReadyChunksPerSlot = layout::BF16AGGemmWorkspace::kNumReadyChunksPerSlot;
     DG_STATIC_ASSERT(BLOCK_M == 128 and BLOCK_N == 128 and BLOCK_K == 64, "The first BF16 AG+GEMM version expects 128x128x64 tiles");
-    DG_STATIC_ASSERT(kNumAGThreads % 32 == 0 and kNumAGThreads >= 128, "Invalid AG threads");
+    DG_STATIC_ASSERT(kNumAGThreads == 0 or (kNumAGThreads % 32 == 0 and kNumAGThreads >= 128), "Invalid AG threads");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128 and kNumEpilogueThreads == 128, "Invalid GEMM thread layout");
+    DG_STATIC_ASSERT(kNumReadyChunksPerSlot == 4, "Unexpected ready chunk count");
 
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
@@ -76,7 +78,6 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
     const uint32_t rank_idx = sym_buffer.rank_idx;
-    const uint32_t next_rank = (rank_idx + 1) % kNumRanks;
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const auto workspace = layout::BF16AGGemmWorkspace(
         sym_buffer.get_base_ptr(), kNumRanks, shape_m_per_rank, shape_k, num_slots);
@@ -121,46 +122,6 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
     }
     __syncthreads();
 
-    for (uint32_t i = sm_idx * kNumThreads + thread_idx; i < kNumRanks; i += kNumSMs * kNumThreads)
-        workspace.get_slot_state_ptr(i)[0] = 0;
-    constexpr uint32_t kAfterStateCleanBarrierTag = 51;
-    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kAfterStateCleanBarrierTag>(
-        workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, true, true);
-
-    constexpr uint32_t kAGGridSyncIndex = 1;
-    auto ag_sync_scope = []() { cutlass::arch::NamedBarrier::sync(kNumAGThreads, 1); };
-    if (warp_idx < kNumAGWarps) {
-        auto copy_16B = [&](void* dst, const void* src, const uint64_t& num_bytes) {
-            auto* dst_vec = reinterpret_cast<uint4*>(dst);
-            const auto* src_vec = reinterpret_cast<const uint4*>(src);
-            const uint64_t num_vecs = num_bytes / sizeof(uint4);
-            const uint64_t global_thread_idx = static_cast<uint64_t>(sm_idx) * kNumAGThreads + thread_idx;
-            const uint64_t global_num_threads = static_cast<uint64_t>(kNumSMs) * kNumAGThreads;
-            for (uint64_t i = global_thread_idx; i < num_vecs; i += global_num_threads)
-                dst_vec[i] = src_vec[i];
-        };
-        copy_16B(workspace.get_slot_x_ptr(rank_idx), workspace.get_local_x_ptr(),
-                 static_cast<uint64_t>(runtime_m_per_rank) * shape_k * sizeof(nv_bfloat16));
-        comm::grid_sync<kNumSMs, kAGGridSyncIndex>(workspace, sm_idx, thread_idx, ag_sync_scope);
-        if (sm_idx == 0 and thread_idx == 0)
-            ptx::red_add_rel(workspace.get_slot_state_ptr(rank_idx), 1);
-        #pragma unroll 1
-        for (uint32_t step = 0; step + 1 < kNumRanks; ++ step) {
-            const uint32_t src_rank = (rank_idx + kNumRanks - step) % kNumRanks;
-            while (ptx::ld_acq_sys(workspace.get_slot_state_ptr(src_rank)) == 0);
-            auto* remote_x = sym_buffer.map(workspace.get_slot_x_ptr(src_rank), next_rank);
-            copy_16B(remote_x, workspace.get_slot_x_ptr(src_rank),
-                     static_cast<uint64_t>(runtime_m_per_rank) * shape_k * sizeof(nv_bfloat16));
-            comm::grid_sync<kNumSMs, kAGGridSyncIndex>(workspace, sm_idx, thread_idx, ag_sync_scope);
-            if (sm_idx == 0 and thread_idx == 0) {
-                __threadfence_system();
-                auto* remote_state = sym_buffer.map(workspace.get_slot_state_ptr(src_rank), next_rank);
-                *remote_state = 1;
-            }
-
-        }
-    }
-
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
         ++ k_block_idx;
@@ -170,10 +131,12 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
     auto get_next_block = [&](uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t& iter_idx) {
         const uint32_t num_m_blocks = ceil_div(shape_m, BLOCK_M);
         const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
+        const uint32_t num_m_blocks_per_rank = ceil_div(runtime_m_per_rank, BLOCK_M);
         if (block_idx >= num_m_blocks * num_n_blocks)
             return false;
-        m_block_idx = block_idx / num_n_blocks;
-        n_block_idx = block_idx - m_block_idx * num_n_blocks;
+        const uint32_t logical_m_block_idx = block_idx / num_n_blocks;
+        m_block_idx = (logical_m_block_idx + rank_idx * num_m_blocks_per_rank) % num_m_blocks;
+        n_block_idx = block_idx - logical_m_block_idx * num_n_blocks;
         block_idx += kNumSMs;
         ++ iter_idx;
         return true;
@@ -185,9 +148,15 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
             const uint32_t global_m = m_block_idx * BLOCK_M;
             const uint32_t src_rank = global_m / runtime_m_per_rank;
             const uint32_t local_m = global_m - src_rank * runtime_m_per_rank;
-            while (ptx::ld_acq_sys(workspace.get_slot_state_ptr(src_rank)) == 0);
             const uint32_t n_idx = n_block_idx * BLOCK_N;
             const uint32_t slot_m = src_rank * shape_m_per_rank + local_m;
+            const uint32_t chunk_start = local_m / ready_chunk_rows;
+            const uint32_t chunk_end = cute::min<uint32_t>((local_m + BLOCK_M - 1) / ready_chunk_rows, num_ready_chunks - 1);
+            #pragma unroll
+            for (uint32_t chunk_idx = 0; chunk_idx < kNumReadyChunksPerSlot; ++ chunk_idx) {
+                if (chunk_idx >= chunk_start and chunk_idx <= chunk_end)
+                    while (ptx::ld_acq_sys(workspace.get_slot_state_ptr(src_rank, chunk_idx)) == 0);
+            }
             const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);

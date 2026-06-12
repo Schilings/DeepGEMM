@@ -48,7 +48,7 @@ static AGGemmConfig get_ag_gemm_config(const int& m, const int& n, const int& k,
     constexpr int swizzle_a_mode = 128;
     constexpr int swizzle_b_mode = 128;
     constexpr int swizzle_cd_mode = 128;
-    constexpr int num_ag_threads = 128;
+    constexpr int num_ag_threads = 0;
     constexpr int num_non_epilogue_threads = 128;
     constexpr int num_epilogue_threads = 128;
     const auto [sf_block_m, sf_block_n] = SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4);
