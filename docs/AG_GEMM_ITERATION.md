@@ -37,6 +37,15 @@
 
 ---
 
+## 2026-06-12：AKO4ALL 迭代启动
+
+- 按 `docs/RULE.md` 要求切换到 AKO4ALL 方式继续推进 `AG GEMM`
+- 不使用 `solution/` 或 `opt/` 分支，直接在 `main` 原文件上迭代
+- 使用项目原生 test / benchmark 驱动，而不是 AKO4ALL 默认 bench scaffold
+- 当前先补 `tests/test_ag_gemm.py` 与 `benchmarks/bench_ag_gemm.py`，然后基于其结果继续优化
+
+---
+
 ## 2026-06-12：Phase 1 — Flux 风格重构骨架
 
 ### 已完成
@@ -47,6 +56,7 @@
 
 - 新增 `kNumReadyChunksPerSlot = 4`
 - `slot_state` 区域大小改为 `num_slots * 4 * sizeof(uint32_t)` 的显式语义
+- 为了和稳定的 `BF16 A2A` 对称内存骨架保持一致，`local_x` 预留区扩成 `num_ranks` 份 token buffer，`slot_x` 基址相应后移
 - `get_slot_state_ptr(slot_idx, chunk_idx)` 支持按 slot + chunk 访问
 
 #### 2. BF16 AG GEMM kernel 改为 compute-only 形态
@@ -70,8 +80,8 @@
 - 新增 `launch_bf16_ag_gemm_comm(...)`
 - 在高优先级 comm stream 上：
   - `cudaMemsetAsync` 清零本地 `slot_state`
-  - 用 `cudaMemcpyAsync` 把各 rank 的 `local_x` 拷到本地 `slot_x[src_rank]`
-  - 每个 chunk 拷完后用 `cuStreamWriteValue32` 写本地 ready flag
+  - 用显式 local `cudaMemcpyAsync` / remote `cudaMemcpyPeerAsync` 把各 rank 的 `local_x` 拷到本地 `slot_x[src_rank]`
+  - 每个 chunk 拷完后用 `cudaMemsetAsync` 置位本地 ready flag
 - 先完成 self chunk，再 record `local_ready_event`
 - GEMM 主 stream 只等待 `local_ready_event`，然后立刻启动 compute kernel
 - 远端 rank 的 chunk 继续在 comm stream 后台搬运，kernel 侧按 ready flag 自旋等待
@@ -135,15 +145,15 @@
 
 ### Phase 2
 
-- 补 `tests/test_ag_gemm.py`
-- 跑通 2/4/8 GPU correctness
+- 跑通 `4/8 GPU` correctness
 - 验证 chunk-ready 等待逻辑没有死锁 / 越界 / 顺序问题
+- 去掉测试脚本里的临时 debug 开关或把它们整理成正式 debug 模式
 
 ### Phase 3
 
-- 补 `benchmarks/bench_ag_gemm.py`
+- 基于现有 `benchmarks/bench_ag_gemm.py` 继续扩形状与 GPU 数
 - 和 `Flux` / `separate all_gather + gemm` 做 baseline 对比
-- 评估 `256T compute-only` 相比旧 `384T` kernel 的吞吐变化
+- 评估 `256T compute-only` 相比旧 `384T` kernel 的吞吐变化；当前 `2 GPU` geo mean 为 `0.952x`
 
 ### Phase 4
 

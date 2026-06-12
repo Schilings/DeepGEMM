@@ -18,6 +18,15 @@
 - Performance: `python benchmarks/bench_gemm_rs.py 8 20`
 - Quick perf (2 GPU, faster iteration): `python benchmarks/bench_gemm_rs.py 2 10`
 
+## AG GEMM Adaptation
+- Source of directives: `docs/RULE.md`
+- Optimize `deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh` in place.
+- Related files: `csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp`, `csrc/jit_kernels/heuristics/ag_gemm.hpp`, `csrc/apis/ag_gemm.hpp`, `deep_gemm/ag_gemm/__init__.py`
+- Use project-native AG correctness test: `python tests/test_ag_gemm.py 2`
+- Use project-native AG benchmark: `python benchmarks/bench_ag_gemm.py 2 10`
+- Keep iteration notes in `docs/AG_GEMM_ITERATION.md`
+- Push after every iteration.
+
 ## Architecture
 - 8× NVIDIA B300 SXM6 (SM100, compute 10.3, 148 SMs per GPU)
 - NVLink Gen5 (900 GB/s bidirectional)

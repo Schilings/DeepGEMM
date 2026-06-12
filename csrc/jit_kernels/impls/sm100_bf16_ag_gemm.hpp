@@ -26,9 +26,18 @@ inline cudaStream_t get_bf16_ag_gemm_comm_stream() {
 
 inline cudaEvent_t get_bf16_ag_gemm_local_ready_event() {
     static thread_local cudaEvent_t event = []() {
-        cudaEvent_t e;
-        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
-        return e;
+        cudaEvent_t local_event;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&local_event, cudaEventDisableTiming));
+        return local_event;
+    }();
+    return event;
+}
+
+inline cudaEvent_t get_bf16_ag_gemm_comm_done_event() {
+    static thread_local cudaEvent_t event = []() {
+        cudaEvent_t done_event;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&done_event, cudaEventDisableTiming));
+        return done_event;
     }();
     return event;
 }
@@ -42,7 +51,8 @@ inline void launch_bf16_ag_gemm_comm(const torch::Tensor& sym_buffer,
                                      const int& k,
                                      const int& block_m,
                                      uint32_t& ready_chunk_rows,
-                                     uint32_t& num_ready_chunks) {
+                                     uint32_t& num_ready_chunks,
+                                     cudaEvent_t& comm_done_event) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto workspace = layout::BF16AGGemmWorkspace(nullptr, num_ranks, max_m_per_rank, k, num_slots);
     constexpr uint32_t kNumReadyChunksPerSlot = layout::BF16AGGemmWorkspace::kNumReadyChunksPerSlot;
@@ -58,8 +68,8 @@ inline void launch_bf16_ag_gemm_comm(const torch::Tensor& sym_buffer,
     const auto current_stream = at::cuda::getCurrentCUDAStream();
     const auto comm_stream = get_bf16_ag_gemm_comm_stream();
     const auto local_ready_event = get_bf16_ag_gemm_local_ready_event();
+    comm_done_event = get_bf16_ag_gemm_comm_done_event();
 
-    auto* local_base = reinterpret_cast<char*>(sym_buffer.data_ptr());
     auto* local_state_base = reinterpret_cast<uint32_t*>(math::advance_ptr(
         sym_buffer.data_ptr(), reinterpret_cast<uintptr_t>(workspace.get_slot_state_ptr())));
     DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(
@@ -77,8 +87,7 @@ inline void launch_bf16_ag_gemm_comm(const torch::Tensor& sym_buffer,
             reinterpret_cast<void*>(sym_buffer_ptrs[src_rank]), reinterpret_cast<uintptr_t>(workspace.get_local_x_ptr(row_start)));
         DG_CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, chunk_bytes, cudaMemcpyDefault, comm_stream));
         auto* chunk_state_ptr = local_state_base + src_rank * kNumReadyChunksPerSlot + chunk_idx;
-        DG_CUDA_DRIVER_CHECK(cuStreamWriteValue32(
-            reinterpret_cast<CUstream>(comm_stream), reinterpret_cast<CUdeviceptr>(chunk_state_ptr), 1u, CU_STREAM_WRITE_VALUE_DEFAULT));
+        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(chunk_state_ptr, 1, sizeof(uint32_t), comm_stream));
     };
 
     for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
@@ -91,6 +100,7 @@ inline void launch_bf16_ag_gemm_comm(const torch::Tensor& sym_buffer,
             launch_chunk_copy(src_rank, static_cast<int>(chunk_idx));
     }
 
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(comm_done_event, comm_stream));
     DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(current_stream.stream(), local_ready_event, 0));
 }
 
@@ -174,9 +184,11 @@ static void sm100_bf16_ag_gemm_nt(const torch::Tensor& d,
     DG_HOST_ASSERT(config.block_k == 64);
 
     uint32_t ready_chunk_rows = 0, num_ready_chunks = 0;
+    cudaEvent_t comm_done_event;
+    const auto current_stream = at::cuda::getCurrentCUDAStream();
     launch_bf16_ag_gemm_comm(sym_buffer, sym_buffer_ptrs, rank_idx, max_m_per_rank,
                              runtime_m_per_rank, num_slots, k, config.block_m,
-                             ready_chunk_rows, num_ready_chunks);
+                             ready_chunk_rows, num_ready_chunks, comm_done_event);
 
     const auto tensor_map_a = make_tma_2d_desc(slots_x,
                                                k, max_m_per_rank * num_slots,
@@ -218,6 +230,7 @@ static void sm100_bf16_ag_gemm_nt(const torch::Tensor& d,
     const auto code = SM100BF16AGGemmRuntime::generate(args);
     const auto runtime = compiler->build("sm100_bf16_ag_gemm_nt", code);
     SM100BF16AGGemmRuntime::launch(runtime, args);
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(current_stream.stream(), comm_done_event, 0));
 }
 
 } // namespace deep_gemm

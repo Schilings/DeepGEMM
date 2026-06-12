@@ -176,9 +176,8 @@ static void bf16_ag_gemm_nt(const torch::Tensor& d,
 }
 
 static void register_apis(pybind11::module_& m) {
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-
     m.def("get_token_alignment_for_ag_gemm", &get_token_alignment_for_ag_gemm);
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     m.def("get_symm_buffer_size_for_ag_gemm", &get_symm_buffer_size_for_ag_gemm);
     m.def("fp8_ag_gemm_nt", &fp8_ag_gemm_nt,
           pybind11::arg("d"), pybind11::arg("b"), pybind11::arg("sym_buffer"),

@@ -29,6 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::gemm::register_apis(m);
     deep_gemm::gemm_rs::register_apis(m);
     deep_gemm::layout::register_apis(m);
+    deep_gemm::ag_gemm::register_apis(m);
 
     deep_gemm::a2a_gemm::register_apis(m);
     deep_gemm::mega::register_apis(m);

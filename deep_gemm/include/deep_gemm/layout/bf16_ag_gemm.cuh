@@ -31,7 +31,7 @@ struct BF16AGGemmWorkspace {
     CUTLASS_HOST_DEVICE uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
-        num_bytes += get_num_token_bytes_per_rank();
+        num_bytes += static_cast<uint64_t>(num_ranks) * get_num_token_bytes_per_rank();
         num_bytes += num_slots * get_num_token_bytes_per_rank();
         num_bytes += static_cast<uint64_t>(num_slots) * sizeof(uint32_t) * kNumReadyChunksPerSlot;
         return math::align<uint64_t>(num_bytes, 16);
@@ -57,7 +57,8 @@ struct BF16AGGemmWorkspace {
 
     template <typename dtype_t = void>
     CUTLASS_HOST_DEVICE dtype_t* get_slot_x_ptr(const uint32_t& slot_idx = 0, const uint32_t& token_idx = 0) const {
-        auto* base_ptr = math::advance_ptr(get_local_x_ptr(num_max_tokens_per_rank), slot_idx * get_num_token_bytes_per_rank());
+        auto* slots_base = math::advance_ptr(base, kNumBarrierSignalBytes + static_cast<uint64_t>(num_ranks) * get_num_token_bytes_per_rank());
+        auto* base_ptr = math::advance_ptr(slots_base, slot_idx * get_num_token_bytes_per_rank());
         return math::advance_ptr<dtype_t>(base_ptr, static_cast<uint64_t>(token_idx) * hidden * sizeof(nv_bfloat16));
     }
 
