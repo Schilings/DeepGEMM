@@ -43,7 +43,6 @@ static AGGemmConfig get_ag_gemm_config(const int& m, const int& n, const int& k,
     const int block_k = 128 / elem_size_ab;
 
     constexpr int num_multicast = 1;
-    constexpr int load_block_n = block_n;
     constexpr int load_block_m = block_m;
     constexpr int load_block_n = block_n;
     constexpr int swizzle_a_mode = 128;

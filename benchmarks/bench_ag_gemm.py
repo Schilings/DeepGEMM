@@ -24,7 +24,17 @@ from deep_gemm.ag_gemm import bf16_ag_gemm_nt, get_symm_buffer_for_bf16_ag_gemm
 
 
 SHAPES = [
-    # Target: large-shape training scenarios (M_per_rank=10K~20K+, N=7168, K=4096~7168)
+    # Medium sequence length (4K~8K per rank, N=4096/7168, K=4096/7168)
+    (4096,  4096, 4096),
+    (4096,  7168, 4096),
+    (4096,  7168, 7168),
+    (6144,  4096, 4096),
+    (6144,  7168, 4096),
+    (6144,  7168, 7168),
+    (8192,  4096, 4096),
+    (8192,  7168, 4096),
+    (8192,  7168, 7168),
+    # Large shapes (10K~20K per rank)
     (10240, 7168, 4096),
     (10240, 7168, 7168),
     (12288, 7168, 4096),
