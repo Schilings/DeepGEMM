@@ -145,15 +145,15 @@
 
 ### Phase 2
 
-- 跑通 `4/8 GPU` correctness
-- 验证 chunk-ready 等待逻辑没有死锁 / 越界 / 顺序问题
+- 继续定位 BF16 AG 首轮 cold-start 的根因，目标是去掉 correctness test 里的显式 warmup launch
+- 验证 chunk-ready 等待逻辑在更多形状与更多轮次下没有死锁 / 越界 / 顺序问题
 - 去掉测试脚本里的临时 debug 开关或把它们整理成正式 debug 模式
 
 ### Phase 3
 
 - 基于现有 `benchmarks/bench_ag_gemm.py` 继续扩形状与 GPU 数
 - 和 `Flux` / `separate all_gather + gemm` 做 baseline 对比
-- 评估 `256T compute-only` 相比旧 `384T` kernel 的吞吐变化；当前 `2 GPU` geo mean 为 `0.952x`
+- 评估 `256T compute-only` 相比旧 `384T` kernel 的吞吐变化；当前 geo mean：`2 GPU 0.952x` / `4 GPU 0.953x` / `8 GPU 0.946x`
 
 ### Phase 4
 

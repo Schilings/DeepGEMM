@@ -60,6 +60,7 @@ class AGGemmSymmBuffer:
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
         self.buffer.zero_()
+        torch.cuda.synchronize()
         self.group.barrier()
         torch.cuda.synchronize()
 

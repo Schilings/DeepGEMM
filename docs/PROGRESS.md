@@ -525,14 +525,15 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 - 迭代记录：`docs/AG_GEMM_ITERATION.md`
 - 启动时间：2026-06-12
 - 当前方向：把 `sm100_bf16_ag_gemm.cuh` 从 **in-kernel NVLink ring-push** 改成 **host-side comm stream + compute-only GEMM kernel**
-- 当前阶段：Phase 1 骨架 + 2 GPU baseline 已跑通
+- 当前阶段：Phase 1 骨架 + 多卡 baseline 已跑通
   - BF16 AG workspace 改成 `slot + chunk` ready-flag 语义，并修复了对称内存布局/分配不一致问题
   - BF16 AG GEMM kernel 去掉 AG warps，改成只等待 chunk-ready 再 TMA load A
-  - JIT runtime 接入 `cudaMemcpyAsync(cudaMemcpyDefault) + cudaMemsetAsync` 的 host-side 通信编排，并追加 `comm_done_event`
+  - JIT runtime 接入 `cudaMemcpyAsync(cudaMemcpyDefault) + cudaMemsetAsync` 的 host-side 通信编排，并补上 `input_ready_event` / `local_ready_event` / `comm_done_event`
   - 修复 AG GEMM Python/C++ 入口：`python_api.cpp` 补上 `ag_gemm::register_apis(m)`，`get_token_alignment_for_ag_gemm` 对 BF16 路径可见
-  - `tests/test_ag_gemm.py` 已新增并在 `2 GPU` basic suite 上 `5/5 PASS`
-  - `benchmarks/bench_ag_gemm.py` 已新增，`2 GPU, 10 iters` 的 geo mean speedup = `0.952x`，当前 `2/7` shapes 优于 separate
-- 下一步：补 `4/8 GPU` correctness 与 benchmark，并继续优化当前 `0.952x` 的 2 GPU 性能基线
+  - `tests/test_ag_gemm.py` 已新增，并通过显式 warmup launch 稳定覆盖 BF16 AG 首轮 cold-start；`2/4/8 GPU` basic suite 均 `5/5 PASS`
+  - `benchmarks/bench_ag_gemm.py` 已新增；`2 GPU, 10 iters` geo mean=`0.952x`，`4 GPU, 10 iters` geo mean=`0.953x`，`8 GPU, 5 iters` geo mean=`0.946x`
+  - 当前 fused 胜率：`2 GPU 2/7`，`4 GPU 3/7`，`8 GPU 5/7`，说明大 shape 下开始具备优势，但整体几何均值仍略低于 separate
+- 下一步：继续定位 BF16 AG 首轮 cold-start 的根因，并围绕大 shape 已经领先的区间继续做 overlap / copy 路径优化
 
 ---
 

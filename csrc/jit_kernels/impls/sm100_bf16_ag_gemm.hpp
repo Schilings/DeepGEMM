@@ -24,6 +24,15 @@ inline cudaStream_t get_bf16_ag_gemm_comm_stream() {
     return stream.stream();
 }
 
+inline cudaEvent_t get_bf16_ag_gemm_input_ready_event() {
+    static thread_local cudaEvent_t event = []() {
+        cudaEvent_t input_ready_event;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&input_ready_event, cudaEventDisableTiming));
+        return input_ready_event;
+    }();
+    return event;
+}
+
 inline cudaEvent_t get_bf16_ag_gemm_local_ready_event() {
     static thread_local cudaEvent_t event = []() {
         cudaEvent_t local_event;
@@ -67,8 +76,12 @@ inline void launch_bf16_ag_gemm_comm(const torch::Tensor& sym_buffer,
 
     const auto current_stream = at::cuda::getCurrentCUDAStream();
     const auto comm_stream = get_bf16_ag_gemm_comm_stream();
+    const auto input_ready_event = get_bf16_ag_gemm_input_ready_event();
     const auto local_ready_event = get_bf16_ag_gemm_local_ready_event();
     comm_done_event = get_bf16_ag_gemm_comm_done_event();
+
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(input_ready_event, current_stream.stream()));
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(comm_stream, input_ready_event, 0));
 
     auto* local_state_base = reinterpret_cast<uint32_t*>(math::advance_ptr(
         sym_buffer.data_ptr(), reinterpret_cast<uintptr_t>(workspace.get_slot_state_ptr())));

@@ -95,6 +95,11 @@ def _run_single_shape(rank: int, num_gpus: int, group, tokens_per_rank: int, n_d
     _log('after x copy')
 
     d_fused = torch.zeros((num_gpus * tokens_per_rank, n_dim), dtype=torch.bfloat16, device=device)
+    _log('before warmup kernel')
+    bf16_ag_gemm_nt(d_fused, b, sym_buffer, tokens_per_rank)
+    torch.cuda.synchronize(device)
+    dist.barrier(group)
+    d_fused.zero_()
     _log('before kernel')
     bf16_ag_gemm_nt(d_fused, b, sym_buffer, tokens_per_rank)
     _log('after kernel launch')
