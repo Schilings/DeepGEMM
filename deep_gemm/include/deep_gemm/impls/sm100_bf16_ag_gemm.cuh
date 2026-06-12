@@ -24,6 +24,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumAGThreads,
           uint32_t kNumNonEpilogueThreads,
           uint32_t kNumEpilogueThreads,
+          uint32_t kNumMulticast,
           uint32_t kNumSMs, uint32_t kNumRanks,
           typename cd_dtype_t>
 __global__ void __launch_bounds__(kNumAGThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
@@ -41,18 +42,18 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using Allocator = cute::TMEM::Allocator1Sm;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
     using ab_dtype_t = cutlass::bfloat16_t;
 
     constexpr uint32_t kSwizzleAMode = 128;
     constexpr uint32_t kSwizzleBMode = 128;
     constexpr uint32_t kSwizzleCDMode = 128;
     constexpr uint32_t LAYOUT_AD_M = 128;
-    constexpr uint32_t UMMA_M = LAYOUT_AD_M;
+    constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = BLOCK_N;
     constexpr uint32_t UMMA_K = 16;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M;
-    constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
+    constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / kNumMulticast;
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
@@ -121,7 +122,7 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
     } else if (warp_idx == kGemmWarpBase + 2) {
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
-    __syncthreads();
+    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
@@ -135,9 +136,18 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
         const uint32_t num_m_blocks_per_rank = ceil_div(runtime_m_per_rank, BLOCK_M);
         if (block_idx >= num_m_blocks * num_n_blocks)
             return false;
-        const uint32_t logical_m_block_idx = block_idx / num_n_blocks;
-        m_block_idx = (logical_m_block_idx + rank_idx * num_m_blocks_per_rank) % num_m_blocks;
-        n_block_idx = block_idx - logical_m_block_idx * num_n_blocks;
+        if constexpr (kNumMulticast > 1) {
+            // 2-CTA cluster: pair consecutive blocks, same N, adjacent M
+            const uint32_t pair_idx = block_idx / kNumMulticast;
+            const uint32_t cta_in_pair = block_idx % kNumMulticast;
+            const uint32_t logical_m_pair = pair_idx / num_n_blocks;
+            m_block_idx = (logical_m_pair * kNumMulticast + cta_in_pair + rank_idx * num_m_blocks_per_rank) % num_m_blocks;
+            n_block_idx = pair_idx - logical_m_pair * num_n_blocks;
+        } else {
+            const uint32_t logical_m_block_idx = block_idx / num_n_blocks;
+            m_block_idx = (logical_m_block_idx + rank_idx * num_m_blocks_per_rank) % num_m_blocks;
+            n_block_idx = block_idx - logical_m_block_idx * num_n_blocks;
+        }
         block_idx += kNumSMs;
         ++ iter_idx;
         return true;
@@ -149,7 +159,10 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
             const uint32_t global_m = m_block_idx * BLOCK_M;
             const uint32_t src_rank = global_m / runtime_m_per_rank;
             const uint32_t local_m = global_m - src_rank * runtime_m_per_rank;
-            const uint32_t n_idx = n_block_idx * BLOCK_N;
+            uint32_t n_idx = n_block_idx * BLOCK_N;
+            // 2-CTA: CTA1 loads second half of B columns
+            if constexpr (kNumMulticast > 1)
+                n_idx += cute::block_rank_in_cluster() * LOAD_BLOCK_N;
             const uint32_t slot_m = src_rank * shape_m_per_rank + local_m;
             const uint32_t chunk_start = local_m / ready_chunk_rows;
             const uint32_t chunk_end = cute::min<uint32_t>((local_m + BLOCK_M - 1) / ready_chunk_rows, num_ready_chunks - 1);
@@ -163,10 +176,10 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t>(
-                    &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, slot_m, 1);
+                    &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, slot_m, kNumMulticast);
                 tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 1);
-                full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, kNumMulticast);
+                full_barriers[stage_idx]->arrive_and_expect_tx((SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) * kNumMulticast);
             }
         }
     } else if (warp_idx == kGemmWarpBase + 1 and is_leader_cta) {
@@ -182,17 +195,25 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
             auto accum_phase_idx = ((iter_idx - 1) / kNumEpilogueStages) & 1;
             tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
             ptx::tcgen05_after_thread_sync();
+            auto umma_arrive = [](const uint64_t* barrier) {
+                if constexpr (kNumMulticast == 1) {
+                    cutlass::arch::umma_arrive(barrier);
+                } else {
+                    constexpr uint16_t kCTAMask = (1 << kNumMulticast) - 1;
+                    cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask);
+                }
+            };
             auto empty_barrier_arrive = [&](const bool& do_tmem_full_arrive) {
-                cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
+                umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
                 if (do_tmem_full_arrive)
-                    cutlass::arch::umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
+                    umma_arrive(reinterpret_cast<uint64_t*>(tmem_full_barriers[accum_stage_idx]));
                 __syncwarp();
             };
             const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 full_barriers[stage_idx]->wait(phase);
                 ptx::tcgen05_after_thread_sync();
-                using mma_t = ptx::SM100_MMA_F16BF16_SS;
+                using mma_t = cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_F16BF16_SS, ptx::SM100_MMA_F16BF16_2x1SM_SS>;
                 const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
                 const auto a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
@@ -232,7 +253,7 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
         }
     }
 
-    __syncthreads();
+    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
 #else
