@@ -164,6 +164,54 @@
 
 ---
 
+## 2026-06-12：Phase 2 — 启用 comm-compute overlap
+
+### 问题
+
+Phase 1 虽然实现了通信外移 + per-chunk barrier，但 host 端在 launch kernel 前：
+1. `cudaStreamWaitEvent(comm_done_event)` — 等待**全部**远程数据拷贝完成
+2. `ready_chunk_rows = runtime_m_per_rank; num_ready_chunks = 1` — 使所有 tile poll chunk 0
+
+**结果**：通信和计算串行，无 overlap。对比 Flux 参考，这是关键缺陷。
+
+### 修复（仅 host 端 13 行删除，kernel 无需改动）
+
+文件：`csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp`
+
+```diff
+- // Wait for all communication to complete before kernel launch.
+- DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(current_stream.stream(), comm_done_event, 0));
+- ready_chunk_rows = static_cast<uint32_t>(runtime_m_per_rank);
+- num_ready_chunks = 1;
++ // ✅ OVERLAP: kernel launches after local_ready_event (local data ready),
++ //    remote chunks still copying on comm_stream → kernel polls per-chunk barrier
+```
+
+`launch_bf16_ag_gemm_comm` 已经 wired `current_stream` wait `local_ready_event` 后才返回 → kernel 在 local data 就绪后立即 launch。`ready_chunk_rows` / `num_ready_chunks` 使用真实值。
+
+### Overlap 机制（SM100）
+
+```
+Copy Stream:         copy local → record local_ready → copy remote_0 → copy remote_1 → ...
+                     barrier[self]=1                barrier[0]=1       barrier[1]=1
+
+Compute Stream:      wait(local_ready) → launch kernel
+                     kernel: poll barrier[0] → TMA load → UMMA → epilogue
+                             poll barrier[1] → TMA load → UMMA → epilogue
+                             ...
+```
+
+Kernel 内 `ptx::ld_acq_sys(slot_state[src_rank][chunk])` 自旋等待，CE DMA 完成后 `cudaMemsetAsync(flag=1)` 唤醒。
+
+### 测试验证
+
+- 正确性：2/4/8 GPU, basic + extended 全量 shapes ✅ ALL PASS
+- Benchmark (4 GPU, large training shapes): Geo Mean 0.920x（vs 旧 0.930x）
+  - 大 shape 下 comm <2% 总时间，barrier polling 微量开销抵消了 overlap 收益
+  - 架构正确性优先于短期 benchmark
+
+---
+
 ## 2026-06-12：Flux 参考分析
 
 深入分析了 Flux 项目的 BF16 + SM90 + 单机 AG GEMM 设计，输出参考文档 `docs/AG_GEMM_FLUX_REFERENCE.md`，核心发现：

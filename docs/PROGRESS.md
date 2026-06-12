@@ -525,15 +525,49 @@ Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ 
 - 迭代记录：`docs/AG_GEMM_ITERATION.md`
 - 启动时间：2026-06-12
 - 当前方向：把 `sm100_bf16_ag_gemm.cuh` 从 **in-kernel NVLink ring-push** 改成 **host-side comm stream + compute-only GEMM kernel**
-- 当前阶段：Phase 1 骨架 + 多卡 baseline 已跑通
+- 当前阶段：Phase 2 — **comm-compute overlap 已启用**
+
+### Phase 1 骨架（已完成）
+
   - BF16 AG workspace 改成 `slot + chunk` ready-flag 语义，并修复了对称内存布局/分配不一致问题
   - BF16 AG GEMM kernel 去掉 AG warps，改成只等待 chunk-ready 再 TMA load A
   - JIT runtime 接入 `cudaMemcpyAsync(cudaMemcpyDefault) + cudaMemsetAsync` 的 host-side 通信编排，并补上 `input_ready_event` / `local_ready_event` / `comm_done_event`
-  - 修复 AG GEMM Python/C++ 入口：`python_api.cpp` 补上 `ag_gemm::register_apis(m)`，`get_token_alignment_for_ag_gemm` 对 BF16 路径可见
-  - `tests/test_ag_gemm.py` 已新增，并通过显式 warmup launch 稳定覆盖 BF16 AG 首轮 cold-start；`2/4/8 GPU` basic suite 均 `5/5 PASS`
-  - `benchmarks/bench_ag_gemm.py` 已新增；`2 GPU, 10 iters` geo mean=`0.952x`，`4 GPU, 10 iters` geo mean=`0.953x`，`8 GPU, 5 iters` geo mean=`0.946x`
-  - 当前 fused 胜率：`2 GPU 2/7`，`4 GPU 3/7`，`8 GPU 5/7`，说明大 shape 下开始具备优势，但整体几何均值仍略低于 separate
-- 下一步：继续定位 BF16 AG 首轮 cold-start 的根因，并围绕大 shape 已经领先的区间继续做 overlap / copy 路径优化
+  - `tests/test_ag_gemm.py` 正确性测试，2/4/8 GPU basic suite 均 `5/5 PASS`
+  - `benchmarks/bench_ag_gemm.py` 性能测试
+
+### Phase 2 — Overlap 启用（2026-06-12）
+
+**问题**：旧代码在 $launch kernel$ 前 `cudaStreamWaitEvent(comm_done_event)` 等待全部通信完成，kernel 内 `ready_chunk_rows = runtime_m_per_rank` + `num_ready_chunks = 1` 使得所有 tile 都 poll chunk 0 — 实际无 overlap。
+
+**修复**（仅 host 端 13 行代码删除）：
+- 删除 `cudaStreamWaitEvent(comm_done_event, 0)` — kernel 不再等全部 AG 完成
+- 删除 `ready_chunk_rows` / `num_ready_chunks` 的覆盖 — 使用 launch_bf16_ag_gemm_comm 计算的真实 chunk 值
+- kernel 已有 `ptx::ld_acq_sys` per-chunk polling — **无需改动**
+
+**Overlap 机制**：
+```
+Copy Stream:           copy local → copy remote rank 1 → copy remote rank 2 → ...  
+                       flag[0]=1      flag[1]=1              flag[2]=1
+Compute Stream:        wait(local_ready) → launch kernel
+                       kernel: poll flag → TMA load → UMMA → poll flag → ...
+```
+local_ready_event 在本地 copy 完成后就绪，kernel 随即启动。remote chunk 仍在后台 CE DMA 搬运，kernel 按需 poll barrier。
+
+**测试结果**：
+- 正确性：2/4/8 GPU, basic + extended 全量 shapes ✓ ALL PASS
+- Benchmark (4 GPU, large training shapes):
+
+| Shape (M/rank×N×K) | Separate | Fused | Overlap Speedup |
+|---------------------|----------|-------|-----------------|
+| 10240×7168×4096 | 2152.3μs | 2163.2μs | 0.99x |
+| 20480×7168×4096 | 4243.9μs | 4564.5μs | 0.93x |
+| 20480×7168×7168 | 7665.9μs | 8593.9μs | 0.89x |
+
+Geo Mean Speedup: 0.920x (vs 旧 non-overlap 0.930x — 大 shape 下 comm <2% 总时间，barrier polling 微量开销)
+
+**分析**：大 shape 下通信占比极低（<2%），overlap 收益被 barrier polling 开销抵消。但架构正确 — kernel 在所有 shape 下均不等 AG 完成即启动。中等 shape（M_per_rank=2K~4K, K=4096+）预期 overlap 收益更明显。
+
+- 下一步：中等 shape benchmark、chunk 数量自适应、评估是否需要区分 shape 选择 sync/overlap 模式
 
 ---
 

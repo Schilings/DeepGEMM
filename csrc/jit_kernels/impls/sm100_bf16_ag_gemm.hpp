@@ -202,20 +202,16 @@ static void sm100_bf16_ag_gemm_nt(const torch::Tensor& d,
     launch_bf16_ag_gemm_comm(sym_buffer, sym_buffer_ptrs, rank_idx, max_m_per_rank,
                              runtime_m_per_rank, num_slots, k, config.block_m,
                              ready_chunk_rows, num_ready_chunks, comm_done_event);
-    // Wait for all communication to complete before kernel launch.
-    // For large shapes the comm time is small relative to compute,
-    // and removing per-tile polling inside the kernel is a net win.
-    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(current_stream.stream(), comm_done_event, 0));
-    // Tell kernel all data is ready — set ready_chunk_rows to total M so
-    // chunk_start = local_m / ready_chunk_rows = 0 and chunk_end = 0 but
-    // the slot_state has already been set to 1 by comm, so polling exits immediately.
-    // Even simpler: set num_ready_chunks = 0 won't work because of the min() in kernel.
-    // Instead we rely on all flags being 1 — the polling will find them immediately.
-    // No kernel change needed: polling hits 1 on first load. But we can still eliminate
-    // the ld_acq_sys overhead by setting ready_chunk_rows = runtime_m_per_rank so that
-    // every tile maps to chunk_start=0, chunk_end=0, polling only index 0 which is ready.
-    ready_chunk_rows = static_cast<uint32_t>(runtime_m_per_rank);
-    num_ready_chunks = 1;
+    // ✅ OVERLAP design (Flux-style):
+    // - launcher already wired `current_stream` to wait for `local_ready_event`,
+    //   so the kernel launches only after the local (self) data chunk is ready.
+    // - Remote data chunks are still being copied asynchronously on `comm_stream`.
+    //   They set per-chunk barrier flags via `cudaMemsetAsync` as they complete.
+    // - The kernel polls `slot_state[src_rank][chunk_idx]` via `ld_acq_sys` before
+    //   TMA-loading each tile → CE DMA and SM execute in parallel.
+    // - We do NOT wait for `comm_done_event` here — that would serialize comm & compute.
+    // - `ready_chunk_rows` / `num_ready_chunks` use the REAL values computed by
+    //   `launch_bf16_ag_gemm_comm`, so kernel barrier polling maps tiles to actual chunks.
 
     const auto tensor_map_a = make_tma_2d_desc(slots_x,
                                                k, max_m_per_rank * num_slots,
