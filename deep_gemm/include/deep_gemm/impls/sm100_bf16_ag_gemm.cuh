@@ -110,7 +110,7 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
     if (warp_idx == kGemmWarpBase + 1 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            full_barriers[i]->init(1);
+            full_barriers[i]->init(2 * kNumMulticast);  // 2 producers (A+B) × kNumMulticast
             empty_barriers[i]->init(1);
         }
         #pragma unroll
@@ -153,16 +153,13 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
         return true;
     };
 
+    // ── Load A warp: TMA load A matrix only ──
     if (warp_idx == kGemmWarpBase and cute::elect_one_sync()) {
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
             const uint32_t src_rank = global_m / runtime_m_per_rank;
             const uint32_t local_m = global_m - src_rank * runtime_m_per_rank;
-            uint32_t n_idx = n_block_idx * BLOCK_N;
-            // 2-CTA: CTA1 loads second half of B columns
-            if constexpr (kNumMulticast > 1)
-                n_idx += cute::block_rank_in_cluster() * LOAD_BLOCK_N;
             const uint32_t slot_m = src_rank * shape_m_per_rank + local_m;
             const uint32_t chunk_start = local_m / ready_chunk_rows;
             const uint32_t chunk_end = cute::min<uint32_t>((local_m + BLOCK_M - 1) / ready_chunk_rows, num_ready_chunks - 1);
@@ -177,12 +174,33 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t>(
                     &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, slot_m, kNumMulticast);
-                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, kNumMulticast);
-                full_barriers[stage_idx]->arrive_and_expect_tx((SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) * kNumMulticast);
+                if (is_leader_cta)
+                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE * kNumMulticast);
+                else
+                    full_barriers[stage_idx]->arrive(0u);
             }
         }
-    } else if (warp_idx == kGemmWarpBase + 1 and is_leader_cta) {
+    // ── Load B warp: TMA load B matrix only (parallel with Load A) ──
+    } else if (warp_idx == kGemmWarpBase + 1 and cute::elect_one_sync()) {
+        uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
+        while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+            uint32_t n_idx = n_block_idx * BLOCK_N;
+            if constexpr (kNumMulticast > 1)
+                n_idx += cute::block_rank_in_cluster() * LOAD_BLOCK_N;
+            const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                const uint32_t k_idx = k_block_idx * BLOCK_K;
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
+                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, kNumMulticast);
+                if (is_leader_cta)
+                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE * kNumMulticast);
+                else
+                    full_barriers[stage_idx]->arrive(0u);
+            }
+        }
+    // ── MMA warp: waits for both A+B on full_barriers ──
+    } else if (warp_idx == kGemmWarpBase + 2 and is_leader_cta) {
         auto instr_desc = cute::UMMA::make_instr_desc<ab_dtype_t, ab_dtype_t, float,
                                                        UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
         auto a_desc = make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
