@@ -162,9 +162,29 @@
 
 ---
 
+---
+
+## 2026-06-12：Flux 参考分析
+
+深入分析了 Flux 项目的 BF16 + SM90 + 单机 AG GEMM 设计，输出参考文档 `docs/AG_GEMM_FLUX_REFERENCE.md`，核心发现：
+
+1. **通信与计算并行方式**：
+   - CE DMA（`cudaMemcpyAsync` + `CUStreamWriteValue`）在 Copy Stream 搬运数据
+   - GEMM kernel 在 Compute Stream 上逐 tile 通过 `SystemBarrier::wait_eq` 等待 barrier flag
+   - CE 和 SM 是不同的硬件单元，真正并行执行
+
+2. **Barrier 粒度**：per data_chunk（M/world_size 行），不等全矩阵 AG 完成即可开始计算
+
+3. **调度优化**：Tile Swizzle 将 tile 顺序按 rank 做 M 方向偏移，使每个 rank 优先计算本地数据对应的 tile（local-first）
+
+4. **与 DeepGEMM 当前实现的对应**：Phase 1 重构已覆盖 Flux 的核心设计要点（通信外移、per-chunk barrier、local-first swizzle）。后续细化方向：chunk 自适应数量、双 consumer warpgroup 交替、SM100 barrier slot 细节
+
+---
+
 ## 本轮涉及文件
 
 - `docs/AG_GEMM_ITERATION.md`
+- `docs/AG_GEMM_FLUX_REFERENCE.md`
 - `deep_gemm/include/deep_gemm/layout/bf16_ag_gemm.cuh`
 - `deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh`
 - `csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp`
