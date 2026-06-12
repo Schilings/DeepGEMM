@@ -151,7 +151,6 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {}, {},
-        {},
         {}, {},
         {}
     >);
@@ -159,7 +158,6 @@ static void __instantiate_kernel() {{
 )", args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_stages,
     args.config.num_ag_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
-    args.config.num_multicast,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.d_dtype));
     }
@@ -249,8 +247,7 @@ static void sm100_bf16_ag_gemm_nt(const torch::Tensor& d,
         .launch_args = LaunchArgs(num_sms,
                                   config.num_ag_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size,
-                                  config.num_multicast,
-                                  false /* disable PDL for multicast=2 */)
+                                  config.num_multicast)
     };
 
     const auto code = SM100BF16AGGemmRuntime::generate(args);
