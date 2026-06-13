@@ -25,24 +25,36 @@ Flux-style A2A GEMM: host-side CE DMA + compute-only kernel, per-chunk barrier p
 
 **Geo Mean: 1.239x | Avg Fused: 1105.7T | Avg Sep: 894.6T**
 
-Config: mc2, block 128×128×64, num_stages=7, 256T (128 non-epi + 128 epi), kNumReadyChunksPerSlot=4
-
-### Analysis
-
-- **Strong shapes**: N=4096, M≥8192 → 1.3-1.6x (A2A comm overhead is significant, overlap pays off)
-- **Weak shapes**: K=7168 → 1.01-1.18x (GEMM compute dominates, A2A is ~5% overhead, hard to overlap)
-- **Weakest**: 16384×7168×7168 = 1.012x (almost no A2A overhead to save)
-
-### Optimization directions to try
-
-1. **PDL (Pipeline DSL) tuning** — AG GEMM iter 1 got +1.5% from PDL
-2. **Barrier polling backoff** — `__nanosleep(200)` when polling (reduce SM power waste)
-3. **Chunk copy pipelining** — overlap multiple chunk copies on comm_stream
-4. **Launch bounds tuning** — `__launch_bounds__(256, 2)` for more occupancy
-5. **kNumReadyChunksPerSlot tuning** — 4→2 or 4→8
-6. **Communication order tuning** — try different ring order for remote pulls
+Config: mc2, block 128×128×64, num_stages=7, 256T, launch_bounds(256,1), kNumReadyChunksPerSlot=4
 
 ---
 
-## Iterations
+## Iter 1: `__launch_bounds__(256, 2)` (commit 4c500a9)
+
+**Direction**: Increase min_blocks_per_SM from 1→2 to improve SM occupancy.
+
+**Result**: Geo Mean 1.239x → **1.264x** (+2.0%) ✅ KEEP
+
+| Shape | Baseline | Iter 1 | Delta |
+|---|---|---|---|
+| 1024×4096×4096 | 1.335x | 1.380x | +3.4% |
+| 1024×7168×4096 | 1.222x | 1.179x | -3.5% |
+| 2048×4096×7168 | 1.383x | 1.401x | +1.3% |
+| 2048×7168×4096 | 1.139x | 1.141x | +0.2% |
+| 4096×4096×4096 | 1.243x | 1.449x | **+16.6%** |
+| 4096×7168×4096 | 1.345x | 1.204x | -10.5% |
+| 4096×4096×7168 | 1.159x | 1.578x | **+36.2%** |
+| 8192×4096×4096 | 1.582x | 1.560x | -1.4% |
+| 8192×7168×4096 | 1.346x | 1.347x | +0.1% |
+| 8192×7168×7168 | 1.182x | 1.179x | -0.3% |
+| 2048×7168×2048 | 1.091x | 1.073x | -1.6% |
+| 4096×7168×2048 | 1.202x | 1.211x | +0.7% |
+| 16384×7168×4096 | 1.201x | 1.120x | -6.7% |
+| 16384×7168×7168 | 1.012x | 1.026x | +1.4% |
+
+**Geo Mean**: 1.239x → 1.264x | **Avg Fused**: 1105.7T → 1129.3T
+
+**Analysis**: Mixed results—big wins on N=4096 shapes, some losses on N=7168 and large shapes. Overall geo_mean improvement is modest but positive. The launch_bounds(256,2) may be restricting register usage, benefiting compute-bound (small N) shapes but hurting communication-bound (large N/K) shapes where more registers help with barrier polling.
+
+---
 
