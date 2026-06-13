@@ -696,3 +696,34 @@ all_gather 的额外 kernel launch + 同步开销。
 - CUDA: 12.x + sm_100 target
 - PyTorch: with CUDA support
 - CUTLASS: 3.x (third-party/cutlass)
+
+---
+
+### 2026-06-13
+
+#### GEMM+RS 性能优化迭代（AKO4ALL 第二阶段）
+
+从 baseline geo_mean 1.003x (8 GPU) 开始，探索 comm section 优化。
+
+| Iter | 方向 | 8 GPU Geo Mean | 2 GPU Geo Mean | 状态 |
+|------|------|---------------|---------------|------|
+| baseline | 原始 FP32 reduce | 1.013x (12/21) | 1.091x (20/21) | ✅ 起点 |
+| 19 | 32T comm (W0 only, 288T total) | SIGABRT | — | ❌ warp映射/launch_bounds不兼容 |
+| 19b | Per-warp独立tile (384T, 32T reduce) | 0.948x (7/21) | — | ❌ 带宽利用率骤降 |
+| **20** | **BF16 __hadd2 vectorized reduce** | **1.025x (14/21)** | **1.097x (19/21)** | ✅ **已提交** |
+| 21 | hadd2 + L2 prefetch + reg dealloc 48→40 | 1.084x (2G) | — | ❌ reg减少导致退化 |
+| 21b | hadd2 + L2 prefetch only | 1.009x (12/21) | — | ❌ prefetch反而有害 |
+
+**iter20 详情**：用 BF16 __hadd2 替代 FP32 累加，4×hadd2 vs 8×float add per 16B vector。
+减少算术量和寄存器压力。8 GPU 提升 1.2%，14/21 shapes 赢。
+
+**失败分析**：
+- iter19b (32T reduce): memory bandwidth 是 reduce 瓶颈，128T→32T 导致带宽利用率从 ~100% 降至 ~25%
+- iter21 (prefetch): L2 prefetch 指令开销 + 可能 evict 有用数据，负优化
+- iter21 (reg dealloc 48→40): 编译器可能需要 48 regs 支持 prefetch + hadd2，40 不够导致 spill
+
+**剩余优化空间分析**：
+- NamedBarrier::sync(128,2) 开销：~20-40 cycles，相比 reduce 的 μs 级耗时占比很小
+- Polling 延迟：硬件延迟（NVLink + flag visibility），软件无法消除
+- K=2048 shapes 必输：compute/comm ratio 太低（16.85x），结构性问题
+- K=7168 N=7168 shapes 输：融合 kernel 的 push-based RS 效率不如 NCCL RS（专用协议）
