@@ -388,11 +388,15 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             // This avoids FP32 conversion overhead and reduces register pressure.
             // For FP32 output: fall back to original FP32 accumulation.
             if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                // ── BF16 fast path: 4× __hadd2 per 16B vector ──
-                // Each __hadd2 does 2 BF16 adds in one instruction.
-                // Total ops: 4 × (N-1) __hadd2 per vector (vs 8 × (N-1) float adds)
-                for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
-                    const uint32_t elem_offset = vec_offset * kVecSize;
+                // ── BF16 fast path: 8× __hadd2 per 32B vector (iter23: wider vec) ──
+                // Process 16 BF16 elements per iteration (32B = 2× uint4)
+                // Halves loop iterations vs 16B vec, better memory throughput
+                constexpr uint32_t kWideVecBytes = 32;
+                constexpr uint32_t kWideVecSize = kWideVecBytes / sizeof(comm_dtype_t);  // 16 BF16
+                const uint32_t wide_vecs_per_tile = elems_per_tile / kWideVecSize;
+
+                for (uint32_t wide_vec_offset = comm_thread_local_idx; wide_vec_offset < wide_vecs_per_tile; wide_vec_offset += kNumCommThreads) {
+                    const uint32_t elem_offset = wide_vec_offset * kWideVecSize;
                     const uint32_t tile_row = elem_offset / BLOCK_N;
                     const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
 
@@ -402,31 +406,40 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     if (global_row >= runtime_m_per_rank or global_col >= shape_n)
                         continue;
 
-                    // Load self-rank's contribution from output (already there from Epilogue)
+                    // Load self-rank's contribution (32B = 2× uint4)
                     auto* out_ptr = output + global_row * shape_n + global_col;
-                    uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
+                    uint4 self_data0 = *reinterpret_cast<const uint4*>(out_ptr);
+                    uint4 self_data1 = *reinterpret_cast<const uint4*>(out_ptr + kVecSize);
 
-                    // Accumulate N-1 remote ranks using __hadd2 (2 BF16 adds per instruction)
+                    // Accumulate N-1 remote ranks using __hadd2
                     #pragma unroll 1
                     for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
                         const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
 
                         const comm_dtype_t* partial_ptr =
                             workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
-                        uint4 remote_data = *reinterpret_cast<const uint4*>(partial_ptr);
 
-                        // 4× __hadd2: add 8 BF16 elements as 4 pairs
-                        auto* self_bf16x2 = reinterpret_cast<__nv_bfloat162*>(&self_data);
-                        const auto* remote_bf16x2 = reinterpret_cast<const __nv_bfloat162*>(&remote_data);
+                        // Load 32B of remote data
+                        uint4 remote_data0 = *reinterpret_cast<const uint4*>(partial_ptr);
+                        uint4 remote_data1 = *reinterpret_cast<const uint4*>(partial_ptr + kVecSize);
+
+                        // 8× __hadd2: add 16 BF16 elements as 8 pairs
+                        auto* s0 = reinterpret_cast<__nv_bfloat162*>(&self_data0);
+                        auto* s1 = reinterpret_cast<__nv_bfloat162*>(&self_data1);
+                        const auto* r0 = reinterpret_cast<const __nv_bfloat162*>(&remote_data0);
+                        const auto* r1 = reinterpret_cast<const __nv_bfloat162*>(&remote_data1);
                         #pragma unroll
                         for (uint32_t i = 0; i < 4; ++ i)
-                            self_bf16x2[i] = __hadd2(self_bf16x2[i], remote_bf16x2[i]);
+                            s0[i] = __hadd2(s0[i], r0[i]);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 4; ++ i)
+                            s1[i] = __hadd2(s1[i], r1[i]);
                     }
 
-                    // Write final reduced result to output
-                    *reinterpret_cast<uint4*>(out_ptr) = self_data;
-                }
-            } else {
+                    // Write final reduced result (32B)
+                    *reinterpret_cast<uint4*>(out_ptr) = self_data0;
+                    *reinterpret_cast<uint4*>(out_ptr + kVecSize) = self_data1;
+                }            } else {
                 // ── FP32 fallback: original FP32 accumulation ──
                 for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
                     const uint32_t elem_offset = vec_offset * kVecSize;
