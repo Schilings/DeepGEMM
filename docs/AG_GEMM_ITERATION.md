@@ -376,3 +376,27 @@ Files: deep_gemm/include/deep_gemm/layout/bf16_ag_gemm.cuh, deep_gemm/include/de
 - Root cause: likely an offset mismatch between host flag-setting and kernel flag-reading when chunk count changes
 
 ### Verdict: FAILED — reverted due to deadlock
+
+---
+
+## Iteration 6 — Interleave chunk copies across ranks
+
+### Change
+
+File: csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp
+
+- Changed remote rank copy order from per-rank-sequential to per-chunk-interleaved
+- Old: copy all chunks for rank+1, then all chunks for rank+2, etc.
+- New: copy chunk 0 for all remote ranks, then chunk 1, etc.
+
+### Results (8 GPU, 10 iters)
+
+- Geo Mean: 1.351x (but unstable, fused TFLOPS dropped from ~1100T to ~550T)
+- The separate path also became much slower, inflating the speedup ratio
+- Fused kernel actual performance DEGRADED significantly
+
+### Analysis
+
+Interleaving chunk copies across ranks caused severe performance degradation. The likely cause is CE DMA contention or MNNVL address translation issues when alternating between different remote GPUs. The original sequential-per-rank order is more efficient because the CE can optimize sequential transfers to the same destination. Interleaving forces the CE to switch between different P2P paths repeatedly, adding overhead.
+
+### Verdict: REGRESSION — reverted
