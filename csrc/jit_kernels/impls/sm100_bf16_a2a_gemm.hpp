@@ -122,27 +122,31 @@ inline void launch_bf16_a2a_gemm_comm(const torch::Tensor& sym_buffer,
             reinterpret_cast<uintptr_t>(workspace.get_local_x_ptr(rank_idx, row_start)));
 
         DG_CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, chunk_bytes, cudaMemcpyDefault, comm_stream));
+        // [Iter 7] No per-chunk flag here — batched per-rank flag setting below
+    };
 
-        // Set per-chunk ready flag
-        auto* chunk_state_ptr = local_state_base + src_rank * kNumReadyChunksPerSlot + chunk_idx;
-        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(chunk_state_ptr, 1, sizeof(uint32_t), comm_stream));
+    // Helper: batch-set all chunk flags for a rank at once
+    auto set_rank_flags = [&](const int src_rank) {
+        auto* rank_state_ptr = local_state_base + src_rank * kNumReadyChunksPerSlot;
+        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(rank_state_ptr, 1, sizeof(uint32_t) * num_ready_chunks, comm_stream));
     };
 
     // Step 1: Copy local chunk (self -> self) first for early kernel launch
     for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
         launch_chunk_copy(rank_idx, static_cast<int>(chunk_idx));
+    set_rank_flags(rank_idx);  // Batch: set all self flags at once
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(local_ready_event, comm_stream));
 
-    // Step 2: Pull remote chunks — interleave by chunk index across ranks
-    // Instead of copying all chunks of rank A, then all of rank B, etc.,
-    // we copy chunk 0 of all ranks, then chunk 1, etc.
-    // This lets the kernel start processing earlier ranks' chunk 0 sooner,
-    // improving comm-compute overlap for the first few tiles.
-    for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx) {
-        for (int step = 1; step < num_ranks; ++ step) {
-            const int src_rank = (rank_idx + num_ranks - step) % num_ranks;
+    // Step 2: Pull remote chunks — rank-order with batched flag setting
+    // [Iter 7] Changed from chunk-interleave to rank-order with batched flags.
+    // This reduces host-side cudaMemsetAsync calls from N*chunks to N,
+    // and rank-order + batched flags lets kernel start processing a rank
+    // as soon as ALL its chunks arrive (same latency as before but fewer host calls).
+    for (int step = 1; step < num_ranks; ++ step) {
+        const int src_rank = (rank_idx + num_ranks - step) % num_ranks;
+        for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
             launch_chunk_copy(src_rank, static_cast<int>(chunk_idx));
-        }
+        set_rank_flags(src_rank);  // Set flags after all chunks of this rank copied
     }
 
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(comm_done_event, comm_stream));
