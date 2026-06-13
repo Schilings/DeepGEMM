@@ -116,7 +116,7 @@ sm100_bf16_ag_gemm_nt_impl(void* d,
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
             tmem_full_barriers[i]->init(1);
-            tmem_empty_barriers[i]->init(kNumUMMAStoreThreads);
+            tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
         }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == kGemmWarpBase + 2) {
