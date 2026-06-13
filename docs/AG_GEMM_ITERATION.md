@@ -334,3 +334,27 @@ File: deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh
 The nanosleep backoff did not help. The polling is done by a single thread (elect_one) per CTA, so SM overhead from busy-waiting is minimal. Chunk wait times are short enough (sub-microsecond for most shapes) that the busy-spin is more efficient than introducing nanosleep overhead. The 200ns sleep adds latency to the fast path without sufficient benefit on the slow path.
 
 ### Verdict: REGRESSION — reverted, try next direction
+
+---
+
+## Iteration 4 — Register allocation: launch_bounds(256, 2)
+
+### Change
+
+File: deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh
+
+- Changed __launch_bounds__(256, 1) to __launch_bounds__(256, 2)
+- min_blocks_per_sm=2 allows 2 CTAs/SM, giving more occupancy but fewer registers per thread
+
+### Results (8 GPU, 10 iters)
+
+- Geo Mean: 1.131x (was 1.133x) — essentially neutral, slight regression
+- 17/17 wins
+- K=7168 target shapes improved: 10240x7168x4096 1.08x->1.17x, 10240x7168x7168 1.00x->1.03x
+- Small K=4096 shapes regressed: 4096x4096x4096 1.46x->1.36x
+
+### Analysis
+
+min_blocks_per_sm=2 increases occupancy (2 CTAs/SM) at the cost of fewer registers per thread (127 vs 255 max). This benefits K=7168 shapes (more latency hiding) but hurts K=4096 shapes (possible register spills). Net effect is neutral.
+
+### Verdict: NEUTRAL — reverted, try next direction
