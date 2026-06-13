@@ -1,0 +1,146 @@
+#pragma once
+
+#include <functional>
+#include <pybind11/functional.h>
+
+#include "../jit/device_runtime.hpp"
+#include "layout.hpp"
+
+#if DG_TENSORMAP_COMPATIBLE
+#include "../jit_kernels/impls/sm100_bf16_gemm_rs_compute.hpp"
+#include "../jit_kernels/impls/sm100_rs_reduce.hpp"
+#endif
+
+#include <deep_gemm/layout/gemm_rs.cuh>
+
+
+namespace deep_gemm::gemm_rs_compute {
+
+// Reuse the same symm buffer utilities from single-kernel GEMM+RS
+static int get_token_alignment_for_gemm_rs_compute() {
+    return 128;
+}
+
+static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+get_symm_buffer_size_for_gemm_rs_compute(const int& num_ranks,
+                                          const int& num_max_tokens_per_rank,
+                                          const int& hidden,
+                                          const bool& use_fp32_output) {
+    // Same buffer layout as single-kernel GEMM+RS
+    return gemm_rs::get_symm_buffer_size_for_gemm_rs(num_ranks, num_max_tokens_per_rank, hidden, use_fp32_output);
+}
+
+// ====================================================================
+//  Dual-kernel GEMM Compute + RS Reduce (v3)
+//  - GEMM compute kernel on default stream
+//  - RS reduce kernel on a separate comm stream
+// ====================================================================
+static void bf16_gemm_rs_compute_nt(const torch::Tensor& y,
+                                     const torch::Tensor& a,
+                                     const torch::Tensor& b,
+                                     const torch::Tensor& sym_buffer,
+                                     const std::vector<int64_t>& sym_buffer_ptrs,
+                                     const int& rank_idx,
+                                     const int& num_max_tokens_per_rank,
+                                     const int& num_tokens_per_rank,
+                                     const std::string& compiled_dims,
+                                     const std::string& comm_dtype_str = "bf16") {
+#if DG_TENSORMAP_COMPATIBLE
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+    DG_HOST_ASSERT(sym_buffer_ptrs.size() > 1);
+    DG_HOST_ASSERT(rank_idx >= 0 and rank_idx < static_cast<int>(sym_buffer_ptrs.size()));
+    DG_HOST_ASSERT(num_tokens_per_rank > 0 and num_tokens_per_rank <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_tokens_per_rank % get_token_alignment_for_gemm_rs_compute() == 0);
+
+    const auto major_a = get_major_type_ab(a);
+    const auto major_b = get_major_type_ab(b);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    const auto [m, k] = get_shape<2>(a);
+    const auto [n, k_] = get_shape<2>(b);
+    const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(m == num_tokens_per_rank * num_ranks and k == k_);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16);
+    const auto [ym, yn] = get_shape<2>(y);
+    DG_HOST_ASSERT(ym == num_tokens_per_rank and yn == n);
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16 or y.scalar_type() == torch::kFloat);
+    check_major_type_cd(y);
+    DG_HOST_ASSERT(n % 128 == 0 and k % 64 == 0);
+
+    // Parse communication dtype
+    at::ScalarType comm_dtype;
+    if (comm_dtype_str == "bf16" or comm_dtype_str == "bfloat16") {
+        comm_dtype = torch::kBFloat16;
+    } else if (comm_dtype_str == "fp32" or comm_dtype_str == "float32") {
+        comm_dtype = torch::kFloat;
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported comm_dtype: must be 'bf16' or 'fp32'");
+    }
+
+    const bool use_fp32_comm = (comm_dtype == torch::kFloat);
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_gemm_rs_compute(
+        num_ranks, num_max_tokens_per_rank, n, use_fp32_comm);
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+
+    // Launch GEMM compute kernel on default stream
+    sm100_bf16_gemm_rs_compute_nt(y, a, b, sym_buffer, sym_buffer_ptrs, rank_idx,
+                                   num_max_tokens_per_rank, num_tokens_per_rank, n, k, compiled_dims,
+                                   comm_dtype);
+#else
+    DG_HOST_UNREACHABLE("BF16 GEMM+RS Compute requires TensorMap support");
+#endif
+}
+
+static void rs_reduce(const torch::Tensor& y,
+                      const torch::Tensor& sym_buffer,
+                      const std::vector<int64_t>& sym_buffer_ptrs,
+                      const int& rank_idx,
+                      const int& num_max_tokens_per_rank,
+                      const int& num_tokens_per_rank,
+                      const int& n,
+                      const std::string& comm_dtype_str = "bf16") {
+#if DG_TENSORMAP_COMPATIBLE
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+    DG_HOST_ASSERT(sym_buffer_ptrs.size() > 1);
+    DG_HOST_ASSERT(rank_idx >= 0 and rank_idx < static_cast<int>(sym_buffer_ptrs.size()));
+
+    // Parse communication dtype
+    at::ScalarType comm_dtype;
+    if (comm_dtype_str == "bf16" or comm_dtype_str == "bfloat16") {
+        comm_dtype = torch::kBFloat16;
+    } else if (comm_dtype_str == "fp32" or comm_dtype_str == "float32") {
+        comm_dtype = torch::kFloat;
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported comm_dtype: must be 'bf16' or 'fp32'");
+    }
+
+    // Launch RS reduce kernel
+    sm100_rs_reduce(y, sym_buffer, sym_buffer_ptrs, rank_idx,
+                    num_max_tokens_per_rank, num_tokens_per_rank, n, comm_dtype);
+#else
+    DG_HOST_UNREACHABLE("RS Reduce requires TensorMap support");
+#endif
+}
+
+static void register_apis(pybind11::module_& m) {
+#if DG_TENSORMAP_COMPATIBLE
+    m.def("get_token_alignment_for_gemm_rs_compute", &get_token_alignment_for_gemm_rs_compute);
+    m.def("get_symm_buffer_size_for_gemm_rs_compute", &get_symm_buffer_size_for_gemm_rs_compute);
+    m.def("bf16_gemm_rs_compute_nt", &bf16_gemm_rs_compute_nt,
+          pybind11::arg("y"), pybind11::arg("a"), pybind11::arg("b"), pybind11::arg("sym_buffer"),
+          pybind11::arg("sym_buffer_ptrs"), pybind11::arg("rank_idx"),
+          pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_tokens_per_rank"),
+          pybind11::arg("compiled_dims") = "nk",
+          pybind11::arg("comm_dtype") = "bf16");
+    m.def("rs_reduce", &rs_reduce,
+          pybind11::arg("y"), pybind11::arg("sym_buffer"),
+          pybind11::arg("sym_buffer_ptrs"), pybind11::arg("rank_idx"),
+          pybind11::arg("num_max_tokens_per_rank"), pybind11::arg("num_tokens_per_rank"),
+          pybind11::arg("n"),
+          pybind11::arg("comm_dtype") = "bf16");
+#endif
+}
+
+
+} // namespace deep_gemm::gemm_rs_compute

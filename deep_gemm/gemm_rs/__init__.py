@@ -111,3 +111,61 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
         compiled_dims,
         comm_dtype_str,
     )
+
+
+def bf16_gemm_rs_nt_v3(y: torch.Tensor,
+                        a: torch.Tensor,
+                        b: torch.Tensor,
+                        sym_buffer: GemmRSSymmBuffer,
+                        num_tokens_per_rank: int,
+                        compiled_dims: str = 'nk'):
+    """
+    BF16 GEMM + Reduce-Scatter v3: Dual-kernel architecture with stream-level overlap.
+
+    This implementation:
+    - Uses two separate kernels on different CUDA streams
+    - Kernel 1 (GEMM Compute): 256T, no Comm Warps — pure GEMM + epilogue scatter write + flag signaling
+    - Kernel 2 (RS Reduce): 256T/CTA, per-tile polling — waits for flags, then reduces partial results
+    - Natural pipeline overlap: while GEMM computes later tiles, RS reduce processes earlier ones
+
+    Args:
+        y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
+        a: Input matrix [total_tokens, K], dtype bfloat16
+        b: Weight matrix [N, K] (NT layout), dtype bfloat16
+        sym_buffer: Symmetric buffer (created via get_symm_buffer_for_gemm_rs)
+        num_tokens_per_rank: Actual tokens per rank for this call
+        compiled_dims: JIT compilation dimension string
+    """
+    assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt_v3 is for SM100/B-series GPUs'
+    comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
+
+    # Create a communication stream for RS reduce kernel
+    comm_stream = torch.cuda.Stream()
+
+    # Launch GEMM compute kernel on default stream
+    _C.bf16_gemm_rs_compute_nt(
+        y, a, b,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        num_tokens_per_rank,
+        compiled_dims,
+        comm_dtype_str,
+    )
+
+    # Launch RS reduce kernel on comm_stream
+    with torch.cuda.stream(comm_stream):
+        _C.rs_reduce(
+            y,
+            sym_buffer.buffer,
+            sym_buffer.handle.buffer_ptrs,
+            sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
+            num_tokens_per_rank,
+            sym_buffer.hidden,
+            comm_dtype_str,
+        )
+
+    # Wait for comm_stream to complete
+    torch.cuda.current_stream().wait_stream(comm_stream)
