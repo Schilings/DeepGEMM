@@ -102,27 +102,21 @@ inline void launch_bf16_a2a_gemm_comm(const torch::Tensor& sym_buffer,
     DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(
         local_state_base, 0, sizeof(uint32_t) * num_slots * kNumReadyChunksPerSlot, comm_stream));
 
-    // Helper: copy a chunk from src_rank's local_x[rank_idx] into my slot[src_rank]
-    // In A2A: src_rank sends me its local_x[rank_idx] (the chunk destined for me)
-    auto launch_chunk_copy = [&](const int src_rank, const int chunk_idx) {
-        const int row_start = chunk_idx * static_cast<int>(ready_chunk_rows);
-        if (row_start >= runtime_m_per_rank)
-            return;
-        const int row_count = std::min(runtime_m_per_rank - row_start, static_cast<int>(ready_chunk_rows));
-        const size_t chunk_bytes = static_cast<size_t>(row_count) * k * sizeof(cutlass::bfloat16_t);
+    // [Iter 8] Merge all chunks of a rank into a single memcpy for fewer host API calls
+    // Helper: copy entire rank data (all chunks) in one memcpy
+    auto launch_rank_copy = [&](const int src_rank) {
+        const size_t total_bytes = static_cast<size_t>(runtime_m_per_rank) * k * sizeof(cutlass::bfloat16_t);
 
-        // Destination: my slot[src_rank], offset by row_start
+        // Destination: my slot[src_rank], start of data
         auto* dst = math::advance_ptr(
-            sym_buffer.data_ptr(), reinterpret_cast<uintptr_t>(workspace.get_slot_x_ptr(src_rank, row_start)));
+            sym_buffer.data_ptr(), reinterpret_cast<uintptr_t>(workspace.get_slot_x_ptr(src_rank, 0)));
 
-        // Source: src_rank's local_x[rank_idx, row_start]
-        // local_x[chunk_idx=rank_idx, token_idx=row_start] gives rank src_rank's data for me
+        // Source: src_rank's local_x[rank_idx, 0] (all data this rank sent me)
         auto* src = math::advance_ptr(
             reinterpret_cast<void*>(sym_buffer_ptrs[src_rank]),
-            reinterpret_cast<uintptr_t>(workspace.get_local_x_ptr(rank_idx, row_start)));
+            reinterpret_cast<uintptr_t>(workspace.get_local_x_ptr(rank_idx, 0)));
 
-        DG_CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, chunk_bytes, cudaMemcpyDefault, comm_stream));
-        // [Iter 7] No per-chunk flag here — batched per-rank flag setting below
+        DG_CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, total_bytes, cudaMemcpyDefault, comm_stream));
     };
 
     // Helper: batch-set all chunk flags for a rank at once
@@ -131,22 +125,19 @@ inline void launch_bf16_a2a_gemm_comm(const torch::Tensor& sym_buffer,
         DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(rank_state_ptr, 1, sizeof(uint32_t) * num_ready_chunks, comm_stream));
     };
 
-    // Step 1: Copy local chunk (self -> self) first for early kernel launch
-    for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
-        launch_chunk_copy(rank_idx, static_cast<int>(chunk_idx));
-    set_rank_flags(rank_idx);  // Batch: set all self flags at once
+    // Step 1: Copy local data (self -> self) first for early kernel launch
+    launch_rank_copy(rank_idx);
+    set_rank_flags(rank_idx);
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(local_ready_event, comm_stream));
 
-    // Step 2: Pull remote chunks — rank-order with batched flag setting
-    // [Iter 7] Changed from chunk-interleave to rank-order with batched flags.
-    // This reduces host-side cudaMemsetAsync calls from N*chunks to N,
-    // and rank-order + batched flags lets kernel start processing a rank
-    // as soon as ALL its chunks arrive (same latency as before but fewer host calls).
+    // Step 2: Pull remote data — rank-order with merged memcpy + batched flag setting
+    // [Iter 8] Single memcpy per rank (vs N chunks), batched flags.
+    // Reduces cudaMemcpyAsync calls from N*chunks to N (e.g. 32→8) and
+    // cudaMemsetAsync calls from N*chunks to N (32→8).
     for (int step = 1; step < num_ranks; ++ step) {
         const int src_rank = (rank_idx + num_ranks - step) % num_ranks;
-        for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
-            launch_chunk_copy(src_rank, static_cast<int>(chunk_idx));
-        set_rank_flags(src_rank);  // Set flags after all chunks of this rank copied
+        launch_rank_copy(src_rank);
+        set_rank_flags(src_rank);
     }
 
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(comm_done_event, comm_stream));
