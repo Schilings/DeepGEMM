@@ -219,3 +219,31 @@ than many small fragmented ones. All shapes now have speedup >= 0.992x.
 4. 4卡是部分大 shape 的甜蜜点
 5. 2卡始终有正收益 (≥1.061x)
 
+
+## Communication vs Compute Breakdown (Iter 8, CUDA events, 10 iters)
+
+### 8卡关键数据
+
+| Shape | A2A ms | GEMM ms | Fused ms | 理论max(A2A,GEMM) | 实际Overlap% | A2A占比 |
+|-------|--------|---------|----------|-------------------|-------------|---------|
+| 1024×4096×4096 | 0.172 | 0.164 | 0.242 | 0.172 | 27.9% | 51.3% |
+| 8192×4096×4096 | 1.029 | 1.295 | 1.612 | 1.295 | 30.6% | 44.3% |
+| 4096×4096×7168 | 0.844 | 1.143 | 1.505 | 1.143 | 24.3% | 42.5% |
+| 8192×7168×7168 | 1.917 | 4.438 | 6.039 | 4.438 | 5.0% | 30.2% |
+| 16384×7168×7168 | 3.214 | 9.806 | 13.002 | 9.806 | 0.1% | 24.7% |
+
+### 结论
+
+**瓶颈是 A2A 通信**，但不是简单的GEMM 等 A2A 串行，而是：
+
+1. **A2A 占比 > 40% → overlap 好生效** (20-33% overlap)。此时 GEMM 可以在等数据时持续算 self-rank tile
+2. **A2A 占比 < 30% → overlap 几乎失效** (0-5%)。GEMM 主导但 fused kernel 的 polling/CE 开销仍存，fused ≈ A2A + GEMM
+3. **16384×7168×7168 极端案例**：理论 fused 应 ≈ GEMM=9.8ms，实际 13.0ms。额外 3.2ms = A2A 时间，说明 A2A 完全没被隐藏
+
+### 根因：Flux-style 重叠的结构性局限
+
+- Self-rank tile 可立即计算（数据本地）
+- Remote-rank tile 必须等 A2A flag → kernel 在 polling 时**空转**
+- Shape 越大 → remote rank tile 越多 → 等待比例越高 → overlap 效果越差
+- 8卡 A2A 绝对时间更长 (7 vs 3 远端) + flag 开销更大 (28 vs 12 flags) → 更难 overlap
+
