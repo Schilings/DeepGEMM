@@ -358,3 +358,21 @@ File: deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh
 min_blocks_per_sm=2 increases occupancy (2 CTAs/SM) at the cost of fewer registers per thread (127 vs 255 max). This benefits K=7168 shapes (more latency hiding) but hurts K=4096 shapes (possible register spills). Net effect is neutral.
 
 ### Verdict: NEUTRAL — reverted, try next direction
+
+---
+
+## Iteration 5 — Increase kNumReadyChunksPerSlot 4->8
+
+### Change
+
+Files: deep_gemm/include/deep_gemm/layout/bf16_ag_gemm.cuh, deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh
+
+- Changed kNumReadyChunksPerSlot from 4 to 8 for finer-grained overlap
+- Goal: kernel can start processing remote rank tiles as soon as first sub-chunk arrives
+
+### Results
+
+- DEADLOCK — test hangs on first shape
+- Root cause: likely an offset mismatch between host flag-setting and kernel flag-reading when chunk count changes
+
+### Verdict: FAILED — reverted due to deadlock
