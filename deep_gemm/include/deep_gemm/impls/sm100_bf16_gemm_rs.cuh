@@ -384,61 +384,88 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             cutlass::arch::NamedBarrier::sync(kNumCommThreads, 2);
 
             // ── Phase 2: Reduce N-1 remote ranks + existing output (self-rank) ──
-            // Output already contains self-rank's contribution (written by Epilogue).
-            // Load output value + accumulate N-1 remote partials → write back.
-            for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
-                const uint32_t elem_offset = vec_offset * kVecSize;
-                const uint32_t tile_row = elem_offset / BLOCK_N;
-                const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
+            // iter20: Use BF16 __hadd2 for vectorized reduce when output is BF16.
+            // This avoids FP32 conversion overhead and reduces register pressure.
+            // For FP32 output: fall back to original FP32 accumulation.
+            if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
+                // ── BF16 fast path: 4× __hadd2 per 16B vector ──
+                // Each __hadd2 does 2 BF16 adds in one instruction.
+                // Total ops: 4 × (N-1) __hadd2 per vector (vs 8 × (N-1) float adds)
+                for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
+                    const uint32_t elem_offset = vec_offset * kVecSize;
+                    const uint32_t tile_row = elem_offset / BLOCK_N;
+                    const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
 
-                const uint32_t global_row = base_row + tile_row;
-                const uint32_t global_col = base_col + tile_col;
+                    const uint32_t global_row = base_row + tile_row;
+                    const uint32_t global_col = base_col + tile_col;
 
-                if (global_row >= runtime_m_per_rank or global_col >= shape_n)
-                    continue;
+                    if (global_row >= runtime_m_per_rank or global_col >= shape_n)
+                        continue;
 
-                // Load self-rank's contribution from output (already there from Epilogue)
-                auto* out_ptr = output + global_row * shape_n + global_col;
-                uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
+                    // Load self-rank's contribution from output (already there from Epilogue)
+                    auto* out_ptr = output + global_row * shape_n + global_col;
+                    uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
 
-                float acc[kVecSize];
-                if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                    const auto* self_bf16 = reinterpret_cast<const cd_dtype_t*>(&self_data);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i)
-                        acc[i] = static_cast<float>(self_bf16[i]);
-                } else {
+                    // Accumulate N-1 remote ranks using __hadd2 (2 BF16 adds per instruction)
+                    #pragma unroll 1
+                    for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
+                        const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
+
+                        const comm_dtype_t* partial_ptr =
+                            workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
+                        uint4 remote_data = *reinterpret_cast<const uint4*>(partial_ptr);
+
+                        // 4× __hadd2: add 8 BF16 elements as 4 pairs
+                        auto* self_bf16x2 = reinterpret_cast<__nv_bfloat162*>(&self_data);
+                        const auto* remote_bf16x2 = reinterpret_cast<const __nv_bfloat162*>(&remote_data);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < 4; ++ i)
+                            self_bf16x2[i] = __hadd2(self_bf16x2[i], remote_bf16x2[i]);
+                    }
+
+                    // Write final reduced result to output
+                    *reinterpret_cast<uint4*>(out_ptr) = self_data;
+                }
+            } else {
+                // ── FP32 fallback: original FP32 accumulation ──
+                for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
+                    const uint32_t elem_offset = vec_offset * kVecSize;
+                    const uint32_t tile_row = elem_offset / BLOCK_N;
+                    const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
+
+                    const uint32_t global_row = base_row + tile_row;
+                    const uint32_t global_col = base_col + tile_col;
+
+                    if (global_row >= runtime_m_per_rank or global_col >= shape_n)
+                        continue;
+
+                    // Load self-rank's contribution from output (already there from Epilogue)
+                    auto* out_ptr = output + global_row * shape_n + global_col;
+                    uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
+
+                    float acc[kVecSize];
                     const auto* self_f32 = reinterpret_cast<const float*>(&self_data);
                     #pragma unroll
                     for (uint32_t i = 0; i < kVecSize; ++ i)
                         acc[i] = self_f32[i];
-                }
 
-                // Accumulate N-1 remote ranks' contributions from local partial buffer
-                #pragma unroll 1
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
-                    const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
+                    // Accumulate N-1 remote ranks' contributions from local partial buffer
+                    #pragma unroll 1
+                    for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
+                        const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
 
-                    const comm_dtype_t* partial_ptr =
-                        workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
+                        const comm_dtype_t* partial_ptr =
+                            workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
 
-                    uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
-                    const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
+                        uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
+                        const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
 
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i)
-                        acc[i] += static_cast<float>(comm_data[i]);
-                }
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += static_cast<float>(comm_data[i]);
+                    }
 
-                // Write final reduced result to output
-                if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                    uint4 result;
-                    auto* out_bf16 = reinterpret_cast<cd_dtype_t*>(&result);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i)
-                        out_bf16[i] = cd_dtype_t(acc[i]);
-                    *reinterpret_cast<uint4*>(out_ptr) = result;
-                } else {
+                    // Write final reduced result to output
                     uint4 result;
                     auto* out_f32 = reinterpret_cast<float*>(&result);
                     #pragma unroll
