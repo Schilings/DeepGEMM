@@ -78,7 +78,7 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
             const auto start_clock = clock64();
             while (ld_acq_sys(poll_ptr) == 0u) {
                 if (clock64() - start_clock >= kTimeoutCycles) {
-                    printf("RS reduce timeout: rank=%d, src=%d, tile=(%d,%d)\n",
+                    // printf("RS reduce timeout: rank=%d, src=%d, tile=(%d,%d)\n",
                            rank_idx, src_rank, my_m_block, my_n_block);
                     break;
                 }
