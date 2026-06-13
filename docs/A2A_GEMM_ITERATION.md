@@ -62,3 +62,85 @@ data from the same rank is still in flight.
 
 ---
 
+
+## Iter 4: Mixed chunk interleave (chunk 0 interleave + chunk 1+ rank-order) ❌ REVERTED
+
+**Direction**: Combine chunk 0 interleave (for early data) with rank-order for chunk 1+ (for NVLink continuity).
+**Result**: 1.344x → 1.289x (-4.1%). Mixed strategy breaks NVLink transfer continuity for later chunks.
+**Lesson**: Either fully interleave or fully rank-order; mixing patterns confuses the NVLink scheduler.
+
+## Iter 5: kNumReadyChunksPerSlot 4→2 ❌ REVERTED
+
+**Direction**: Reduce per-slot chunk count from 4 to 2, hoping to reduce flag overhead.
+**Result**: Geo Mean 1.150x → 1.144x (-0.5%). Larger chunks reduce comm-compute overlap granularity.
+**Lesson**: More fine-grained chunks improve overlap opportunity. Reducing chunks hurts.
+
+## Iter 5b: kNumReadyChunksPerSlot 4→8 ❌ REVERTED
+
+**Direction**: Increase per-slot chunk count to 8 for finer-grained overlap.
+**Result**: Geo Mean 1.150x → 0.748x (-35%). 8 flags per rank × 8 ranks = massive memset + flag overhead.
+**Lesson**: More chunks ≠ more overlap. Flag management overhead grows faster than overlap benefit.
+
+## Iter 6a: Dual-stream (self on current_stream) ❌ REVERTED
+
+**Direction**: Move self chunk copy + flag to current_stream, remote copies on comm_stream.
+**Result**: Geo Mean 1.150x → 0.977x (-15%). Reversed stream dependency increases comm_stream wait time.
+**Lesson**: Keep all communication on comm_stream; current_stream should only wait for local_ready_event.
+
+## Iter 6b: Remove #pragma unroll on polling loop ❌ REVERTED
+
+**Direction**: Let compiler decide loop unrolling for the kNumReadyChunksPerSlot polling loop.
+**Result**: Geo Mean 1.150x → 0.956x (-17%). Unrolled loop with conditional skip is faster than rolled loop.
+**Lesson**:  with branch is optimal for small constant iteration counts.
+
+## Iter 6c: Skip self-rank flag polling ❌ REVERTED
+
+**Direction**: Skip  polling when src_rank == rank_idx (self data always ready).
+**Result**: Geo Mean 1.150x → 0.958x (-17%). Branch divergence penalty > polling savings.
+**Lesson**: Warp-level conditional skip for self-rank doesn't help due to branch divergence.
+
+## Iter 7: Rank-order copy + batched flag setting (commit 15b6d33) ✅ KEEP
+
+**Direction**: Replace per-chunk flag memset with per-rank batched flag setting, and switch back to rank-order copy.
+- Old: chunk-interleave + per-chunk  after each copy → 32 memset calls
+- New: rank-order + batched  per rank after all rank's chunks copied → 8 memset calls
+
+Rank-order lets NVLink transfer data more continuously for each source rank.
+Batched flags reduce host-side API call overhead by 4x.
+
+**Result**: Geo Mean 1.150x → **1.217x** (+5.8%) | Avg Fused 1140.8T → **1187.9T** (+4.1%)
+
+| Shape | Iter 3 (20iter) | Iter 7 (20iter) | Δ |
+|---|---|---|---|
+| 1024×4096×4096 | 0.917x | **1.200x** | **+30.9%** |
+| 1024×7168×4096 | 0.935x | **1.200x** | +28.3% |
+| 2048×4096×7168 | 1.021x | **1.319x** | +29.2% |
+| 2048×7168×4096 | 0.965x | **1.122x** | +16.3% |
+| 4096×4096×4096 | 1.129x | **1.450x** | +28.4% |
+| 4096×7168×4096 | 0.993x | **1.342x** | +35.1% |
+| 4096×4096×7168 | 1.120x | **1.499x** | +33.8% |
+| 8192×4096×4096 | 1.193x | **1.610x** | +34.9% |
+| 8192×7168×4096 | 1.190x | **1.187x** | -0.3% |
+| 8192×7168×7168 | 1.074x | **0.990x** | -7.8% |
+| 2048×7168×2048 | 0.979x | **1.113x** | +13.7% |
+| 4096×7168×2048 | 1.045x | **1.154x** | +10.4% |
+| 16384×7168×4096 | 1.068x | **1.040x** | -2.6% |
+| 16384×7168×7168 | 0.979x | **0.997x** | +1.8% |
+
+**Geo Mean**: 1.150x → **1.217x** | **Avg Fused**: 1140.8T → **1187.9T**
+
+**Key insight**: Reducing host-side API call overhead (32→8 cudaMemsetAsync) is more impactful than
+the theoretical overlap benefit of chunk-interleave. Rank-order + batched flags gives the best of both:
+NVLink continuity per-rank AND fewer host-side calls. All shapes now have speedup >= 0.99x.
+
+---
+
+## Summary (CUDA events timing)
+
+| Iter | Geo Mean | Avg Fused TFLOPS | Status |
+|------|----------|-------------------|--------|
+| Baseline | 1.239x (Python) | 1105.7T (Python) | — |
+| Iter 1 | +2.0% | — | ✅ launch_bounds(256,2) |
+| Iter 3 | +6.3% (Python) | — | ✅ chunk-interleave |
+| Iter 3 (CUDA events) | 1.150x | 1140.8T | Reference |
+| **Iter 7** | **1.217x** | **1187.9T** | ✅ **Current best** |
