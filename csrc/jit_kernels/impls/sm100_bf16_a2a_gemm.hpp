@@ -133,12 +133,16 @@ inline void launch_bf16_a2a_gemm_comm(const torch::Tensor& sym_buffer,
         launch_chunk_copy(rank_idx, static_cast<int>(chunk_idx));
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(local_ready_event, comm_stream));
 
-    // Step 2: Pull remote chunks in ring order: (rank_idx-1), (rank_idx-2), ..., (rank_idx+1)
-    // This matches the kernel's compute order so remote data arrives in the order the kernel needs it
-    for (int step = 1; step < num_ranks; ++ step) {
-        const int src_rank = (rank_idx + num_ranks - step) % num_ranks;
-        for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
+    // Step 2: Pull remote chunks — interleave by chunk index across ranks
+    // Instead of copying all chunks of rank A, then all of rank B, etc.,
+    // we copy chunk 0 of all ranks, then chunk 1, etc.
+    // This lets the kernel start processing earlier ranks' chunk 0 sooner,
+    // improving comm-compute overlap for the first few tiles.
+    for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx) {
+        for (int step = 1; step < num_ranks; ++ step) {
+            const int src_rank = (rank_idx + num_ranks - step) % num_ranks;
             launch_chunk_copy(src_rank, static_cast<int>(chunk_idx));
+        }
     }
 
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(comm_done_event, comm_stream));
