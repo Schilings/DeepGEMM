@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -16,6 +17,137 @@
 
 namespace deep_gemm {
 
+namespace {
+
+inline cudaStream_t get_bf16_a2a_gemm_comm_stream() {
+    static thread_local auto stream = at::cuda::getStreamFromPool(true, at::cuda::current_device());
+    return stream.stream();
+}
+
+inline cudaEvent_t get_bf16_a2a_gemm_input_ready_event() {
+    static thread_local cudaEvent_t event = []() {
+        cudaEvent_t input_ready_event;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&input_ready_event, cudaEventDisableTiming));
+        return input_ready_event;
+    }();
+    return event;
+}
+
+inline cudaEvent_t get_bf16_a2a_gemm_local_ready_event() {
+    static thread_local cudaEvent_t event = []() {
+        cudaEvent_t local_event;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&local_event, cudaEventDisableTiming));
+        return local_event;
+    }();
+    return event;
+}
+
+inline cudaEvent_t get_bf16_a2a_gemm_comm_done_event() {
+    static thread_local cudaEvent_t event = []() {
+        cudaEvent_t done_event;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&done_event, cudaEventDisableTiming));
+        return done_event;
+    }();
+    return event;
+}
+
+// Host-side A2A communication via CE DMA (Flux-style).
+//
+// A2A semantics: each rank i has local_x[num_ranks, M_per_rank, K],
+// where local_x[j] is the chunk to send to rank j.
+//
+// Communication (PULL pattern):
+//   1. Clear local slot_state flags
+//   2. Copy local_x[rank_idx] -> slot[rank_idx] (local copy, self chunk)
+//   3. For each remote rank j: pull j's local_x[rank_idx] into my slot[j]
+//   4. Each copy sets per-chunk ready flags
+//
+// Overlap: kernel launches after local_ready_event; remote copies continue
+// on comm_stream, kernel polls per-chunk flags.
+inline void launch_bf16_a2a_gemm_comm(const torch::Tensor& sym_buffer,
+                                      const std::vector<int64_t>& sym_buffer_ptrs,
+                                      const int& rank_idx,
+                                      const int& max_m_per_rank,
+                                      const int& runtime_m_per_rank,
+                                      const int& num_slots,
+                                      const int& k,
+                                      const int& block_m,
+                                      uint32_t& ready_chunk_rows,
+                                      uint32_t& num_ready_chunks,
+                                      cudaEvent_t& comm_done_event) {
+    const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto workspace = layout::BF16A2AGemmWorkspace(nullptr, num_ranks, max_m_per_rank, k, num_slots);
+    constexpr uint32_t kNumReadyChunksPerSlot = layout::BF16A2AGemmWorkspace::kNumReadyChunksPerSlot;
+    DG_HOST_ASSERT(runtime_m_per_rank > 0 and block_m > 0);
+
+    auto ceil_div = [](const int a, const int b) { return (a + b - 1) / b; };
+    auto align_up = [&](const int x, const int alignment) { return ceil_div(x, alignment) * alignment; };
+
+    ready_chunk_rows = static_cast<uint32_t>(std::max(block_m, align_up(ceil_div(runtime_m_per_rank, static_cast<int>(kNumReadyChunksPerSlot)), block_m)));
+    num_ready_chunks = static_cast<uint32_t>(ceil_div(runtime_m_per_rank, static_cast<int>(ready_chunk_rows)));
+    DG_HOST_ASSERT(1 <= num_ready_chunks and num_ready_chunks <= kNumReadyChunksPerSlot);
+
+    const auto current_stream = at::cuda::getCurrentCUDAStream();
+    const auto comm_stream = get_bf16_a2a_gemm_comm_stream();
+    const auto input_ready_event = get_bf16_a2a_gemm_input_ready_event();
+    const auto local_ready_event = get_bf16_a2a_gemm_local_ready_event();
+    comm_done_event = get_bf16_a2a_gemm_comm_done_event();
+
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(input_ready_event, current_stream.stream()));
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(comm_stream, input_ready_event, 0));
+
+    // Clear all slot_state flags
+    auto* local_state_base = reinterpret_cast<uint32_t*>(math::advance_ptr(
+        sym_buffer.data_ptr(), reinterpret_cast<uintptr_t>(workspace.get_slot_state_ptr())));
+    DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(
+        local_state_base, 0, sizeof(uint32_t) * num_slots * kNumReadyChunksPerSlot, comm_stream));
+
+    // Helper: copy a chunk from src_rank's local_x[rank_idx] into my slot[src_rank]
+    // In A2A: src_rank sends me its local_x[rank_idx] (the chunk destined for me)
+    auto launch_chunk_copy = [&](const int src_rank, const int chunk_idx) {
+        const int row_start = chunk_idx * static_cast<int>(ready_chunk_rows);
+        if (row_start >= runtime_m_per_rank)
+            return;
+        const int row_count = std::min(runtime_m_per_rank - row_start, static_cast<int>(ready_chunk_rows));
+        const size_t chunk_bytes = static_cast<size_t>(row_count) * k * sizeof(cutlass::bfloat16_t);
+
+        // Destination: my slot[src_rank], offset by row_start
+        auto* dst = math::advance_ptr(
+            sym_buffer.data_ptr(), reinterpret_cast<uintptr_t>(workspace.get_slot_x_ptr(src_rank, row_start)));
+
+        // Source: src_rank's local_x[rank_idx, row_start]
+        // local_x[chunk_idx=rank_idx, token_idx=row_start] gives rank src_rank's data for me
+        auto* src = math::advance_ptr(
+            reinterpret_cast<void*>(sym_buffer_ptrs[src_rank]),
+            reinterpret_cast<uintptr_t>(workspace.get_local_x_ptr(rank_idx, row_start)));
+
+        DG_CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, chunk_bytes, cudaMemcpyDefault, comm_stream));
+
+        // Set per-chunk ready flag
+        auto* chunk_state_ptr = local_state_base + src_rank * kNumReadyChunksPerSlot + chunk_idx;
+        DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(chunk_state_ptr, 1, sizeof(uint32_t), comm_stream));
+    };
+
+    // Step 1: Copy local chunk (self -> self) first for early kernel launch
+    for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
+        launch_chunk_copy(rank_idx, static_cast<int>(chunk_idx));
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(local_ready_event, comm_stream));
+
+    // Step 2: Pull remote chunks in ring order: (rank_idx-1), (rank_idx-2), ..., (rank_idx+1)
+    // This matches the kernel's compute order so remote data arrives in the order the kernel needs it
+    for (int step = 1; step < num_ranks; ++ step) {
+        const int src_rank = (rank_idx + num_ranks - step) % num_ranks;
+        for (uint32_t chunk_idx = 0; chunk_idx < num_ready_chunks; ++ chunk_idx)
+            launch_chunk_copy(src_rank, static_cast<int>(chunk_idx));
+    }
+
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(comm_done_event, comm_stream));
+    // Kernel launches after local_ready_event (wired below in the caller)
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(current_stream.stream(), local_ready_event, 0));
+}
+
+} // namespace
+
 class SM100BF16A2AGemmRuntime final : public LaunchRuntime<SM100BF16A2AGemmRuntime> {
 public:
     struct Args {
@@ -23,6 +155,8 @@ public:
         int runtime_m_per_rank;
         int n, k;
         int num_slots;
+        int ready_chunk_rows;
+        int num_ready_chunks;
         int num_ranks;
         at::ScalarType d_dtype;
         AGGemmConfig config;
@@ -46,6 +180,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {}, {},
+        {},
         {}, {},
         {}
     >);
@@ -53,6 +188,7 @@ static void __instantiate_kernel() {{
 )", args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_stages,
     args.config.num_ag_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
+    args.config.num_multicast,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.d_dtype));
     }
@@ -65,6 +201,8 @@ static void __instantiate_kernel() {{
             args.n,
             args.k,
             args.num_slots,
+            args.ready_chunk_rows,
+            args.num_ready_chunks,
             args.sym_buffer_ptrs,
             args.tensor_map_a,
             args.tensor_map_b,
@@ -75,6 +213,7 @@ static void __instantiate_kernel() {{
 static void sm100_bf16_a2a_gemm_nt(const torch::Tensor& d,
                                    const torch::Tensor& slots_x,
                                    const torch::Tensor& b,
+                                   const torch::Tensor& sym_buffer,
                                    const std::vector<int64_t>& sym_buffer_ptrs,
                                    const int& rank_idx,
                                    const int& max_m_per_rank,
@@ -88,7 +227,18 @@ static void sm100_bf16_a2a_gemm_nt(const torch::Tensor& d,
     auto config = get_ag_gemm_config(runtime_m_per_rank * num_ranks, n, k, num_sms, static_cast<int>(b.element_size()));
     DG_HOST_ASSERT(config.block_k == 64);
 
-    // tensor_map_a points to the slots buffer (concatenated receive slots)
+    uint32_t ready_chunk_rows = 0, num_ready_chunks = 0;
+    cudaEvent_t comm_done_event;
+    const auto current_stream = at::cuda::getCurrentCUDAStream();
+
+    // Launch host-side A2A communication on comm_stream
+    launch_bf16_a2a_gemm_comm(sym_buffer, sym_buffer_ptrs, rank_idx, max_m_per_rank,
+                              runtime_m_per_rank, num_slots, k, config.block_m,
+                              ready_chunk_rows, num_ready_chunks, comm_done_event);
+
+    // OVERLAP: kernel launches after local_ready_event (wired inside launch_bf16_a2a_gemm_comm).
+    // Remote chunks still copying on comm_stream; kernel polls per-chunk barrier flags.
+
     const auto tensor_map_a = make_tma_2d_desc(slots_x,
                                                k, max_m_per_rank * num_slots,
                                                config.block_k, config.load_block_m,
@@ -110,6 +260,8 @@ static void sm100_bf16_a2a_gemm_nt(const torch::Tensor& d,
         .runtime_m_per_rank = runtime_m_per_rank,
         .n = n, .k = k,
         .num_slots = num_slots,
+        .ready_chunk_rows = static_cast<int>(ready_chunk_rows),
+        .num_ready_chunks = static_cast<int>(num_ready_chunks),
         .num_ranks = num_ranks,
         .d_dtype = d.scalar_type(),
         .config = config,
@@ -127,6 +279,8 @@ static void sm100_bf16_a2a_gemm_nt(const torch::Tensor& d,
     const auto code = SM100BF16A2AGemmRuntime::generate(args);
     const auto runtime = compiler->build("sm100_bf16_a2a_gemm_nt", code);
     SM100BF16A2AGemmRuntime::launch(runtime, args);
+    // Wait for comm to complete before returning (ensures sym_buffer is not freed early)
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(current_stream.stream(), comm_done_event, 0));
 }
 
 } // namespace deep_gemm

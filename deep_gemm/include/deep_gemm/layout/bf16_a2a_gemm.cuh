@@ -5,21 +5,22 @@
 
 namespace deep_gemm::layout {
 
-// Workspace layout for BF16 All2All + GEMM fusion.
+// Workspace layout for BF16 All2All + GEMM fusion (Flux-style).
 //
 // Each rank has:
 //   - local_x: input data [num_ranks * M_per_rank, K] — the full input to scatter
 //     * Chunk j (rows j*M_per_rank..(j+1)*M_per_rank) is sent to rank j
 //   - slots[0..num_slots-1]: receive buffers [M_per_rank, K] each
 //     * slot[j] receives data FROM rank j
-//   - slot_state[0..num_slots-1]: per-rank ready flags
+//   - slot_state[0..num_slots-1][0..kNumReadyChunksPerSlot-1]: per-rank per-chunk ready flags
 //
-// Communication pattern (P2P direct):
-//   Rank i writes chunk[j] of its local_x → slot[i] on rank j (via NVLink)
-//   Then sets slot_state[i] = 1 on rank j
+// Communication pattern (Host-side CE DMA, Flux-style):
+//   Local:  local_x[rank_idx] → slot[rank_idx], set slot_state[rank_idx][chunk] = 1
+//   Remote: For each j ≠ rank_idx:
+//     cudaMemcpyAsync(slot[j] ← rank_j's local_x[rank_idx]), set slot_state[j][chunk] = 1
 //
 // GEMM:
-//   After all slots filled, A matrix = concat(slot[0], slot[1], ..., slot[N-1])
+//   After slots filled, A matrix = concat(slot[0], slot[1], ..., slot[N-1])
 //   = [num_ranks * M_per_rank, K]
 //   GEMM: A × B^T → D [num_ranks * M_per_rank, N]
 //
@@ -31,6 +32,7 @@ struct BF16A2AGemmWorkspace {
     uint32_t num_slots;
 
     static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    static constexpr uint32_t kNumReadyChunksPerSlot = 4;
 
     CUTLASS_HOST_DEVICE
     BF16A2AGemmWorkspace(void* base,
@@ -52,8 +54,8 @@ struct BF16A2AGemmWorkspace {
         num_bytes += num_ranks * get_num_token_bytes_per_rank();
         // slots: num_slots receive buffers, each M_per_rank × K
         num_bytes += num_slots * get_num_token_bytes_per_rank();
-        // slot_state: num_slots × 16B (aligned)
-        num_bytes += num_slots * sizeof(uint32_t) * 4;
+        // slot_state: num_slots × kNumReadyChunksPerSlot × sizeof(uint32_t)
+        num_bytes += static_cast<uint64_t>(num_slots) * sizeof(uint32_t) * kNumReadyChunksPerSlot;
         return math::align<uint64_t>(num_bytes, 16);
     }
 
@@ -88,9 +90,10 @@ struct BF16A2AGemmWorkspace {
             (static_cast<uint64_t>(slot_idx) * num_max_tokens_per_rank + token_idx) * hidden * sizeof(nv_bfloat16));
     }
 
-    CUTLASS_DEVICE uint32_t* get_slot_state_ptr(const uint32_t& slot_idx = 0) const {
+    // Per-chunk ready flags: slot_state[slot_idx][chunk_idx]
+    CUTLASS_HOST_DEVICE uint32_t* get_slot_state_ptr(const uint32_t& slot_idx = 0, const uint32_t& chunk_idx = 0) const {
         auto* base_ptr = math::advance_ptr<uint32_t>(get_slot_x_ptr(num_slots, 0), 0);
-        return base_ptr + slot_idx * 4;
+        return base_ptr + slot_idx * kNumReadyChunksPerSlot + chunk_idx;
     }
 };
 
