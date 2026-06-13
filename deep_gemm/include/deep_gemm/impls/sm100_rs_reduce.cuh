@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cuda_bf16.h>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <cutlass/bfloat16.h>
@@ -78,8 +79,8 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
             const auto start_clock = clock64();
             while (ld_acq_sys(poll_ptr) == 0u) {
                 if (clock64() - start_clock >= kTimeoutCycles) {
-                    // printf("RS reduce timeout: rank=%d, src=%d, tile=(%d,%d)\n",
-                           rank_idx, src_rank, my_m_block, my_n_block);
+                    /* printf("RS reduce timeout: rank=%d, src=%d, tile=(%d,%d)\n",
+                           rank_idx, src_rank, my_m_block, my_n_block); */
                     break;
                 }
             }
