@@ -283,3 +283,31 @@ PDL enables programmaticStreamSerializationAllowed on kernel launch, allowing th
 3. It may help in multi-kernel training loops where AG GEMM is called back-to-back
 
 ### Verdict: NEUTRAL — kept, move to next optimization
+
+---
+
+## Iteration 2 — Pipeline stages 7->8 (remove SF from smem calc)
+
+### Change
+
+File: csrc/jit_kernels/heuristics/ag_gemm.hpp
+
+- Removed smem_sfa_per_stage + smem_sfb_per_stage from smem_per_stage calculation
+- BF16 AG GEMM does not use MX scaling factors, so SF smem was overcounted
+- This allowed num_stages to go from 7 to 8
+
+### Results (8 GPU, 10 iters)
+
+- Geo Mean: 1.116x (down from 1.133x baseline) — REGRESSION
+- 17/17 wins
+
+### Analysis
+
+8 pipeline stages hurt small shapes (K=4096) due to longer pipeline fill/drain overhead:
+- 4096x4096x4096: 1.46x -> 1.31x (-0.15)
+- 8192x4096x4096: 1.52x -> 1.47x (-0.05)
+- 12288x7168x7168: 1.04x -> 1.01x (-0.03)
+
+K=7168 shapes were roughly unchanged or slightly improved. The tradeoff is not favorable.
+
+### Verdict: REGRESSION — reverted, try next direction
