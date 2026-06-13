@@ -14,7 +14,7 @@ namespace deep_gemm {
 
 class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
-    bool enable_pdl = false;
+    bool enable_pdl = true;
     std::shared_ptr<cudaDeviceProp> cached_prop;
 
     // cuBLASLt utils

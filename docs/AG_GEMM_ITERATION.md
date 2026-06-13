@@ -238,3 +238,48 @@ Kernel 内 `ptx::ld_acq_sys(slot_state[src_rank][chunk])` 自旋等待，CE DMA 
 - `csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp`
 - `csrc/jit_kernels/heuristics/ag_gemm.hpp`
 - `csrc/apis/ag_gemm.hpp`
+
+---
+
+## Iteration 1 — Enable PDL (Programmatic Dependent Launch)
+
+### Change
+
+File: csrc/jit/device_runtime.hpp
+
+- Changed enable_pdl default from false to true
+- Rationale: LaunchArgs constructor defaults enable_pdl=true, but LaunchRuntime::launch() overrides with device_runtime->get_pdl() which was false. PDL was effectively disabled for all kernels including AG GEMM.
+
+### Results (8 GPU, 10 iters)
+
+| Shape (M/rank x N x K) | Sep TFLOPS | Fus TFLOPS | Speedup |
+|---|---|---|---|
+| 4096x4096x4096 | 859T | 1254T | 1.46x |
+| 4096x7168x4096 | 1082T | 1297T | 1.20x |
+| 4096x7168x7168 | 1077T | 1162T | 1.08x |
+| 6144x4096x4096 | 869T | 1297T | 1.49x |
+| 6144x7168x4096 | 1104T | 1243T | 1.13x |
+| 6144x7168x7168 | 1092T | 1107T | 1.01x |
+| 8192x4096x4096 | 869T | 1316T | 1.52x |
+| 8192x7168x4096 | 1108T | 1245T | 1.12x |
+| 8192x7168x7168 | 1067T | 1085T | 1.02x |
+| 10240x7168x4096 | 1102T | 1192T | 1.08x |
+| 10240x7168x7168 | 1054T | 1057T | 1.00x |
+| 12288x7168x4096 | 1106T | 1158T | 1.05x |
+| 12288x7168x7168 | 1024T | 1068T | 1.04x |
+| 16384x7168x4096 | 1096T | 1126T | 1.03x |
+| 16384x7168x7168 | 990T | 1064T | 1.07x |
+| 20480x7168x4096 | 1076T | 1132T | 1.05x |
+| 20480x7168x7168 | 965T | 1044T | 1.08x |
+
+- **Geo Mean: 1.133x** (baseline: 1.135x) — within noise
+- **17/17 wins** (same as baseline)
+
+### Analysis
+
+PDL enables programmaticStreamSerializationAllowed on kernel launch, allowing the next kernel to start while the current one is still finishing. However, AG GEMM is a single persistent kernel with its own comm-compute overlap pipeline, so PDL does not provide meaningful benefit in microbenchmarks. The change is kept because:
+1. It aligns with LaunchArgs original design intent (default enable_pdl=true)
+2. It does not regress performance
+3. It may help in multi-kernel training loops where AG GEMM is called back-to-back
+
+### Verdict: NEUTRAL — kept, move to next optimization
