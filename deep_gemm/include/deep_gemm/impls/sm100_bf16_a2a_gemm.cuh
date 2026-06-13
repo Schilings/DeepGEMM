@@ -57,7 +57,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumMulticast,
           uint32_t kNumSMs, uint32_t kNumRanks,
           typename cd_dtype_t>
-__global__ void __launch_bounds__(kNumA2AThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
+__global__ void __launch_bounds__(kNumA2AThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 2)
 sm100_bf16_a2a_gemm_nt_impl(void* d,
                             const uint32_t shape_m_per_rank,
                             const uint32_t runtime_m_per_rank,
