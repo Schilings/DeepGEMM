@@ -727,3 +727,26 @@ all_gather 的额外 kernel launch + 同步开销。
 - Polling 延迟：硬件延迟（NVLink + flag visibility），软件无法消除
 - K=2048 shapes 必输：compute/comm ratio 太低（16.85x），结构性问题
 - K=7168 N=7168 shapes 输：融合 kernel 的 push-based RS 效率不如 NCCL RS（专用协议）
+
+### iter23-25 迭代结果（续）
+
+| Iter | 方向 | 8 GPU Geo Mean | 8 GPU Win | 状态 |
+|------|------|---------------|-----------|------|
+| **23** | **BF16 hadd2 + 32B wide vec** | **1.040x** | **15/21** | ✅ **当前最佳** |
+| 24b | L1::no_allocate polling | 1.036x | 13/21 | ❌ bypass cache增加延迟 |
+| 25 | 64T comm + 192T epi (6 warps) | 1.042x | 14/21 | ❌ NamedBarrier(192)开销抵消收益 |
+
+**iter25 分析**：192T Epilogue 的理论优势（更多并行 TMA store）被 NamedBarrier::sync(192,0) 的更大开销抵消。每个 n-slice iteration 需要同步 192T（vs 128T），且 192T 中只有 128T 实际做 TMEM→smem 工作。
+
+**当前最优配置 (iter23)**:
+- 384T = 128T comm(4 warps, 48 regs dealloc) + 128T non-epi(4 warps) + 128T epi(4 warps, 208 regs alloc)
+- Comm reduce: BF16 __hadd2, 32B wide vector (16 BF16 per iteration)
+- 8 GPU: geo_mean 1.040x, 15/21 shapes winning
+- 2 GPU: geo_mean 1.093x, 20/21 shapes winning
+
+**优化空间评估**：
+- 微优化（polling/cache/prefetch）：已探索殆尽，进一步收益 <0.5%
+- 结构性优化（线程数/寄存器分配）：iter25 证明 192T epi 无效
+- 架构级优化（两kernel方案/通信协议）：需要大规模重构
+- K=2048 shapes 必输（compute/comm ratio 太低），这是 MoE 场景固有限制
+- K=7168 N=7168 shapes (0.98-1.01x)：GEMM 吞吐略低于标准128T kernel，需架构级变化才能突破
