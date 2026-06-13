@@ -400,3 +400,20 @@ File: csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp
 Interleaving chunk copies across ranks caused severe performance degradation. The likely cause is CE DMA contention or MNNVL address translation issues when alternating between different remote GPUs. The original sequential-per-rank order is more efficient because the CE can optimize sequential transfers to the same destination. Interleaving forces the CE to switch between different P2P paths repeatedly, adding overhead.
 
 ### Verdict: REGRESSION — reverted
+
+---
+
+## Iteration 6 (retry) — Interleave chunk copies with clean GPUs
+
+### Results (8 GPU, 10 iters, clean state)
+
+- Geo Mean: 1.122x (was 1.129x baseline) — slight regression
+- 17/17 wins
+- K=7168 target shapes marginally improved: 10240x7168x7168 1.01x->1.03x, 12288x7168x7168 1.01x->1.02x
+- 4096x4096x4096 regressed: 1.46x->1.28x (CE path-switching overhead)
+
+### Note
+
+Previous iteration 6 results (1.35x geo_mean) were INVALID due to zombie GPU processes contaminating the benchmark.
+
+### Verdict: SLIGHT REGRESSION — reverted
