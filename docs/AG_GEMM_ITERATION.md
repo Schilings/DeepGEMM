@@ -417,3 +417,55 @@ Interleaving chunk copies across ranks caused severe performance degradation. Th
 Previous iteration 6 results (1.35x geo_mean) were INVALID due to zombie GPU processes contaminating the benchmark.
 
 ### Verdict: SLIGHT REGRESSION — reverted
+
+---
+
+## Iteration 7 — TMA store stages 2->3
+
+### Change
+
+Files: deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh, csrc/jit_kernels/heuristics/ag_gemm.hpp
+
+- Changed kNumTMAStoreStages from 2 to 3
+
+### Results
+
+- DEADLOCK — test hangs. The sm100_store_cd epilogue likely only supports 2 TMA store stages.
+
+### Verdict: FAILED — reverted due to deadlock
+
+---
+
+## Iteration 8 — Batch remote rank copies (single memcpy per rank)
+
+### Change
+
+File: csrc/jit_kernels/impls/sm100_bf16_ag_gemm.hpp
+
+- Replaced per-chunk remote copies with one large memcpy per rank + batch flag setting
+- Reduces CE command overhead (7 memcpy vs 28 memcpy + 28 memset)
+
+### Results (8 GPU, 10 iters)
+
+- Geo Mean: 1.132x (was 1.129x baseline) — essentially same
+- Large K=7168 shapes improved slightly: 12288x7168x7168 1.01x->1.04x, 16384x7168x7168 1.05x->1.07x
+- Small K=7168 shapes regressed: 4096x7168x7168 1.06x->1.02x (lost fine-grained overlap)
+
+### Analysis
+
+Batching trades fine-grained overlap (helps when kernel processes tiles fast) for reduced CE overhead (helps when data transfer dominates). Net effect is neutral.
+
+### Verdict: NEUTRAL — reverted
+
+---
+
+## Summary after 8 iterations
+
+Only change kept: PDL enabled by default (iter 1). All other changes were neutral or regressive.
+
+Key findings:
+1. The kernel is already well-optimized for its architecture
+2. The bottleneck for K=7168 shapes is fundamental: AG communication takes ~30-40% of total time and can only be partially overlapped with compute
+3. Simple parameter tweaks (stages, launch_bounds, nanosleep, chunk ordering) don't move the needle
+4. The per-chunk barrier overlap mechanism is already effective for its design
+5. Further gains require more fundamental architectural changes (e.g., multi-stream CE DMA, or different comm strategies)
