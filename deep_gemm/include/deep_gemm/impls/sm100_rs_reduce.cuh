@@ -2,6 +2,8 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <cutlass/bfloat16.h>
+#include <cute/util/type_traits.hpp>
 #include <deep_gemm/layout/gemm_rs.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>

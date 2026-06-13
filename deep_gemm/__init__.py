@@ -113,6 +113,7 @@ from .a2a_gemm import (
 
 # GEMM+RS kernels
 from .gemm_rs import (
+    bf16_gemm_rs_nt_v3,
     GemmRSSymmBuffer,
     get_symm_buffer_for_gemm_rs,
     bf16_gemm_rs_nt,

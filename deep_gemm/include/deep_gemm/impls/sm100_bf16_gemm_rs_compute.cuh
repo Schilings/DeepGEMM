@@ -255,11 +255,6 @@ sm100_bf16_gemm_rs_compute_impl(const uint32_t shape_m_per_rank,
         }
     }
 
-    // Warp 1 (Reserved, no-op)
-    else if (warp_idx == 1) {
-        // Intentionally empty
-    }
-
     // ════════════════════════════════════════════════════════════════
     //  Warp 2 (MMA Issue): Execute UMMA FMA
     // ════════════════════════════════════════════════════════════════
