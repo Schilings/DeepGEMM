@@ -311,3 +311,26 @@ File: csrc/jit_kernels/heuristics/ag_gemm.hpp
 K=7168 shapes were roughly unchanged or slightly improved. The tradeoff is not favorable.
 
 ### Verdict: REGRESSION — reverted, try next direction
+
+---
+
+## Iteration 3 — Barrier polling with __nanosleep backoff
+
+### Change
+
+File: deep_gemm/include/deep_gemm/impls/sm100_bf16_ag_gemm.cuh
+
+- Added __nanosleep(200) with exponential backoff to chunk-ready polling loop
+- First 128 iterations: busy-wait, then: nanosleep(200ns) between polls
+- Rationale: reduce SM overhead and L2 pressure during long waits for remote chunks
+
+### Results (8 GPU, 10 iters)
+
+- Geo Mean: 1.126x (down from 1.133x) — slight REGRESSION
+- 17/17 wins
+
+### Analysis
+
+The nanosleep backoff did not help. The polling is done by a single thread (elect_one) per CTA, so SM overhead from busy-waiting is minimal. Chunk wait times are short enough (sub-microsecond for most shapes) that the busy-spin is more efficient than introducing nanosleep overhead. The 200ns sleep adds latency to the fast path without sufficient benefit on the slow path.
+
+### Verdict: REGRESSION — reverted, try next direction
