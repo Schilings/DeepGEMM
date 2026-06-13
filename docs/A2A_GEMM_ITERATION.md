@@ -144,3 +144,45 @@ NVLink continuity per-rank AND fewer host-side calls. All shapes now have speedu
 | Iter 3 | +6.3% (Python) | — | ✅ chunk-interleave |
 | Iter 3 (CUDA events) | 1.150x | 1140.8T | Reference |
 | **Iter 7** | **1.217x** | **1187.9T** | ✅ **Current best** |
+
+## Iter 8: Merge per-rank chunks into single memcpy (commit dc2bc09) ✅ KEEP
+
+**Direction**: Replace per-chunk memcpy (4 calls/rank) with single per-rank memcpy (1 call/rank).
+- Old: rank-order with 4 chunk-sized  per rank + batched flag
+- New: rank-order with 1 full-rank  per rank + batched flag
+- Total host API calls: 64 (iter 3) → 32 (iter 7) → **16** (iter 8)
+
+**Result**: Geo Mean 1.217x → **1.298x** (+6.7%) | Avg Fused 1187.9T → **1236.7T** (+4.1%)
+
+| Shape | Iter 7 (20iter) | Iter 8 (20iter) | Δ |
+|---|---|---|---|
+| 1024×4096×4096 | 1.200x | **1.868x** | **+55.7%** |
+| 1024×7168×4096 | 1.200x | **1.259x** | +4.9% |
+| 2048×4096×7168 | 1.319x | **1.477x** | +12.0% |
+| 2048×7168×4096 | 1.122x | **1.169x** | +4.2% |
+| 4096×4096×4096 | 1.450x | **1.505x** | +3.8% |
+| 4096×7168×4096 | 1.342x | **1.373x** | +2.3% |
+| 4096×4096×7168 | 1.499x | **1.634x** | +9.0% |
+| 8192×4096×4096 | 1.610x | **1.631x** | +1.3% |
+| 8192×7168×4096 | 1.187x | **1.183x** | -0.3% |
+| 8192×7168×7168 | 0.990x | **0.992x** | +0.2% |
+| 2048×7168×2048 | 1.113x | **1.184x** | +6.4% |
+| 4096×7168×2048 | 1.154x | **1.198x** | +3.8% |
+| 16384×7168×4096 | 1.040x | **1.030x** | -1.0% |
+| 16384×7168×7168 | 0.997x | **1.005x** | +0.8% |
+
+**Key insight**: Merging chunk-level memcpy into rank-level memcpy massively reduces host-side API call
+overhead (cudaMemcpyAsync 32→8). The GPU CE can handle large contiguous transfers more efficiently
+than many small fragmented ones. All shapes now have speedup >= 0.992x.
+
+---
+
+## Updated Summary (CUDA events timing)
+
+| Iter | Geo Mean | Avg Fused TFLOPS | Status |
+|------|----------|-------------------|--------|
+| Baseline | 1.239x (Python) | 1105.7T (Python) | — |
+| Iter 1 | +2.0% | — | ✅ launch_bounds(256,2) |
+| Iter 3 (CUDA events) | 1.150x | 1140.8T | ✅ chunk-interleave |
+| Iter 7 | 1.217x | 1187.9T | ✅ rank-order + batched flags |
+| **Iter 8** | **1.298x** | **1236.7T** | ✅ **Current best** |
