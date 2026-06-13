@@ -139,10 +139,7 @@ def bf16_gemm_rs_nt_v3(y: torch.Tensor,
     assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt_v3 is for SM100/B-series GPUs'
     comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
 
-    # Create a communication stream for RS reduce kernel
-    comm_stream = torch.cuda.Stream()
-
-    # Launch GEMM compute kernel on default stream
+    # Step 1: Launch GEMM compute kernel on default stream
     _C.bf16_gemm_rs_compute_nt(
         y, a, b,
         sym_buffer.buffer,
@@ -154,18 +151,17 @@ def bf16_gemm_rs_nt_v3(y: torch.Tensor,
         comm_dtype_str,
     )
 
-    # Launch RS reduce kernel on comm_stream
-    with torch.cuda.stream(comm_stream):
-        _C.rs_reduce(
-            y,
-            sym_buffer.buffer,
-            sym_buffer.handle.buffer_ptrs,
-            sym_buffer.group.rank(),
-            sym_buffer.num_max_tokens_per_rank,
-            num_tokens_per_rank,
-            sym_buffer.hidden,
-            comm_dtype_str,
-        )
+    # Step 2: Synchronize — wait for GEMM compute to finish all flags
+    torch.cuda.synchronize()
 
-    # Wait for comm_stream to complete
-    torch.cuda.current_stream().wait_stream(comm_stream)
+    # Step 3: Launch RS reduce kernel on default stream (serial, no overlap yet)
+    _C.rs_reduce(
+        y,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        num_tokens_per_rank,
+        sym_buffer.hidden,
+        comm_dtype_str,
+    )
