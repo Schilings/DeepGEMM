@@ -82,6 +82,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     //        per store stage for swap-AB cases, and an entire BLOCK_M for non-swap cases
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N =        kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
+    // ⚠️ 一行一个lane，跟tmem特性有关
     constexpr uint32_t kNumUMMAStoreThreads = kSwapAB ? kNumEpilogueThreads: STORE_BLOCK_M;
     DG_STATIC_ASSERT(kNumUMMAStoreThreads % 32 == 0, "Invalid store block M");
 
@@ -463,15 +464,31 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  tmem_empty_barriers[accum_stage_idx],
                  tensor_map_cd);
             } else {
-                epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
-                    kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
-                    kGemmType, kWithAccumulation,
-                    cd_dtype_t, epilogue::transform::EpilogueIdentity>
-                (smem_cd, tma_stage_idx, tmem_base_addr,
-                 base_m_idx, base_n_idx, scheduler.current_group_idx,
-                 epilogue_warp_idx, lane_idx,
-                 tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd);
+                // Epilogue: STSM 从 TMEM 读出 → 写入 SMEM → TMA store 写回全局 D 矩阵
+                epilogue::sm100_store_cd<
+                    // 模板参数（编译期常量）
+                    BLOCK_M, BLOCK_N,               // 输出 tile 尺寸 (M × N)
+                    STORE_BLOCK_M, STORE_BLOCK_N,   // 每次 store wave 的粒度
+                    kSwizzleCDMode,                 // TMA 写回 D 时的 swizzle 模式（避免 bank conflict）
+                    kNumTMAStoreStages,             // TMA store 流水级数（通常为 2）
+                    kNumUMMAStoreThreads,           // STSM 写 SMEM 使用的线程数
+                    kGemmType,                      // GEMM 变体（Normal / M_grouped / N_grouped_contiguous）
+                    kWithAccumulation,              // 是否与已有 D 累加
+                    cd_dtype_t,                     // 输出数据类型（如 bfloat16）
+                    epilogue::transform::EpilogueIdentity  // Epilogue 变换（identity = 无额外变换）
+                >(
+                    // 运行时参数
+                    smem_cd,                        // C/D 输出的 SMEM 缓冲区（pattern-visited）
+                    tma_stage_idx,                  // TMA store 流水级索引（跨 tile 共享）
+                    tmem_base_addr,                 // 当前 accumulator stage 的 TMEM 基地址
+                    base_m_idx,                     // 当前 tile 在全局 M 维的起始位置
+                    base_n_idx,                     // 当前 tile 在全局 N 维的起始位置 (= n_block × BLOCK_N)
+                    scheduler.current_group_idx,    // batch / group 索引（grouped GEMM 使用）
+                    epilogue_warp_idx,              // CTA 内 epilogue warp 的 ID
+                    lane_idx,                       // epilogue warp 内的 lane ID
+                    tmem_empty_barriers[accum_stage_idx],  // barrier：通知 TMEM 可在 store 后被下一轮 UMMA 重用
+                    tensor_map_cd                   // 指向全局 D 矩阵的 TMA 描述符
+                );
             }
         }
     }
