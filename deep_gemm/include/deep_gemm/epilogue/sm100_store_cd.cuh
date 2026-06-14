@@ -60,8 +60,45 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
     // =========================================================================
     // Step 2: M 维 wave 循环
     // =========================================================================
-    // 输出 tile (BLOCK_M × BLOCK_N) 在 M 维被拆成 kNumMWaves 个 wave，
-    // 每个 wave 处理 STORE_BLOCK_M 行，以流水线方式交错执行
+    //
+    // 数据分块全景（以 BLOCK_M=128, BLOCK_N=128, STORE_BLOCK_M=128, STORE_BLOCK_N=64 为例）
+    //
+    // ╔══════════════════════════════════ Level 1: 输出 tile (128×128 BF16) ═══╗
+    // ║                                                                        ║
+    // ║        N=0              N=63  N=64              N=127                  ║
+    // ║        ┌─────────────────────┬─────────────────────┐                   ║
+    // ║        │     atom (0,0)      │     atom (0,1)      │ M=0               ║
+    // ║        │   STORE_BLOCK_N=64  │   STORE_BLOCK_N=64  │                   ║
+    // ║        │                     │                     │                   ║
+    // ║        │                     │                     │                   ║
+    // ║        └─────────────────────┴─────────────────────┘ M=127             ║
+    // ║        迭代: (w=0,s=0) → (w=0,s=1)  每步推进 stage_idx                  ║
+    // ║                                                                        ║
+    // ║  ════════════════ Level 2: 单个 atom (128×64) 的 warp 分区 ═══════      ║
+    // ║         ◄─── 128B = 64 个 BF16 ───►                                    ║
+    // ║    ┌────────────────────────────────┐                                  ║
+    // ║    │ lane 0..31 → 32 行             │ warp 0 (epilogue_warp_idx=0)     ║
+    // ║    │                                │        rows 0..31                ║
+    // ║    ├────────────────────────────────┤                                  ║
+    // ║    │ lane 0..31 → 32 行             │ warp 1 (epilogue_warp_idx=1)     ║
+    // ║    │                                │        rows 32..63               ║
+    // ║    ├────────────────────────────────┤                                  ║
+    // ║    │ lane 0..31 → 32 行             │ warp 2 (epilogue_warp_idx=2)     ║
+    // ║    │                                │        rows 64..95               ║
+    // ║    ├────────────────────────────────┤                                  ║
+    // ║    │ lane 0..31 → 32 行             │ warp 3 (epilogue_warp_idx=3)     ║
+    // ║    │                                │        rows 96..127              ║
+    // ║    └────────────────────────────────┘                                  ║
+    // ║    4 warp × 32 lane = 128 线程, 每 lane 写 1 行, warp 间不重叠           ║
+    // ║                                                                        ║
+    // ║  ═════════════ Level 3: 单线程 = 1 行 × 64 元素写 SMEM ═══════════      ║
+    // ║    TMEM_LOAD(128bit) → 寄存器 → st_shared(SMEM)                        ║
+    // ║    整 atom STSM 完成后 → TMA store 异步写回全局 D                       ║
+    // ╚════════════════════════════════════════════════════════════════════════╝
+    //
+    // 🔄 swap-AB 场景 (STORE_BLOCK_M=16, STORE_BLOCK_N=128): M 维拆成 8 个 wave
+    //    N 维不拆分, 迭代: (w=0,s=0) → (w=1,s=0) → ... → (w=7,s=0)
+    //
     constexpr auto kNumMWaves = BLOCK_M / STORE_BLOCK_M;
     #pragma unroll
     for (uint32_t w = 0; w < kNumMWaves; ++ w) {
@@ -69,12 +106,34 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
         // =====================================================================
         // Step 3: N 维 store atom 循环
         // =====================================================================
-        // 每个 wave 内，N 维拆成 kNumStores 个 atom，每个 atom 处理 STORE_BLOCK_N 列
-        // 每次迭代推进一次流水（advance_store_pipeline），实现 STSM 与 TMA store 的 overlap
         constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
         #pragma unroll
         for (uint32_t s = 0; s < kNumStores; ++ s, advance_store_pipeline()) {
             // 当前 stage 的 SMEM 基地址（byte 级指针）
+            // ⚠️ TMEM 与 SMEM CD 不是 1:1 对应，而是 1:N（1 个 TMEM stage → N 个 SMEM CD atom）
+            //
+            // 根本原因：SMEM CD 的 N 维容量受 swizzle stripe (128B) 限制，远小于 TMEM 的 N 维
+            //   TMEM     N 维 = BLOCK_N = 128 列 FP32 = 512B/行
+            //   SMEM CD  N 维 = kSwizzleCDMode = 128B = 64 列 BF16/行
+            //   比例 = 128 / 64 = 2 → 1 个 TMEM tile 需要 2 个 SMEM CD atom
+            //
+            // 因此虽然两者都是双缓冲，但粒度不同：
+            //   kNumEpilogueStages=2: UMMA 双缓冲 TMEM，tile 级
+            //   kNumTMAStoreStages=2:  epilogue 双缓冲 SMEM CD，atom 级（1/N tile）
+            //
+            //     TMEM[0] (128×128 FP32)             SMEM CD (2 stage × 128×64 BF16)
+            //     ┌─────────────────────┐            ┌──────────┐  ┌──────────┐
+            //     │                     │    atom0   │ stage[0] │  │ stage[1] │
+            //     │    accum_stage=0    │──────────▶│ 128×64   │  │ 128×64   │
+            //     │                     │    atom1   │   TMA──▶│  │   TMA──▶│
+            //     └─────────────────────┘            └──────────┘  └──────────┘
+            //                                                ▲ 轮转复用 ▲
+            //     TMEM[1] (128×128 FP32)           atom0: stage[?] ← 取决于 tile 间流水
+            //     ┌─────────────────────┐          atom1: stage[?] ← advance 继续轮转
+            //     │    accum_stage=1    │
+            //     └─────────────────────┘
+            //
+            // tma_stage_idx 在 tile 间持续轮转（不重置），实现跨 tile 流水复用
             auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
 
             // =================================================================
@@ -93,7 +152,17 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
             // =================================================================
             // Step 3b: STSM — 从 TMEM 读出数据并写入 SMEM
             // =================================================================
-            // 遍历当前 atom 的每个 bank group
+            //
+            // 每个 lane 处理一整行 64 个 BF16 元素，分 8 次迭代搬运（每次 8 个 = 1 bank group = 16B）
+            //
+            //   TMEM (连续地址)                           SMEM (swizzle 后，row=lane_idx)
+            //   ┌── i=0: 元素  0.. 7 (128bit) ──┐      ┌─ col=0 → d0..d7  ─┐
+            //   │  i=1: 元素  8..15             │      │  col=1 → d8..d15   │
+            //   │  ...                          │ ──▶  │  ...                │  ← 同 1 行
+            //   │  i=7: 元素 56..63             │      │  col=7 → d56..d63  │
+            //   └───────────────────────────────┘      └────────────────────┘
+            //
+            //   8 次迭代 × 8 元素/次 = 64 元素 = STORE_BLOCK_N，lane 间无依赖
             #pragma unroll
             for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
                 // ------ 地址计算 ------
@@ -103,20 +172,40 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
                                      w * BLOCK_N +                                     // M 维 wave 偏移
                                      s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;    // N 维偏移 + element 偏移
 
-                // SMEM 地址：按 bank group + swizzle 排布，经过比特异或 swizzle 避免 bank conflict
-                //                  ┌── warp 内按 lane_idx 索引 ──┐
-                //  layout 概念:  (lane, row_within_atom, col_within_atom)
+                // SMEM 地址 = warp 偏移 + atom 内 (row, col)，详见上方全景图的 Level 2/3
+                // warp 间不重叠，swizzle 消 bank conflict
                 auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
                 constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
                 auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
                 auto col = kHasShortcut ? (i) : (bank_group_index % 8);
-                // Swizzle: col 与 row 做比特异或，打散访问模式，消除 bank conflict
                 col ^= row % (kSwizzleCDMode / 16);
+                // i=0 时每个 lane 的 (row, col_swizzled) 和 bank 映射 (kSwizzleCDMode=128, BF16):
+                //
+                //     lane  row  col^=row%8  SMEM addr   bank   冲突组
+                //     ────  ───  ──────────  ─────────   ────   ────
+                //      0     0       0            0        0     A
+                //      1     1       1          144        4     B
+                //    ...   ...     ...          ...      ...    ...
+                //      7     7       7         1008       28     H
+                //      8     8       0  ←       1024        0     A  (8%8=0)
+                //      9     9       1         ↙ 1168        4     B
+                //     15    15       7     row%8=0..7       28     H
+                //     16    16       0     8 组循环中       0      A
+                //     ..    ..      ..                     ..     ..
+                //     31    31       7                      28     H
+                //
+                // 无 swizzle: lane 0..31 全部 col=0 → 全部 bank 0 → 32-way ❌
+                // 有 swizzle: 8 个 bank 各 4 条 lane → 4-way ✅
+                // Swizzle: col ^= row%8，将同一列的 32 个 lane 均匀散布到 8 个 bank，
+                // 32-way conflict → 4-way conflict（每 bank 仅 4 个 lane 竞争）
+                // 不加 swizzle：所有 lane 写 128B 对齐地址 → 全部命同一 bank → 32-way ❌
+                // 加 swizzle：  lane0→bank0, lane1→bank1, ... lane7→bank7, lane8→bank0, ...
+                
 
-                // SMEM 地址 = warp 偏移 (每个 warp 32 线程 × swizzle 字节) + row×bank_bytes + col×bank_bytes
+                // SMEM 地址 = warp 偏移 + row×bank_bytes + col×bank_bytes
                 auto smem_ptr = smem_base_ptr +                                             // stage 基址
-                                epilogue_warp_idx * 32 * kSwizzleCDMode +                   // warp 偏移
-                                row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // atom 内偏移
+                                epilogue_warp_idx * 32 * kSwizzleCDMode +                   // warp 偏移（每 warp 独占 32 行 × 128B）
+                                row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // atom 内偏移（行 × 128B + 列 × 16B）
 
                 // ------ 数据搬运：TMEM load → STSM (TMEM → SMEM) ------
                 // 使用 SM100 的 tcgen05 TMEM load 指令，直接从 tensor memory 读到寄存器，
@@ -161,6 +250,8 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
             // =================================================================
             // Step 3d: TMA store — 将 SMEM 中的数据异步写回全局 D 矩阵
             // =================================================================
+            // TMA 硬件在读出 SMEM 时自动做逆向 XOR swizzle，故全局 D 中的元素顺序正确：
+            // SMEM 中 swizzle 只是为了消除 bank conflict，最终语义由 TMA 保证
             // 所有线程同步保证 SMEM 写完，然后 warp 0 中单个线程发起 TMA store
             // TMA store 是异步的：发起后立即返回，DMA 在后台搬运，kernel 继续处理下一阶段
             cute::tma_store_fence();

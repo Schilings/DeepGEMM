@@ -81,8 +81,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     // NOTES: To maximize epilogue threads utilization, process an entire BLOCK_N
     //        per store stage for swap-AB cases, and an entire BLOCK_M for non-swap cases
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
+    // kSwizzleCDMode=128 是 TMA swizzle stripe 的字节宽度，除以 sizeof 转元素数 → BF16:64, FP32:32
+    // 每个 store atom 的 N 宽度 = 一个 swizzle stripe，保证 TMA store 硬件对齐最优
     constexpr uint32_t STORE_BLOCK_N =        kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
-    // ⚠️ 一行一个lane，跟tmem特性有关
+    // epilogue 线程数 = STORE_BLOCK_M，每个线程负责 M 维的一个 element 行（与 TMEM load 特性相关）
     constexpr uint32_t kNumUMMAStoreThreads = kSwapAB ? kNumEpilogueThreads: STORE_BLOCK_M;
     DG_STATIC_ASSERT(kNumUMMAStoreThreads % 32 == 0, "Invalid store block M");
 
@@ -104,6 +106,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     DG_STATIC_ASSERT(UMMA_A_SIZE_PER_STAGE <= SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE * kNumStages, "Memory out of bound for UMMA");
 
     // Real tensor memory size and offsets
+    // Tmem按列分
     constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols>();
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
