@@ -37,13 +37,19 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
+    // Stage Merge: 当 stage 数 ≥ 8 且 A/B 均为 K-major（K 连续）时，将多个原始 stage 合并，
+    // TMA 一次加载更多 K 元素 → stage 数和 umma_arrive() 调用数减半。
     constexpr bool kDoMergeStages =
         kNumStages_ >= 8 and kGemmType == GemmType::Normal and
         kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K;
-    // Ensure there are at least `kNumMinStages` stages after merge
+    // 合并后至少保留 kNumMinStages 个 stage
     constexpr uint32_t kNumMinStages = 8;
+    // kNumStagesPerMerge: 合并倍数（例 16 stages → 8 stages, merge 倍数为 2）
+    // 未触发合并时为 1（无合并）
     constexpr uint32_t kNumStagesPerMerge = kDoMergeStages ? kNumStages_ / kNumMinStages : 1;
+    // BLOCK_K: 合并后一次 TMA 加载的 K 元素数（= BLOCK_K_ × kNumStagesPerMerge）
     constexpr uint32_t BLOCK_K = BLOCK_K_ * kNumStagesPerMerge;
+    // kNumStages: 合并后的实际 stage 数
     constexpr uint32_t kNumStages = kNumStages_ / kNumStagesPerMerge;
 
     // ClusterTransactionBarrier 是 CUTLASS 对 CUDA PTX mbarrier 硬件原语的封装。
@@ -276,6 +282,8 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         // MMA issue warp
         // NOTES: only the leader CTA will do this
         // Make instruction descriptor
+        // 创建 UMMA 指令描述符：告诉 tensor core 输入为 bf16×bf16→fp32 的矩阵乘，
+        // M/N 维度和 A/B 的 major 布局。swapAB 时 A/B 的 major 互换（N 维度也随之变）。
         auto instr_desc = kSwapAB ? cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float,
                                                                 UMMA_M, UMMA_N, kMajorB, kMajorA>()
                                   : cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float,
@@ -283,9 +291,14 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
         // Merged stages only happens in NT normal GEMM cases
+        // BLOCK_ATOM_K: smem swizzle 在 K 维度上的原子大小（= BLOCK_K / kNumStagesPerMerge = 原始 BLOCK_K_）。
+        // 即使 stage merge 后 BLOCK_K 变大，swizzle 模式不变，UMMA descriptor 必须用原始原子大小描述布局。
         constexpr uint32_t BLOCK_ATOM_K = BLOCK_K / kNumStagesPerMerge;
         auto a_desc = mma::sm100::make_umma_desc<kMajorA, LOAD_BLOCK_M, BLOCK_ATOM_K, kSwizzleAMode>(smem_a[0], 0, 0);
         auto b_desc = mma::sm100::make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_ATOM_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        // SM100 UMMA SmemDescriptor 中所有地址/偏移以 16 字节为单位（>>4 编码）。
+        // a_desc.lo 是 stage 0 的 smem 地址（16B 单位），累加每个 stage 的大小（/16 转 16B 单位）
+        // 得到对应 stage 的 descriptor。每个 lane 管一个 stage，后续用 __shfl_sync 按需取用。
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -302,6 +315,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
             tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+            // tcgen05.fence::after_thread_sync：SM100 tensor core 是深度异步流水线的，barrier.wait
+            // 只做线程级同步，不管 tensor core 的 TMEM 写入是否已提交。此 fence 确保本次 iteration
+            // 开始前，上一轮 tensor core 的所有 TMEM 写入已可见，防止读到脏数据。
             ptx::tcgen05_after_thread_sync();
 
             // UMMA and empty barrier arrival alias
@@ -333,21 +349,37 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait TMA arrival
                 full_barriers[stage_idx]->wait(phase);
+                // 任何 barrier.wait 之后如果马上要发射 UMMA 指令，都需要 fence，只是这里守卫的是内层 K 循环。
                 ptx::tcgen05_after_thread_sync();
 
                 // Issue UMMA in the leader CTA
+                // mma_t: 根据 kNumMulticast 选择 UMMA 指令类型（单 SM / 2-CTA cluster），2x1SM 会从两个 SM 的分布式 smem 读取数据
                 using mma_t = cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_F16BF16_SS, ptx::SM100_MMA_F16BF16_2x1SM_SS>;
+                // 将编译期 instr_desc 转为运行时 64 位立即数，传给 UMMA fma 指令
                 const auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
                 const auto a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
                 if (cute::elect_one_sync()) {
                     #pragma unroll
+                    // 内层 K 循环: 每次 UMMA_K=16 个 K 元素发一条 UMMA 指令
+                    // BLOCK_K=64 时循环 4 次，stage merge 后 BLOCK_K=128 时循环 8 次
                     for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
+                        // atom_k_idx: 当前 UMMA 步落在哪个 swizzle atom 内
+                        // BULOCK_ATOM_K=64 时，k=0..3 全在 atom 0，k=4..7 在 atom 1
                         uint32_t atom_k_idx = k * UMMA_K / BLOCK_ATOM_K;
+                        // advance_umma_desc_lo(base, elem_offset, k_within_atom):
+                        //   参数2 = atom_k_idx * M_rows * BLOCK_ATOM_K: 跨 atom 大跳（元素数）
+                        //   参数3 = k * UMMA_K % BLOCK_ATOM_K:   atom 内 K 偏移 (0,16,32,48)
+                        // smem 中 A[0:LOAD_BLOCK_M, k*16:(k+1)*16] 的起始位置 → UMMA descriptor lo
                         a_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t>(
-                                        a_desc_base_lo, atom_k_idx * LOAD_BLOCK_M * BLOCK_ATOM_K, k * UMMA_K % BLOCK_ATOM_K);
+                                        a_desc_base_lo, atom_k_idx * LOAD_BLOCK_M * BLOCK_ATOM_K,
+                                        k * UMMA_K % BLOCK_ATOM_K);
                         b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
-                                        b_desc_base_lo, atom_k_idx * LOAD_BLOCK_N * BLOCK_ATOM_K, k * UMMA_K % BLOCK_ATOM_K);
+                                        b_desc_base_lo, atom_k_idx * LOAD_BLOCK_N * BLOCK_ATOM_K,
+                                        k * UMMA_K % BLOCK_ATOM_K);
+                        // 发射 UMMA fma: D += A × B
+                        //   参数3 = accum_stage_idx * UMMA_N: TMEM 中累加器的列偏移
+                        //   参数4 = k_block_idx>0 or k>0: 首个 K-block 第一步清零累加器，后续累加
                         if (kSwapAB) {
                             mma_t::fma(b_desc, a_desc, accum_stage_idx * UMMA_N,
                                        k_block_idx > 0 or k > 0, runtime_instr_desc);
