@@ -178,6 +178,24 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
             }
         }
     }
+
+    // Reset ready flags for next iteration (consumer resets after consuming)
+    // This is critical: flags must be reset AFTER reduce is done, not before.
+    // In the serial execution model, GEMM compute sets flags → sync → RS reduce reads + resets.
+    // In the overlap model, RS reduce processes tiles as their flags become ready, then resets.
+    __syncthreads();
+    {
+        const uint32_t flags_per_slot = num_m_blocks * num_n_blocks;
+        const uint32_t total_flags = kNumRanks * flags_per_slot;
+        for (uint32_t flag_idx = tid; flag_idx < total_flags; flag_idx += kNumThreads) {
+            const uint32_t slot = flag_idx / flags_per_slot;
+            const uint32_t local_idx = flag_idx - slot * flags_per_slot;
+            const uint32_t mb = local_idx / num_n_blocks;
+            const uint32_t nb = local_idx - mb * num_n_blocks;
+            auto* ready_ptr = workspace.get_ready_ptr(slot, mb, nb);
+            *ready_ptr = 0u;
+        }
+    }
 }
 
 } // namespace deep_gemm

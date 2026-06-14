@@ -468,19 +468,10 @@ sm100_bf16_gemm_rs_compute_impl(const uint32_t shape_m_per_rank,
         workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
         [&]() { __syncthreads(); }, true, true);
 
-    // Reset ready flags for next iteration
-    {
-        const uint32_t flags_per_slot = num_m_blocks_per_rank * num_n_blocks;
-        const uint32_t total_flags = kNumRanks * flags_per_slot;
-        for (uint32_t flag_idx = thread_idx; flag_idx < total_flags; flag_idx += kNumThreads) {
-            const uint32_t slot = flag_idx / flags_per_slot;
-            const uint32_t local_idx = flag_idx - slot * flags_per_slot;
-            const uint32_t mb = local_idx / num_n_blocks;
-            const uint32_t nb = local_idx - mb * num_n_blocks;
-            auto* ready_ptr = workspace.get_ready_ptr(slot, mb, nb);
-            *ready_ptr = 0u;
-        }
-    }
+    // Note: Ready flags are NOT reset here — they are reset by the RS reduce kernel
+    // after consuming them. This is critical for the serial execution model where
+    // torch.cuda.synchronize() is called between GEMM compute and RS reduce.
+    // If flags were reset here, RS reduce would find all flags==0 and timeout.
 
     // Deallocate tensor memory
     if (warp_idx == kLoadWarpIdx)
