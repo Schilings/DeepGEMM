@@ -46,6 +46,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t BLOCK_K = BLOCK_K_ * kNumStagesPerMerge;
     constexpr uint32_t kNumStages = kNumStages_ / kNumStagesPerMerge;
 
+    // ClusterTransactionBarrier 是 CUTLASS 对 CUDA PTX mbarrier 硬件原语的封装。
+    // init(N)/arrive()/wait() 等方法最终编译为 mbarrier.init/arrive/try_wait 等 PTX 指令。
+    // mbarrier 是 SMEM 中的一个硬件对象，用于 TMA 加载完成同步和 warp 间流水线控制。
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
@@ -86,6 +89,10 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     DG_STATIC_ASSERT(kNumTMAStoreStages >= 1, "Invalid number of TMA stages");
 
     // NOTES: Make sure we have enough shared memory for UMMA padding
+    // SM100 上 UMMA 硬件要求 A 矩阵对齐到 LAYOUT_AD_M (128) 行。
+    // 当 LOAD_BLOCK_M < 128 时（如 32 或 64），TMA 加载的实际行数少于 128，但 UMMA
+    // 仍以 128 行为单位访问 smem，多出的部分会溢出到 B 的 smem 区域。此断言编译期
+    // 验证 A 的 smem 加 B 所有 stage 的 smem 总空间足以容纳 UMMA 的访问范围。
     static constexpr uint32_t UMMA_A_SIZE_PER_STAGE = math::constexpr_align(LOAD_BLOCK_M, LAYOUT_AD_M) * BLOCK_K * sizeof(nv_bfloat16);
     DG_STATIC_ASSERT(UMMA_A_SIZE_PER_STAGE <= SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE * kNumStages, "Memory out of bound for UMMA");
 
@@ -128,7 +135,8 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
     });
 
-    // Fill barriers
+    // SMEM 布局: [smem_cd | smem_a(num_stages) | smem_b(num_stages) | barriers | tmem_ptr]
+    // 将数据区之后的 smem 原始字节 reinterpret_cast 为 Barrier* 数组，所有 barrier 都从此处分配。
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
     auto full_barriers              = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto empty_barriers             = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
@@ -136,11 +144,19 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     auto tmem_empty_barriers        = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + kNumEpilogueStages + i); });
     auto tensor_core_full_barrier   = barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2;
 
-    // Fill the tensor memory pointer
+    // TMEM 地址存放在 shared memory 中，紧接在所有 barrier 之后。
+    // warp 2 负责分配 TMEM 并将地址写入此处，epilogue warps 后续从中读取地址用于 store。
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2 + 1);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Initialize barriers
+    // init(N) 表示 barrier 需要 N 次 arrive 后才会解除阻塞。
+    // ── TMA ↔ MMA 流水线 barrier ──
+    // full_barriers: TMA 加载完成信号。所有 CTA 的 TMA warp 都会 arrive → init(kNumMulticast)
+    // empty_barriers: MMA 消费完成信号。只有 leader CTA 的 MMA warp 会 arrive → init(1)
+    // ── TMEM 流水线 barrier ──
+    // tmem_full_barriers: UMMA 累加到 TMEM 完成。只有 leader CTA 的 MMA warp arrive → init(1)
+    // tmem_empty_barriers: epilogue 存出完成。所有 CTA 的 epilogue threads arrive → init(kNumMulticast * kNumUMMAStoreThreads)
     if (warp_idx == 1 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
@@ -208,6 +224,9 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
                 // NOTES: `k_idx` is actually the k index default for K-major, while `k_b_idx` may be MN-major
                 // And for all m-grouped GEMMs, A must be K-majored
+                // k_idx 仅作基准值（k * BLOCK_K），实际代码中未使用。
+                // k_a_idx/k_b_idx 分开计算：因为 A/B 的 major 布局可能不同，在 grouped GEMM 中
+                // MN-major 的矩阵需要在 K 维上叠加 group offset，所以需要各自独立计算 K 索引。
                 DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous or kGemmType == GemmType::Batched or
                                  kMajorA == cute::UMMA::Major::K, "Invalid major");
                 uint32_t k_idx = k_block_idx * BLOCK_K;
@@ -239,6 +258,12 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                         &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], n_idx, k_b_idx, kNumMulticast, batch_idx);
 
                 // Arrive at full barriers
+                // SM100 通过 distributed shared memory（shared::cluster）实现跨 CTA 访问 barrier。
+                // TMA 2SM load 将数据 multicast 到两个 CTA 的 smem，但完成信号只发给 leader CTA 的 barrier。
+                // ClusterTransactionBarrier 是硬件支持的分布式原语：leader 负责追踪整个 cluster 的 TX 字节数，
+                // 非 leader 通过 shared::cluster 地址空间对其远程 arrive。
+                // Leader: arrive_and_expect_tx 设定预期接收的 TX 字节数（* kNumMulticast 因数据写入两份 smem）
+                // 非 Leader: arrive(0u) 仅参与 barrier 同步，不设置 TX 期望
                 constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
                 if (is_leader_cta) {
                     full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
