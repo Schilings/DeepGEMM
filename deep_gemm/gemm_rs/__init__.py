@@ -122,11 +122,22 @@ def bf16_gemm_rs_nt_v3(y: torch.Tensor,
     """
     BF16 GEMM + Reduce-Scatter v3: Dual-kernel architecture with stream-level overlap.
 
-    This implementation:
+    This implementation (Flux-inspired dual-kernel design):
     - Uses two separate kernels on different CUDA streams
-    - Kernel 1 (GEMM Compute): 256T, no Comm Warps — pure GEMM + epilogue scatter write + flag signaling
-    - Kernel 2 (RS Reduce): 256T/CTA, per-tile polling — waits for flags, then reduces partial results
-    - Natural pipeline overlap: while GEMM computes later tiles, RS reduce processes earlier ones
+    - Kernel 1 (GEMM Compute, 256T): No Comm Warps — pure GEMM + epilogue scatter write + flag signaling
+    - Kernel 2 (RS Reduce, 256T/CTA): Per-tile polling — waits for flags, then reduces partial results
+    - Natural tile-level pipeline overlap via per-tile ready flags
+
+    Stream orchestration:
+    - GEMM compute kernel runs on compute_stream
+    - RS reduce kernel runs on comm_stream
+    - RS reduce polls per-tile flags set by GEMM epilogue — natural tile-level overlap
+    - Event synchronization ensures correct ordering
+
+    Expected performance:
+    - GEMM throughput should match standard 256T GEMM (~1100 TFLOPS on B300)
+    - vs single-kernel 384T GEMM (~600 TFLOPS, register spilling bottleneck)
+    - Overlap: while GEMM computes later tiles, RS reduce reduces earlier ones
 
     Args:
         y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
@@ -139,8 +150,8 @@ def bf16_gemm_rs_nt_v3(y: torch.Tensor,
     assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt_v3 is for SM100/B-series GPUs'
     comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
 
-    # Step 1: Launch GEMM compute kernel on default stream
-    _C.bf16_gemm_rs_compute_nt(
+    # Single C++ entry point handles both kernels + stream orchestration + event sync
+    _C.bf16_gemm_rs_v3_nt(
         y, a, b,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs,
@@ -148,20 +159,5 @@ def bf16_gemm_rs_nt_v3(y: torch.Tensor,
         sym_buffer.num_max_tokens_per_rank,
         num_tokens_per_rank,
         compiled_dims,
-        comm_dtype_str,
-    )
-
-    # Step 2: Synchronize — wait for GEMM compute to finish all flags
-    torch.cuda.synchronize()
-
-    # Step 3: Launch RS reduce kernel on default stream (serial, no overlap yet)
-    _C.rs_reduce(
-        y,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        num_tokens_per_rank,
-        sym_buffer.hidden,
         comm_dtype_str,
     )
