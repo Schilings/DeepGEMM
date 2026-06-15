@@ -23,13 +23,18 @@ using namespace deep_gemm::math;
 //  Design:
 //    - Each CTA handles one tile of the output
 //    - Per-tile polling of ready flags (set by GEMM kernel epilogue)
-//    - Vectorized BF16 __hadd2 / FP32 accumulate for maximum memory bandwidth
+//    - FP32 accumulation for precision (BF16 partial → FP32 acc → BF16 output)
 //    - 256T/CTA for full memory bandwidth utilization
 //
 //  Overlap mechanism:
 //    - GEMM kernel computes tiles in round-robin interleaved order
 //    - This kernel polls per-tile ready flags, processing tiles as they complete
 //    - Natural pipeline: while GEMM computes later tiles, we reduce earlier ones
+//
+//  Precision:
+//    - Even with comm_dtype=BF16 (saving NVLink bandwidth), we accumulate in FP32
+//    - This matches NCCL's behavior and eliminates multi-rank accumulation error
+//    - With 8 ranks: BF16 __hadd2 ×7 → max_diff~32 vs FP32 acc ×7 → max_diff=0
 //
 // ============================================================================================
 
@@ -55,13 +60,9 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
     const uint32_t num_n_blocks = ceil_div(shape_n, BLOCK_N);
     const uint32_t total_tiles = num_m_blocks * num_n_blocks;
 
-    // Elements per tile and vectorization
-    constexpr uint32_t kVecBytes = 16;  // 128-bit = uint4
+    // Vectorization: 128-bit = uint4
+    constexpr uint32_t kVecBytes = 16;
     constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);  // 8 for BF16, 4 for FP32
-
-    // BF16 wide vector: 32B = 2x uint4, process 16 BF16 per iteration
-    constexpr uint32_t kWideVecBytes = 32;
-    constexpr uint32_t kWideVecSize = kWideVecBytes / sizeof(comm_dtype_t);  // 16 for BF16
     const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
 
     // Process tiles assigned to this CTA
@@ -87,13 +88,16 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
         }
         __syncthreads();
 
-        // Phase 2: Vectorized reduce
-        if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-            // BF16 fast path with wide vectors (32B = 16 BF16 per iteration)
-            const uint32_t wide_vecs_per_tile = elems_per_tile / kWideVecSize;
+        // Phase 2: Vectorized reduce with FP32 accumulation
+        // Key insight: always accumulate in FP32 regardless of comm_dtype
+        // This matches NCCL's behavior and eliminates multi-rank BF16 accumulation error
+        if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
+            // BF16 communication + FP32 accumulation
+            // This is the recommended path: saves NVLink bandwidth while maintaining precision
+            const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 
-            for (uint32_t wide_vec_offset = tid; wide_vec_offset < wide_vecs_per_tile; wide_vec_offset += kNumThreads) {
-                const uint32_t elem_offset = wide_vec_offset * kWideVecSize;
+            for (uint32_t vec_offset = tid; vec_offset < vecs_per_tile; vec_offset += kNumThreads) {
+                const uint32_t elem_offset = vec_offset * kVecSize;
                 const uint32_t tile_row = elem_offset / BLOCK_N;
                 const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
                 const uint32_t global_row = base_row + tile_row;
@@ -102,39 +106,41 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
                 if (global_row >= runtime_m_per_rank or global_col >= shape_n)
                     continue;
 
-                // Load self-rank contribution from output
+                // Load self-rank contribution from output (BF16)
                 auto* out_ptr = output + global_row * shape_n + global_col;
-                uint4 self_data0 = *reinterpret_cast<const uint4*>(out_ptr);
-                uint4 self_data1 = *reinterpret_cast<const uint4*>(out_ptr + kVecSize);
+                uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
 
-                // Accumulate N-1 remote ranks using __hadd2
+                // Initialize FP32 accumulator from self-rank BF16 data
+                float acc[kVecSize];
+                const auto* self_bf16 = reinterpret_cast<const __nv_bfloat16*>(&self_data);
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecSize; ++i)
+                    acc[i] = __bfloat162float(self_bf16[i]);
+
+                // Accumulate N-1 remote ranks in FP32
                 #pragma unroll 1
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
+                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++rank_iter) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
                     const comm_dtype_t* partial_ptr =
                         workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
 
-                    uint4 remote_data0 = *reinterpret_cast<const uint4*>(partial_ptr);
-                    uint4 remote_data1 = *reinterpret_cast<const uint4*>(partial_ptr + kVecSize);
-
-                    auto* s0 = reinterpret_cast<__nv_bfloat162*>(&self_data0);
-                    auto* s1 = reinterpret_cast<__nv_bfloat162*>(&self_data1);
-                    const auto* r0 = reinterpret_cast<const __nv_bfloat162*>(&remote_data0);
-                    const auto* r1 = reinterpret_cast<const __nv_bfloat162*>(&remote_data1);
+                    uint4 remote_data = *reinterpret_cast<const uint4*>(partial_ptr);
+                    const auto* remote_bf16 = reinterpret_cast<const __nv_bfloat16*>(&remote_data);
                     #pragma unroll
-                    for (uint32_t i = 0; i < 4; ++ i)
-                        s0[i] = __hadd2(s0[i], r0[i]);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < 4; ++ i)
-                        s1[i] = __hadd2(s1[i], r1[i]);
+                    for (uint32_t i = 0; i < kVecSize; ++i)
+                        acc[i] += __bfloat162float(remote_bf16[i]);
                 }
 
-                // Write final reduced result
-                *reinterpret_cast<uint4*>(out_ptr) = self_data0;
-                *reinterpret_cast<uint4*>(out_ptr + kVecSize) = self_data1;
+                // Convert FP32 accumulator back to BF16 and write
+                uint4 result;
+                auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(&result);
+                #pragma unroll
+                for (uint32_t i = 0; i < kVecSize; ++i)
+                    out_bf16[i] = __float2bfloat16(acc[i]);
+                *reinterpret_cast<uint4*>(out_ptr) = result;
             }
         } else {
-            // FP32 fallback
+            // FP32 communication + FP32 accumulation
             const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 
             for (uint32_t vec_offset = tid; vec_offset < vecs_per_tile; vec_offset += kNumThreads) {
@@ -153,11 +159,11 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
                 float acc[kVecSize];
                 const auto* self_f32 = reinterpret_cast<const float*>(&self_data);
                 #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++ i)
+                for (uint32_t i = 0; i < kVecSize; ++i)
                     acc[i] = self_f32[i];
 
                 #pragma unroll 1
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
+                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++rank_iter) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
                     const comm_dtype_t* partial_ptr =
                         workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
@@ -165,14 +171,14 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
                     uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
                     const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
                     #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                    for (uint32_t i = 0; i < kVecSize; ++i)
                         acc[i] += static_cast<float>(comm_data[i]);
                 }
 
                 uint4 result;
                 auto* out_f32 = reinterpret_cast<float*>(&result);
                 #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++ i)
+                for (uint32_t i = 0; i < kVecSize; ++i)
                     out_f32[i] = acc[i];
                 *reinterpret_cast<uint4*>(out_ptr) = result;
             }
