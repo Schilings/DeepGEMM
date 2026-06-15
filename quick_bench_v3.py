@@ -1,4 +1,4 @@
-"""Quick benchmark for V3 dual-kernel GEMM+RS - with barrier reset fix"""
+"""Quick benchmark for V3 dual-kernel GEMM+RS - single shape test"""
 import torch, torch.distributed as dist, torch.multiprocessing as mp
 import deep_gemm
 from deep_gemm.utils.dist import init_dist
@@ -9,6 +9,7 @@ def bench(local_rank, num_local_ranks):
     torch.manual_seed(42 + rank_idx)
     torch.cuda.manual_seed(42 + rank_idx)
 
+    # Test shapes (from small to large)
     shapes = [
         (2048, 7168, 4096),
         (4096, 7168, 2048),
@@ -34,14 +35,9 @@ def bench(local_rank, num_local_ranks):
         sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(group, m_per_rank, n, out_dtype=torch.bfloat16)
         dist.barrier()
 
-        def run_v3():
-            # Reset NVLink barrier state (first 32 bytes) before each call
-            sym_buffer.buffer[:32].zero_()
-            deep_gemm.bf16_gemm_rs_nt_v3(y_v3, a, b, sym_buffer, m_per_rank, compiled_dims="nk")
-
         # Warmup V3
         for _ in range(3):
-            run_v3()
+            deep_gemm.bf16_gemm_rs_nt_v3(y_v3, a, b, sym_buffer, m_per_rank, compiled_dims="nk")
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -50,7 +46,7 @@ def bench(local_rank, num_local_ranks):
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         for _ in range(20):
-            run_v3()
+            deep_gemm.bf16_gemm_rs_nt_v3(y_v3, a, b, sym_buffer, m_per_rank, compiled_dims="nk")
         end.record()
         torch.cuda.synchronize()
         v3_time = start.elapsed_time(end) / 20  # ms

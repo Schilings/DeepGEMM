@@ -205,6 +205,19 @@ static void sm100_bf16_gemm_rs_v3_nt(const torch::Tensor& y,
     DG_HOST_ASSERT(config.block_k == 64);
     DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
 
+    // -- Step 0: Reset barrier state and synchronize streams --
+    // The GEMM compute kernel uses nvlink_barrier which persists state in sym_buffer
+    // (grid_sync counters at +0/+4, nvlink barrier counter at +4, signals at +20/+24).
+    // These MUST be zeroed before each kernel launch to prevent stale state from
+    // previous invocations causing barrier timeout.
+    // We zero the first 32 bytes (kNumBarrierSignalBytes) on compute_stream.
+    const auto comm_stream = get_gemm_rs_comm_stream();
+    DG_CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
+    const auto compute_stream = at::cuda::getCurrentCUDAStream();
+    constexpr uint64_t kBarrierRegionBytes = 32;  // kNumBarrierSignalBytes from GemmRSWorkspace
+    DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(sym_buffer.data_ptr<int8_t>(), 0,
+                                           kBarrierRegionBytes, compute_stream.stream()));
+
     // Create TMA descriptors
     const auto tensor_map_a = make_tma_2d_desc(a,
                                                k, m,
@@ -218,7 +231,6 @@ static void sm100_bf16_gemm_rs_v3_nt(const torch::Tensor& y,
                                                config.swizzle_b_mode);
 
     // -- Step 1: Launch GEMM compute kernel on compute_stream --
-    const auto compute_stream = at::cuda::getCurrentCUDAStream();
     const int total_threads = config.num_non_epilogue_threads + config.num_epilogue_threads;
 
     const SM100BF16GemmRSComputeRuntime::Args compute_args = {
@@ -248,7 +260,7 @@ static void sm100_bf16_gemm_rs_v3_nt(const torch::Tensor& y,
     DG_CUDA_RUNTIME_CHECK(cudaEventRecord(gemm_launched_event, compute_stream.stream()));
 
     // -- Step 2: Launch RS reduce kernel on comm_stream --
-    const auto comm_stream = get_gemm_rs_comm_stream();
+    // Note: comm_stream already synchronized in Step 0
 
     // comm_stream waits for GEMM kernel to be at least launched
     // (not completed -- overlap happens naturally via per-tile polling)
