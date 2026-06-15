@@ -750,3 +750,36 @@ all_gather 的额外 kernel launch + 同步开销。
 - 架构级优化（两kernel方案/通信协议）：需要大规模重构
 - K=2048 shapes 必输（compute/comm ratio 太低），这是 MoE 场景固有限制
 - K=7168 N=7168 shapes (0.98-1.01x)：GEMM 吞吐略低于标准128T kernel，需架构级变化才能突破
+
+### 2026-06-15
+
+#### V3 Dual-Kernel GEMM+RS 开发与验证
+
+**架构设计（Flux-inspired dual-kernel）**：
+- Kernel 1 (GEMM Compute, 256T): No Comm Warps — 纯 GEMM + epilogue scatter write + per-tile flag signaling
+- Kernel 2 (RS Reduce, 256T/CTA): Per-tile polling of ready flags + BF16 __hadd2 vectorized reduce
+- Stream-level overlap: GEMM compute on compute_stream, RS reduce on comm_stream
+- Event synchronization: gemm_launched_event → comm_stream waits → RS reduce runs → comm_done_event → compute_stream waits
+
+**正确性验证**：
+- 2 GPU: 6/6 ALL PASSED (max_diff=0.0000)
+- 8 GPU: 6/6 ALL PASSED (max_diff=16/32, BF16 累加误差正常)
+
+**关键 Bug — NVLink Barrier Timeout**：
+- V3 dual-kernel 在连续调用（warmup + timed iterations）时出现 NVLink barrier timeout
+- 单次调用（正确性测试）正常，多次调用失败
+- 错误特征： — 只有部分 rank 发送了信号
+- 可能根因：
+  1. comm_stream (static thread_local) 和 compute_stream 的异步竞争
+  2. NVLink barrier signal_ptr 在多轮调用间状态不一致
+  3. GEMM compute kernel 的 nvlink_barrier 在 persistent kernel 模式下的 grid_sync 问题
+- 待修复
+
+**修改文件**：
+- : V3 双kernel入口 + stream/event 管理
+- : GEMM compute-only kernel (256T)
+- : RS reduce kernel (256T/CTA)
+- : 添加 bf16_gemm_rs_nt_v3 Python API
+- : 注册 bf16_gemm_rs_v3_nt C++ API
+- : V3 正确性测试
+- : V3 性能 benchmark

@@ -1,20 +1,20 @@
 """
-GEMM-RS Performance Benchmark: Fused vs Separate (GEMM + NCCL RS)
+GEMM-RS Performance Benchmark: V3 Dual-Kernel vs V1 Fused vs Separate (GEMM + NCCL RS)
 
 Comprehensive comparison targeting large model training scenarios:
-  1. bf16_gemm_rs_nt (pull-based single kernel) — fused
-  2. bf16_gemm_nt + torch.distributed.reduce_scatter_tensor — separate (NCCL)
+  1. bf16_gemm_nt + torch.distributed.reduce_scatter_tensor -- separate (NCCL)
+  2. bf16_gemm_rs_nt (pull-based single kernel, 384T) -- v1 fused
+  3. bf16_gemm_rs_nt_v3 (dual-kernel overlap, 256T compute + 256T reduce) -- v3 fused
 
-Focus on large hidden dimensions (7168) and long-context training scenarios
-where the fused approach should show maximum benefit.
+Focus on large hidden dimensions (7168) and long-context training scenarios.
 
 Usage:
     python benchmarks/bench_gemm_rs.py [num_gpus] [num_iters]
     python benchmarks/bench_gemm_rs.py 8 30                    # 8 GPU, 30 iters
-    python benchmarks/bench_gemm_rs.py 2 20 --profile          # with nsys markers
+    python benchmarks/bench_gemm_rs.py 2 20                    # 2 GPU, 20 iters
 
 Output:
-    - Per-shape latency (μs), TFLOPS, and speedup
+    - Per-shape latency (us), TFLOPS, and speedup
     - Geometric mean speedup across all shapes
     - Comm/Compute ratio analysis
 """
@@ -32,48 +32,35 @@ import deep_gemm
 from deep_gemm.utils.dist import init_dist
 
 
-# ─── Test shapes ───
-# (tokens_per_rank, N, K) — covering all typical LLM training regimes
-#
-# Design rationale:
-#   - Small M + Small N/K: MoE inference (low batch)
-#   - Large M + Large N/K: Dense training (long context, large hidden)
-#   - N=7168: DeepSeek-V3 style models
-#   - K=7168: attention projection dimensions
-#
+# --- Test shapes ---
 SHAPES_STANDARD = [
-    # ── Realistic LLM training shapes ──
-    # In actual training: total M = 10k-20k+, hidden_dim = 4k-8k
-    # tokens_per_rank = total_M / num_GPUs
-    # On 8 GPUs: per-rank 2k = total 16k, per-rank 4k = total 32k
-
-    # ── Medium (typical training batch, 8 GPU → total 8k-16k tokens) ──
+    # -- Medium (typical training batch, 8 GPU -> total 8k-16k tokens) --
     (1024, 4096, 7168),
     (1024, 7168, 4096),
     (2048, 4096, 7168),
     (2048, 7168, 4096),
     (2048, 7168, 2048),
 
-    # ── Large (long context, 8 GPU → total 32k tokens) ──
+    # -- Large (long context, 8 GPU -> total 32k tokens) --
     (4096, 7168, 2048),
     (4096, 2048, 7168),
     (4096, 4096, 4096),
     (4096, 7168, 4096),
     (4096, 4096, 7168),
 
-    # ── Very Large (long context, 8 GPU → total 64k tokens) ──
+    # -- Very Large (long context, 8 GPU -> total 64k tokens) --
     (8192, 7168, 2048),
     (8192, 2048, 7168),
     (8192, 4096, 4096),
     (8192, 7168, 4096),
 
-    # ── Extreme (batch size 16k/rank, total 128k tokens on 8 GPU) ──
+    # -- Extreme (batch size 16k/rank, total 128k tokens on 8 GPU) --
     (16384, 7168, 2048),
     (16384, 2048, 7168),
     (16384, 4096, 4096),
     (16384, 7168, 4096),
 
-    # ── Stress test ──
+    # -- Stress test --
     (8192, 7168, 7168),
     (16384, 7168, 7168),
     (20480, 7168, 2048),
@@ -82,29 +69,21 @@ SHAPES_STANDARD = [
 
 def flush_l2():
     """Flush GPU L2 cache by allocating and zeroing a large tensor."""
-    torch.empty(int(256e6 // 4), dtype=torch.int32, device='cuda').zero_()
+    torch.empty(int(256e6 // 4), dtype=torch.int32, device="cuda").zero_()
 
 
 def compute_tflops(m, n, k, time_ms):
-    """Compute TFLOPS for a GEMM of shape M×N×K."""
+    """Compute TFLOPS for a GEMM of shape MxNxK."""
     flops = 2.0 * m * n * k
     return flops / (time_ms * 1e-3) / 1e12
 
 
 def compute_comm_bytes(tokens_per_rank, n_dim, num_ranks, dtype_bytes=2):
-    """
-    Compute communication volume for reduce-scatter.
-    Bandwidth-optimal: each rank receives (N-1)/N × data_size from peers.
-    """
     data_per_rank = tokens_per_rank * n_dim * dtype_bytes
     return data_per_rank * (num_ranks - 1) / num_ranks
 
 
 def bench_fn(fn, num_warmup=5, num_iters=20, barrier_group=None):
-    """
-    Benchmark a function using CUDA events.
-    Returns average time in milliseconds.
-    """
     # Warmup
     for _ in range(num_warmup):
         fn()
@@ -135,23 +114,25 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
     torch.manual_seed(42 + rank_idx)
     torch.cuda.manual_seed(42 + rank_idx)
 
-    device = f'cuda:{local_rank}'
+    device = f"cuda:{local_rank}"
 
     if rank_idx == 0:
-        print(f"\n{'═'*100}")
+        print(f"\n{'='*120}")
         print(f"  GEMM-RS Performance Benchmark: {num_ranks} GPUs, {num_iters} iterations per measurement")
         print(f"  GPU: {torch.cuda.get_device_name(local_rank)}")
-        print(f"{'═'*100}")
+        print(f"  V1=Pull-based single-kernel(384T), V3=Dual-kernel overlap(256T compute + 256T reduce)")
+        print(f"{'='*120}")
         print()
-        print(f"  {'Shape':<22} │ {'Separate':>10} {'Fused':>10} │ "
-              f"{'Sep TFLOPS':>10} {'Fus TFLOPS':>10} │ {'Speedup':>8} │ {'Comp/Comm':>10}")
-        print(f"  {'(M/rank×N×K)':<22} │ {'(μs)':>10} {'(μs)':>10} │ "
-              f"{'':>10} {'':>10} │ {'':>8} │ {'Ratio':>10}")
-        print(f"  {'─'*22}─┼─{'─'*10}─{'─'*10}─┼─"
-              f"{'─'*10}─{'─'*10}─┼─{'─'*8}─┼─{'─'*10}")
+        print(f"  {'Shape':<22} | {'Separate':>10} {'V1 Fused':>10} {'V3 Dual':>10} | "
+              f"{'Sep TFLOPS':>10} {'V1 TFLOPS':>10} {'V3 TFLOPS':>10} | "
+              f"{'V1 Speedup':>10} {'V3 Speedup':>10}")
+        print(f"  {'(M/rank x N x K)':<22} | {'(us)':>10} {'(us)':>10} {'(us)':>10} | "
+              f"{'':>10} {'':>10} {'':>10} | "
+              f"{'vs Sep':>10} {'vs Sep':>10}")
+        print(f"  {'-'*22}-+-{'-'*10}-{'-'*10}-{'-'*10}-+-"
+              f"{'-'*10}-{'-'*10}-{'-'*10}-+-{'-'*10}-{'-'*10}")
 
     results = []
-    shape_groups = {}  # Group results by category
 
     for tokens_per_rank, n_dim, k_dim in SHAPES_STANDARD:
         total_m = tokens_per_rank * num_ranks
@@ -161,6 +142,7 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
         a = torch.randn((total_m, k_dim), dtype=torch.bfloat16, device=device)
         b = torch.randn((n_dim, k_dim), dtype=torch.bfloat16, device=device)
         y_fused = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=device)
+        y_v3 = torch.zeros_like(y_fused)
         y_sep = torch.zeros_like(y_fused)
         d_full = torch.zeros((total_m, n_dim), dtype=torch.bfloat16, device=device)
 
@@ -171,13 +153,13 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             )
         except Exception as e:
             if rank_idx == 0:
-                print(f"  {tokens_per_rank}×{n_dim}×{k_dim:<5}  │ {'SKIP (buffer alloc failed)':>50} │")
+                print(f"  {tokens_per_rank}x{n_dim}x{k_dim:<5}  | {'SKIP (buffer alloc failed)':>70} |")
             dist.barrier()
             continue
 
         dist.barrier()
 
-        # ── Benchmark: Separate (GEMM + NCCL RS) ──
+        # -- Benchmark: Separate (GEMM + NCCL RS) --
         def run_separate():
             deep_gemm.bf16_gemm_nt(a, b, d_full)
             dist.reduce_scatter_tensor(y_sep, d_full, op=dist.ReduceOp.SUM, group=group)
@@ -186,148 +168,144 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             time_separate_ms = bench_fn(run_separate, num_iters=num_iters, barrier_group=group)
         except Exception as e:
             if rank_idx == 0:
-                print(f"  {tokens_per_rank}×{n_dim}×{k_dim:<5}  │ {'SKIP (separate failed)':>50} │")
+                print(f"  {tokens_per_rank}x{n_dim}x{k_dim:<5}  | {'SKIP (separate failed)':>70} |")
             sym_buffer.destroy()
             dist.barrier()
             continue
 
-        # ── Benchmark: Fused (Pull-based) ──
-        def run_fused():
-            deep_gemm.bf16_gemm_rs_nt(y_fused, a, b, sym_buffer, tokens_per_rank, compiled_dims='nk')
+        # -- Benchmark: V1 Fused (Pull-based single kernel, 384T) --
+        def run_fused_v1():
+            deep_gemm.bf16_gemm_rs_nt(y_fused, a, b, sym_buffer, tokens_per_rank, compiled_dims="nk")
 
         try:
-            time_fused_ms = bench_fn(run_fused, num_iters=num_iters, barrier_group=group)
+            time_v1_ms = bench_fn(run_fused_v1, num_iters=num_iters, barrier_group=group)
         except Exception as e:
+            time_v1_ms = float("inf")
             if rank_idx == 0:
-                print(f"  {tokens_per_rank}×{n_dim}×{k_dim:<5}  │ {'SKIP (fused failed)':>50} │")
-            sym_buffer.destroy()
-            dist.barrier()
-            continue
+                print(f"  V1 fused failed for {tokens_per_rank}x{n_dim}x{k_dim}: {e}")
+
+        # -- Benchmark: V3 Dual-kernel overlap (256T compute + 256T reduce) --
+        def run_fused_v3():
+            deep_gemm.bf16_gemm_rs_nt_v3(y_v3, a, b, sym_buffer, tokens_per_rank, compiled_dims="nk")
+
+        try:
+            time_v3_ms = bench_fn(run_fused_v3, num_iters=num_iters, barrier_group=group)
+        except Exception as e:
+            time_v3_ms = float("inf")
+            if rank_idx == 0:
+                print(f"  V3 dual-kernel failed for {tokens_per_rank}x{n_dim}x{k_dim}: {e}")
 
         # Compute metrics
         time_separate_us = time_separate_ms * 1000
-        time_fused_us = time_fused_ms * 1000
-        speedup = time_separate_us / time_fused_us if time_fused_us > 0 else float('inf')
+        time_v1_us = time_v1_ms * 1000 if time_v1_ms != float("inf") else float("inf")
+        time_v3_us = time_v3_ms * 1000 if time_v3_ms != float("inf") else float("inf")
+
+        speedup_v1 = time_separate_us / time_v1_us if time_v1_us > 0 and time_v1_us != float("inf") else 0
+        speedup_v3 = time_separate_us / time_v3_us if time_v3_us > 0 and time_v3_us != float("inf") else 0
 
         tflops_separate = compute_tflops(total_m, n_dim, k_dim, time_separate_ms)
-        tflops_fused = compute_tflops(total_m, n_dim, k_dim, time_fused_ms)
-
-        # Compute/comm ratio (rough estimate)
-        compute_flops = 2.0 * total_m * n_dim * k_dim
-        comm_bytes = compute_comm_bytes(tokens_per_rank, n_dim, num_ranks)
-        # Assume ~900 GB/s NVLink bandwidth per direction, ~1000 TFLOPS peak BF16
-        comp_time_ideal = compute_flops / (1000e12)  # seconds
-        comm_time_ideal = comm_bytes / (900e9)  # seconds
-        comp_comm_ratio = comp_time_ideal / max(comm_time_ideal, 1e-12)
+        tflops_v1 = compute_tflops(total_m, n_dim, k_dim, time_v1_ms) if time_v1_ms != float("inf") else 0
+        tflops_v3 = compute_tflops(total_m, n_dim, k_dim, time_v3_ms) if time_v3_ms != float("inf") else 0
 
         results.append({
-            'tokens_per_rank': tokens_per_rank,
-            'n_dim': n_dim,
-            'k_dim': k_dim,
-            'time_separate_us': time_separate_us,
-            'time_fused_us': time_fused_us,
-            'speedup': speedup,
-            'tflops_separate': tflops_separate,
-            'tflops_fused': tflops_fused,
-            'comp_comm_ratio': comp_comm_ratio,
+            "tokens_per_rank": tokens_per_rank,
+            "n_dim": n_dim,
+            "k_dim": k_dim,
+            "time_separate_us": time_separate_us,
+            "time_v1_us": time_v1_us,
+            "time_v3_us": time_v3_us,
+            "speedup_v1": speedup_v1,
+            "speedup_v3": speedup_v3,
+            "tflops_separate": tflops_separate,
+            "tflops_v1": tflops_v1,
+            "tflops_v3": tflops_v3,
         })
 
         if rank_idx == 0:
-            shape_str = f"{tokens_per_rank}×{n_dim}×{k_dim}"
-            speedup_str = f"{speedup:.2f}x"
-            if speedup >= 1.0:
-                speedup_str = f"**{speedup:.2f}x**"
+            shape_str = f"{tokens_per_rank}x{n_dim}x{k_dim}"
+            v1_str = f"{speedup_v1:.2f}x" if speedup_v1 > 0 else "FAIL"
+            v3_str = f"{speedup_v3:.2f}x" if speedup_v3 > 0 else "FAIL"
+            if speedup_v3 >= speedup_v1 and speedup_v3 > 0:
+                v3_str = f"**{speedup_v3:.2f}x**"
 
-            print(f"  {shape_str:<22} │ {time_separate_us:>8.1f}μs {time_fused_us:>8.1f}μs │ "
-                  f"{tflops_separate:>8.1f}T {tflops_fused:>8.1f}T │ "
-                  f"{speedup:>7.2f}x │ {comp_comm_ratio:>8.2f}x")
+            time_v1_str = f"{time_v1_us:>8.1f}" if time_v1_us != float("inf") else "     FAIL"
+            time_v3_str = f"{time_v3_us:>8.1f}" if time_v3_us != float("inf") else "     FAIL"
+            tflops_v1_str = f"{tflops_v1:>8.1f}T" if tflops_v1 > 0 else "     FAIL"
+            tflops_v3_str = f"{tflops_v3:>8.1f}T" if tflops_v3 > 0 else "     FAIL"
+
+            print(f"  {shape_str:<22} | {time_separate_us:>8.1f}u {time_v1_str}u {time_v3_str}u | "
+                  f"{tflops_separate:>8.1f}T {tflops_v1_str} {tflops_v3_str} | "
+                  f"{v1_str:>10} {v3_str:>10}")
 
         sym_buffer.destroy()
         dist.barrier()
 
-    # ── Summary ──
+    # -- Summary --
     if rank_idx == 0 and results:
-        print(f"\n{'═'*100}")
+        print(f"\n{'='*120}")
         print(f"  Summary ({num_ranks} GPUs)")
-        print(f"{'═'*100}")
+        print(f"{'='*120}")
 
         # Overall stats
-        speedups = [r['speedup'] for r in results]
-        geo_mean = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-        max_speedup = max(speedups)
-        min_speedup = min(speedups)
-        median_speedup = sorted(speedups)[len(speedups) // 2]
+        v1_speedups = [r["speedup_v1"] for r in results if r["speedup_v1"] > 0]
+        v3_speedups = [r["speedup_v3"] for r in results if r["speedup_v3"] > 0]
 
-        print(f"\n  Overall Statistics:")
-        print(f"    Geometric Mean Speedup: {geo_mean:.3f}x")
-        print(f"    Median Speedup:         {median_speedup:.3f}x")
-        print(f"    Best Speedup:           {max_speedup:.3f}x")
-        print(f"    Worst Speedup:          {min_speedup:.3f}x")
-        print(f"    Shapes where Fused wins (>1.0x): "
-              f"{sum(1 for s in speedups if s > 1.0)}/{len(speedups)}")
+        geo_v1 = math.exp(sum(math.log(s) for s in v1_speedups) / len(v1_speedups)) if v1_speedups else 0
+        geo_v3 = math.exp(sum(math.log(s) for s in v3_speedups) / len(v3_speedups)) if v3_speedups else 0
 
-        # Categorize by scenario
+        print(f"\n  Overall Statistics (vs Separate GEMM+NCCL RS):")
+        print(f"    V1 Fused (384T) geo_mean speedup: {geo_v1:.3f}x")
+        print(f"    V3 Dual-Kernel (256T) geo_mean speedup: {geo_v3:.3f}x")
+        if geo_v1 > 0 and geo_v3 > 0:
+            v3_vs_v1 = geo_v3 / geo_v1
+            print(f"    V3 vs V1 improvement ratio: {v3_vs_v1:.3f}x")
+
+        # Best/worst
+        if v1_speedups:
+            print(f"\n  V1 Fused: best={max(v1_speedups):.2f}x, worst={min(v1_speedups):.2f}x")
+        if v3_speedups:
+            print(f"  V3 Dual:  best={max(v3_speedups):.2f}x, worst={min(v3_speedups):.2f}x")
+
+        # By scenario
         print(f"\n  By Scenario:")
+        for label, pred in [
+            ("N=7168 (large hidden)", lambda r: r["n_dim"] == 7168),
+            ("K=7168 (large input)", lambda r: r["k_dim"] == 7168),
+            ("M/rank>=2048 (long ctx)", lambda r: r["tokens_per_rank"] >= 2048),
+            ("M/rank>=8192 (very long)", lambda r: r["tokens_per_rank"] >= 8192),
+        ]:
+            subset = [r for r in results if pred(r)]
+            if subset:
+                sv1 = [r["speedup_v1"] for r in subset if r["speedup_v1"] > 0]
+                sv3 = [r["speedup_v3"] for r in subset if r["speedup_v3"] > 0]
+                g1 = math.exp(sum(math.log(s) for s in sv1) / len(sv1)) if sv1 else 0
+                g3 = math.exp(sum(math.log(s) for s in sv3) / len(sv3)) if sv3 else 0
+                print(f"    {label:<28} V1={g1:.3f}x  V3={g3:.3f}x  ({len(subset)} shapes)")
 
-        # Large hidden dim (N=7168)
-        large_n = [r for r in results if r['n_dim'] == 7168]
-        if large_n:
-            geo = math.exp(sum(math.log(r['speedup']) for r in large_n) / len(large_n))
-            print(f"    N=7168 (large hidden):    geo_mean={geo:.3f}x  "
-                  f"(best={max(r['speedup'] for r in large_n):.2f}x)")
+        # TFLOPS comparison
+        print(f"\n  Average TFLOPS:")
+        avg_sep = sum(r["tflops_separate"] for r in results) / len(results)
+        avg_v1 = sum(r["tflops_v1"] for r in results if r["tflops_v1"] > 0) / max(1, sum(1 for r in results if r["tflops_v1"] > 0))
+        avg_v3 = sum(r["tflops_v3"] for r in results if r["tflops_v3"] > 0) / max(1, sum(1 for r in results if r["tflops_v3"] > 0))
+        print(f"    Separate: {avg_sep:.1f} TFLOPS")
+        print(f"    V1 Fused: {avg_v1:.1f} TFLOPS")
+        print(f"    V3 Dual:  {avg_v3:.1f} TFLOPS")
 
-        # Large K dim (K=7168)
-        large_k = [r for r in results if r['k_dim'] == 7168]
-        if large_k:
-            geo = math.exp(sum(math.log(r['speedup']) for r in large_k) / len(large_k))
-            print(f"    K=7168 (large input):     geo_mean={geo:.3f}x  "
-                  f"(best={max(r['speedup'] for r in large_k):.2f}x)")
+        # Top shapes
+        print(f"\n  Top 5 Shapes for V3 (highest speedup over Separate):")
+        sorted_v3 = sorted(results, key=lambda r: r["speedup_v3"], reverse=True)
+        for i, r in enumerate(sorted_v3[:5]):
+            shape_str = f"{r['tokens_per_rank']}x{r['n_dim']}x{r['k_dim']}"
+            print(f"    {i+1}. {shape_str:<18} V3={r['speedup_v3']:.2f}x  V1={r['speedup_v1']:.2f}x  "
+                  f"(sep={r['time_separate_us']:.0f}us, v3={r['time_v3_us']:.0f}us)")
 
-        # Small M (MoE inference)
-        small_m = [r for r in results if r['tokens_per_rank'] <= 256]
-        if small_m:
-            geo = math.exp(sum(math.log(r['speedup']) for r in small_m) / len(small_m))
-            print(f"    M/rank≤256 (MoE infer):   geo_mean={geo:.3f}x  "
-                  f"(best={max(r['speedup'] for r in small_m):.2f}x)")
-
-        # Large M (long context training)
-        large_m = [r for r in results if r['tokens_per_rank'] >= 2048]
-        if large_m:
-            geo = math.exp(sum(math.log(r['speedup']) for r in large_m) / len(large_m))
-            print(f"    M/rank≥2048 (long ctx):   geo_mean={geo:.3f}x  "
-                  f"(best={max(r['speedup'] for r in large_m):.2f}x)")
-
-        # Compute-bound vs comm-bound
-        print(f"\n  By Compute/Comm Ratio:")
-        compute_heavy = [r for r in results if r['comp_comm_ratio'] > 5.0]
-        comm_heavy = [r for r in results if r['comp_comm_ratio'] <= 2.0]
-        balanced = [r for r in results if 2.0 < r['comp_comm_ratio'] <= 5.0]
-
-        if compute_heavy:
-            geo = math.exp(sum(math.log(r['speedup']) for r in compute_heavy) / len(compute_heavy))
-            print(f"    Compute-heavy (ratio>5):  geo_mean={geo:.3f}x ({len(compute_heavy)} shapes)")
-        if balanced:
-            geo = math.exp(sum(math.log(r['speedup']) for r in balanced) / len(balanced))
-            print(f"    Balanced (2<ratio≤5):     geo_mean={geo:.3f}x ({len(balanced)} shapes)")
-        if comm_heavy:
-            geo = math.exp(sum(math.log(r['speedup']) for r in comm_heavy) / len(comm_heavy))
-            print(f"    Comm-heavy (ratio≤2):     geo_mean={geo:.3f}x ({len(comm_heavy)} shapes)")
-
-        # Best candidates for fusion
-        print(f"\n  Top 5 Shapes for Fusion (highest speedup):")
-        sorted_results = sorted(results, key=lambda r: r['speedup'], reverse=True)
-        for i, r in enumerate(sorted_results[:5]):
-            shape_str = f"{r['tokens_per_rank']}×{r['n_dim']}×{r['k_dim']}"
-            print(f"    {i+1}. {shape_str:<18} {r['speedup']:.2f}x  "
-                  f"(sep={r['time_separate_us']:.0f}μs, fused={r['time_fused_us']:.0f}μs)")
-
-        print(f"\n{'═'*100}\n")
+        print(f"\n{'='*120}\n")
 
     dist.barrier()
     dist.destroy_process_group()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     num_gpus = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     num_iters = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 20
 
