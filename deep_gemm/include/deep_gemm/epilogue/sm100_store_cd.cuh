@@ -41,8 +41,8 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
     // Step 0: 编译期校验
     // =========================================================================
     // TMA store 要求 D 矩阵必须 swizzled，且维度对齐
-    constexpr uint32_t kNumBankGroupBytes = 16;
-    constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
+    constexpr uint32_t kNumBankGroupBytes = 16; 
+    constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t); // 8 
     DG_STATIC_ASSERT(kSwizzleCDMode > 0, "TMA D must be swizzled");
     DG_STATIC_ASSERT(STORE_BLOCK_N % kNumElemsPerBankGroup == 0, "Invalid swizzling");
     DG_STATIC_ASSERT(BLOCK_M % STORE_BLOCK_M == 0, "Invalid block sizes");
@@ -164,7 +164,7 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
             //
             //   8 次迭代 × 8 元素/次 = 64 元素 = STORE_BLOCK_N，lane 间无依赖
             #pragma unroll
-            for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
+            for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) { 
                 // ------ 地址计算 ------
                 // TMEM 地址：基址 + M wave 偏移 + N store 偏移 + element 偏移
                 // TMEM 中数据按 (M, N) 行主序排布，每行 BLOCK_N 个元素
@@ -174,34 +174,57 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
 
                 // SMEM 地址 = warp 偏移 + atom 内 (row, col)，详见上方全景图的 Level 2/3
                 // warp 间不重叠，swizzle 消 bank conflict
-                auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
-                constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
+                // i + lane_idx * 8
+                auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes); 
+                constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8; // True
+                // i / 8 + lane_idx ->  row: 0 ~ 31
                 auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
+                // i -> i ^ (row % 8) -> col: 0 ~ 7
                 auto col = kHasShortcut ? (i) : (bank_group_index % 8);
                 col ^= row % (kSwizzleCDMode / 16);
-                // i=0 时每个 lane 的 (row, col_swizzled) 和 bank 映射 (kSwizzleCDMode=128, BF16):
                 //
-                //     lane  row  col^=row%8  SMEM addr   bank   冲突组
-                //     ────  ───  ──────────  ─────────   ────   ────
-                //      0     0       0            0        0     A
-                //      1     1       1          144        4     B
-                //    ...   ...     ...          ...      ...    ...
-                //      7     7       7         1008       28     H
-                //      8     8       0  ←       1024        0     A  (8%8=0)
-                //      9     9       1         ↙ 1168        4     B
-                //     15    15       7     row%8=0..7       28     H
-                //     16    16       0     8 组循环中       0      A
-                //     ..    ..      ..                     ..     ..
-                //     31    31       7                      28     H
+                // XOR swizzle 原理（一行就懂）：
+                //   col 全相同 → 全挤一个 bank → conflict
+                //   row%8 各不相同 → 每个 lane 有个不同的"签名"
+                //   col ^= row%8 → 用 row 的差异去扰动 col → 相同的 col 被散成不同的 bank
                 //
-                // 无 swizzle: lane 0..31 全部 col=0 → 全部 bank 0 → 32-way ❌
-                // 有 swizzle: 8 个 bank 各 4 条 lane → 4-way ✅
-                // Swizzle: col ^= row%8，将同一列的 32 个 lane 均匀散布到 8 个 bank，
-                // 32-way conflict → 4-way conflict（每 bank 仅 4 个 lane 竞争）
-                // 不加 swizzle：所有 lane 写 128B 对齐地址 → 全部命同一 bank → 32-way ❌
-                // 加 swizzle：  lane0→bank0, lane1→bank1, ... lane7→bank7, lane8→bank0, ...
-                
-
+                //   XOR 保证 {0^c, 1^c, ..., 7^c} 一定是 {0..7} 的排列（每种 c 对应一种洗牌方式）
+                //   8 个 lane 的 row%8 恰好是 0..7 → 8 种排列 → 8 个不同 bank → 0-conflict
+                // 
+                //i=0 时，col 从 0→7，XOR row%8 的结果：
+                // row%8=0: [0][1][2][3][4][5][6][7]    恒等排列
+                // row%8=1: [1][0][3][2][5][4][7][6]    邻位交换
+                // row%8=2: [2][3][0][1][6][7][4][5]    隔位交换
+                // row%8=3: [3][2][1][0][7][6][5][4]    4位翻转
+                // row%8=4: [4][5][6][7][0][1][2][3]    前后半交换
+                // row%8=5: [5][4][7][6][1][0][3][2]
+                // row%8=6: [6][7][4][5][2][3][0][1]
+                // row%8=7: [7][6][5][4][3][2][1][0]    完全逆序
+                // 
+                // st.shared.b128（128bit = 16B）的调度粒度是 quarter-warp（8 lane），
+                // 32 个活跃 lane → 4 次串行 memory transaction，bank conflict 分析按每 quarter-warp 独立计算。
+                //
+                // i=0 时 lane 0..31 的 swizzle 映射（kSwizzleCDMode=128, BF16）：
+                //
+                //     QW   lane  row  col^=row%8   bank
+                //     ──   ────  ───  ──────────   ────
+                //      0     0     0       0          0
+                //      0     1     1       1          4
+                //      0    ...   ...     ...        ...
+                //      0     7     7       7         28     ← QW0: 8 lane 写 8 个不同 bank，0-way ✅
+                //     ──   ────  ───  ──────────   ────
+                //      1     8     8       0          0
+                //      1     9     9       1          4
+                //      1    ...   ...     ...        ...
+                //      1    15    15       7         28     ← QW1: 同上，0-way ✅
+                //     ──   ────  ───  ──────────   ────
+                //      2   16~23  16~23  0~7       0,4,..,28  ← QW2: 0-way ✅
+                //      3   24~31  24~31  0~7       0,4,..,28  ← QW3: 0-way ✅
+                //
+                // 无 swizzle（所有 lane col=0）：每个 QW 内 8 lane 全打 bank 0 → 8-way conflict ❌
+                //                       4 QW × 8 cycle/QW = 32 cycle
+                // 有 swizzle：每个 QW 内 8 lane 各打不同 bank → 0-way conflict ✅
+                //             4 QW × 1 cycle/QW = 4 cycle（快 8 倍）
                 // SMEM 地址 = warp 偏移 + row×bank_bytes + col×bank_bytes
                 auto smem_ptr = smem_base_ptr +                                             // stage 基址
                                 epilogue_warp_idx * 32 * kSwizzleCDMode +                   // warp 偏移（每 warp 独占 32 行 × 128B）

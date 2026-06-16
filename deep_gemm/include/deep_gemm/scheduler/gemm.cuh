@@ -38,7 +38,7 @@ struct Scheduler {
     int current_iter = -1;
 
     // Block configs
-    uint32_t num_blocks;
+    uint32_t num_blocks; 
     uint32_t num_m_blocks;
     uint32_t num_n_blocks;
 

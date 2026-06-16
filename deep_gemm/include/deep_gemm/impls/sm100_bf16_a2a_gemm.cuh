@@ -59,8 +59,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           typename cd_dtype_t>
 __global__ void __launch_bounds__(kNumA2AThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 2)
 sm100_bf16_a2a_gemm_nt_impl(void* d,
-                            const uint32_t shape_m_per_rank,
-                            const uint32_t runtime_m_per_rank,
+                            const uint32_t shape_m_per_rank,    // = max_m_per_rank, 用于 slot 间 stride 计算（buffer 按 max 分配）
+                            const uint32_t runtime_m_per_rank,  // 实际 token 数，用于计算循环边界和 rank 归属
                             const uint32_t shape_n,
                             const uint32_t shape_k,
                             const uint32_t num_slots,
@@ -106,13 +106,14 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
     constexpr uint32_t kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;
     constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols>();
 
-    const uint32_t shape_m = runtime_m_per_rank * kNumRanks;
+    const uint32_t shape_m = runtime_m_per_rank * kNumRanks;  // 实际计算总行数（用 runtime，不碰无效数据）
     const uint32_t sm_idx = blockIdx.x;
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
     const uint32_t rank_idx = sym_buffer.rank_idx;
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
+    // workspace 用 shape_m_per_rank(max) 构造，因为 get_slot_x_ptr 用 max 算 slot 间偏移
     const auto workspace = layout::BF16A2AGemmWorkspace(
         sym_buffer.get_base_ptr(), kNumRanks, shape_m_per_rank, shape_k, num_slots);
 
@@ -208,8 +209,11 @@ sm100_bf16_a2a_gemm_nt_impl(void* d,
         uint32_t block_idx = blockIdx.x, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
+            // 用 runtime_m_per_rank 判断当前 tile 属于哪个 src_rank
             const uint32_t src_rank = global_m / runtime_m_per_rank;
             const uint32_t local_m = global_m - src_rank * runtime_m_per_rank;
+            // 算 slot 内偏移必须用 shape_m_per_rank(max)，因为 buffer 按 max 分配，slot stride = max * K
+            // 如果这里用 runtime，local_m 超过 runtime 时会越界到下一个 slot
             const uint32_t slot_m = src_rank * shape_m_per_rank + local_m;
             // Per-chunk barrier polling: wait until all chunks covering this tile are ready
             const uint32_t chunk_start = local_m / ready_chunk_rows;

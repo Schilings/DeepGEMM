@@ -45,12 +45,15 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     // Configs
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t WAVE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
-    constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M;
+    constexpr uint32_t kNumMWaves = BLOCK_M / WAVE_BLOCK_M; // kNumMWaves = 1 or 2
     constexpr uint32_t kNumTMAStoreStages = 2;
-    constexpr uint32_t kNumUTCCPAlignedElems = 128;
-    DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
+    constexpr uint32_t kNumUTCCPAlignedElems = 128; 
+    DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K"); 
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
 
+    // kGranKA和kGranKB表示A和B的per-block量化维度
+    // 如果 kGranKA=32，那么一个BlockK=128就是4个SF(UE8M0),对应1个UINT4，所以kNumSFAStagesPerLoad=1 每1次k 都要加载 1次 SF
+    // 如果 kGranKA=128，那么一个BlockK=128就是1个SF(UE8M0)，对应0.25个UINT4，所以kNumSFAStagesPerLoad=4 每4次k 加载 1次 SF
     constexpr uint32_t kNumSFAStagesPerLoad = kGranKA == 32 ? 1 : 4;
     constexpr uint32_t kNumSFBStagesPerLoad = kGranKB == 32 ? 1 : 4;
     DG_STATIC_ASSERT(kGranKA == 32 or kGranKA == 128, "Invalid granularity K for A");
@@ -60,6 +63,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
+    // SF加载的步长是4，4个UE8M0对于一个UINT4，所以shape_k//（kGranKA * 4）
     const uint32_t shape_sfa_k = ceil_div(shape_k, kGranKA * 4);
     const uint32_t shape_sfb_k = ceil_div(shape_k, kGranKB * 4);
 
@@ -72,8 +76,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
     // 2-CTA MMA
-    constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
-    constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
+    constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1); //  BLOCK_M
+    constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast); // BLOCK_N/2
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
