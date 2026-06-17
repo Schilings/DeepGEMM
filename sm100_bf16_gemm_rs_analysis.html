@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=yes">
+<title>sm100_bf16_gemm_rs 完整源码逐行解析</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;font-size:14px;line-height:1.7;color:#1a1a2e;background:#f8f9fa;padding:8px}
+h1{font-size:18px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:14px;border-radius:10px;text-align:center;margin-bottom:10px}
+h2{font-size:15px;color:#fff;background:#667eea;padding:8px 12px;border-radius:6px;margin:16px 0 8px}
+h3{font-size:13px;color:#555;margin:10px 0 6px;padding-left:8px;border-left:3px solid #667eea}
+.card{background:#fff;border-radius:8px;padding:10px 12px;margin-bottom:10px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+pre{font-family:'SF Mono','Fira Code',monospace;font-size:11.5px;background:#1e1e2e;color:#cdd6f4;padding:10px;border-radius:6px;overflow-x:auto;white-space:pre;line-height:1.45;margin:6px 0}
+pre .ln{color:#585b70;user-select:none;display:inline-block;width:28px;text-align:right;margin-right:8px}
+pre .kw{color:#89b4fa}pre .num{color:#fab387}pre .cm{color:#6c7086;font-style:italic}
+pre .fn{color:#a6e3a1}pre .type{color:#89dceb}pre .str{color:#f9e2af}pre .dir{color:#cba6f7}
+.hl{background:#fff3cd;padding:1px 4px;border-radius:3px}
+.tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:8px;margin:1px;font-weight:600}
+.tag-load{background:#e3f2fd;color:#1565c0}.tag-mma{background:#e8f5e9;color:#2e7d32}
+.tag-epi{background:#fff3e0;color:#e65100}.tag-rs{background:#fce4ec;color:#c62828}
+.tag-init{background:#f3e5f5;color:#7b1fa2}.tag-sched{background:#e0f7fa;color:#00695c}
+table{width:100%;border-collapse:collapse;font-size:12px;margin:6px 0}
+th,td{border:1px solid #ddd;padding:6px;text-align:left}th{background:#f5f5f5}
+.diag{background:#fafafa;border:1px solid #ddd;border-radius:6px;padding:8px;font-family:'SF Mono',monospace;font-size:10.5px;line-height:1.5;overflow-x:auto;white-space:pre}
+.arrow{color:#667eea;font-weight:bold}
+ul{padding-left:16px}li{margin-bottom:3px}
+.collapse-btn{background:#667eea;color:#fff;border:none;padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin:4px 2px}
+.collapse-btn:active{background:#764ba2}
+.collapsible{max-height:0;overflow:hidden;transition:max-height .3s ease-out}
+.collapsible.open{max-height:99999px}
+.note{background:#fff8e1;border-left:3px solid #ffc107;padding:6px 10px;border-radius:0 4px 4px 0;margin:6px 0;font-size:12px}
+</style>
+</head>
+<body>
+<h1>sm100_bf16_gemm_rs.cuh 完整源码逐行解析</h1>
+
+<!-- ==================== 总览 ==================== -->
+<div class="card">
+<h2>总览：这个 kernel 做什么</h2>
+<p><strong>BF16 GEMM + Reduce-Scatter 融合 kernel</strong>，在 SM100 (Blackwell) 上运行。</p>
+<p>数学操作：<code>C = A × B^T</code>，其中 A∈R^{M,K}，B∈R^{N,K}，C∈R^{M,N}</p>
+<p>Reduce-Scatter：每个 rank 只需最终输出 C 的一部分行（按 M 维度切分），所以 GEMM 的每个 tile 计算完就直接 NVLink 发给目标 rank，RS 线程在另一侧收集累加。</p>
+<div class="diag">                    ┌──────────────┐
+  Rank 0 视角:      │  GEMM 计算    │
+  A[0..M/K], B     │  C = A × B^T  │
+                    └──────┬───────┘
+                           │ Epilogue
+                    ┌──────▼───────┐
+                    │  NVLink 写到  │
+                    │  目标 rank 的 │
+                    │  partial 缓冲 │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │  RS Warps:    │
+                    │  等所有rank的 │
+                    │  ready=1，    │
+                    │  累加 partial │
+                    │  → 写入 y     │
+                    └──────────────┘</div>
+</div>
+
+<!-- ==================== 线程角色 ==================== -->
+<div class="card">
+<h2>线程角色分配</h2>
+<p>CTA 内 <code>kNumRSThreads + 128 + 128</code> 个线程，分 4 组：</p>
+<table>
+<tr><th>Warp 范围</th><th>角色</th><th>标签</th></tr>
+<tr><td>warp 0 ~ kNumRSWarps-1</td><td><strong>RS 收集线程</strong>：轮询 ready flag，累加各 rank 的 partial，写入最终输出 y</td><td><span class="tag tag-rs">RS</span></td></tr>
+<tr><td>warp kGemmWarpBase (=kNumRSWarps)</td><td><strong>TMA Load Warp</strong>：通过 TMA 从全局内存加载 A/B tile 到 smem</td><td><span class="tag tag-load">LOAD</span></td></tr>
+<tr><td>warp kGemmWarpBase+1</td><td><strong>MMA Issue Warp</strong>：执行 UMMA FMA 指令，累加到 TMEM（仅 leader CTA）</td><td><span class="tag tag-mma">MMA</span></td></tr>
+<tr><td>warp kGemmWarpBase+2</td><td><strong>TMEM 分配</strong>：初始化后空闲</td><td><span class="tag tag-init">INIT</span></td></tr>
+<tr><td>warp (RS+128)/32 起，共 128 线程</td><td><strong>Epilogue Warps</strong>：TMEM→smem→NVLink scatter 到远端 partial</td><td><span class="tag tag-epi">EPILOGUE</span></td></tr>
+</table>
+<div class="diag">CTA 线程布局 (以 kNumRSThreads=128 为例, 共 384 线程):
+
+├── warp 0..3   ── <span style="color:#c62828">RS Warps</span> (128 threads) ── 轮询+累加
+├── warp 4     ── <span style="color:#1565c0">TMA Load Warp</span>       ── 加载 A/B 到 smem
+├── warp 5     ── <span style="color:#2e7d32">MMA Issue Warp</span>      ── 执行 FMA (仅 leader CTA)
+├── warp 6     ── <span style="color:#7b1fa2">TMEM Alloc</span>          ── 初始化后空闲
+└── warp 7..10 ── <span style="color:#e65100">Epilogue Warps</span> (128) ── TMEM→smem→NVLink scatter</div>
+</div>
+
+<!-- ==================== 第1段：头文件和模板参数 ==================== -->
+<div class="card">
+<h2>第1段：头文件和模板参数 (L1-34)</h2>
+<button class="collapse-btn" onclick="toggleCode('code1')">展开/收起源码</button>
+<div id="code1" class="collapsible open">
+<pre><span class="ln"> 1</span> <span class="dir">#pragma once</span>
+<span class="ln"> 2</span> <span class="dir">#pragma clang diagnostic push</span>
+<span class="ln"> 3</span> <span class="dir">#pragma clang diagnostic ignored "-Wunknown-attributes"</span>
+<span class="ln"> 4</span>
+<span class="ln"> 5</span> <span class="dir">#include</span> <span class="str">&lt;cutlass/arch/barrier.h&gt;</span>
+<span class="ln"> 6</span>
+<span class="ln"> 7</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/common/epilogue_utils.cuh&gt;</span>
+<span class="ln"> 8</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/common/sm100_utils.cuh&gt;</span>
+<span class="ln"> 9</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/common/utils.cuh&gt;</span>
+<span class="ln">10</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/comm/barrier.cuh&gt;</span>
+<span class="ln">11</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/layout/gemm_rs.cuh&gt;</span>
+<span class="ln">12</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/layout/sym_buffer.cuh&gt;</span>
+<span class="ln">13</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/ptx/ld_st.cuh&gt;</span>
+<span class="ln">14</span>
+<span class="ln">15</span> <span class="kw">namespace</span> deep_gemm {
+<span class="ln">16</span>
+<span class="ln">17</span> <span class="kw">using namespace</span> deep_gemm::sm100;
+<span class="ln">18</span>
+<span class="ln">19</span> <span class="kw">template</span> &lt;<span class="type">uint32_t</span> BLOCK_M, <span class="type">uint32_t</span> BLOCK_N, <span class="type">uint32_t</span> BLOCK_K,  <span class="cm">// GEMM tile 尺寸 128×128×64</span>
+<span class="ln">20</span>           <span class="type">uint32_t</span> kNumStages,                           <span class="cm">// 软件流水线 stage 数</span>
+<span class="ln">21</span>           <span class="type">uint32_t</span> kNumRSThreads,                        <span class="cm">// Reduce-Scatter 收集线程数</span>
+<span class="ln">22</span>           <span class="type">uint32_t</span> kNumNonEpilogueThreads,                <span class="cm">// MMA 非epilogue线程数 (128)</span>
+<span class="ln">23</span>           <span class="type">uint32_t</span> kNumEpilogueThreads,                   <span class="cm">// Epilogue线程数 (128)</span>
+<span class="ln">24</span>           <span class="type">uint32_t</span> kNumSMs, <span class="type">uint32_t</span> kNumRanks,            <span class="cm">// SM数, rank数</span>
+<span class="ln">25</span>           <span class="kw">typename</span> <span class="type">cd_dtype_t</span>&gt;                          <span class="cm">// 输出类型: bfloat16 或 float</span>
+<span class="ln">26</span> __global__ <span class="kw">void</span> __launch_bounds__(kNumRSThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, <span class="num">1</span>)
+<span class="ln">27</span> sm100_bf16_gemm_rs_nt_impl(<span class="kw">void</span>* y,                         <span class="cm">// 最终输出 (reduce-scatter后每个rank的部分)</span>
+<span class="ln">28</span>                            <span class="kw">const</span> <span class="type">uint32_t</span> shape_m_per_rank,   <span class="cm">// 编译期M维度/rank (对齐到BLOCK_M)</span>
+<span class="ln">29</span>                            <span class="kw">const</span> <span class="type">uint32_t</span> runtime_m_per_rank, <span class="cm">// 运行时实际M维度/rank (可能不满一个BLOCK)</span>
+<span class="ln">30</span>                            <span class="kw">const</span> <span class="type">uint32_t</span> shape_n,             <span class="cm">// N维度 (hidden size)</span>
+<span class="ln">31</span>                            <span class="kw">const</span> <span class="type">uint32_t</span> shape_k,             <span class="cm">// K维度</span>
+<span class="ln">32</span>                            <span class="kw">const</span> __grid_constant__ layout::SymBuffer&lt;kNumRanks&gt; sym_buffer, <span class="cm">// NVLink对称内存</span>
+<span class="ln">33</span>                            <span class="kw">const</span> __grid_constant__ cute::TmaDescriptor tensor_map_a,     <span class="cm">// A的TMA描述符</span>
+<span class="ln">34</span>                            <span class="kw">const</span> __grid_constant__ cute::TmaDescriptor tensor_map_b) {    <span class="cm">// B的TMA描述符</span></pre>
+</div>
+</div>
+
+<!-- ==================== 第2段：常量和索引 ==================== -->
+<div class="card">
+<h2>第2段：常量定义和线程索引 (L35-81)</h2>
+<button class="collapse-btn" onclick="toggleCode('code2')">展开/收起源码</button>
+<div id="code2" class="collapsible open">
+<pre><span class="ln">35</span> <span class="dir">#if</span> (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ &gt;= 1000)) or defined(__CLION_IDE__)
+<span class="ln">36</span>     <span class="kw">using</span> <span class="type">Barrier</span> = cutlass::arch::ClusterTransactionBarrier;
+<span class="ln">37</span>     <span class="kw">using</span> <span class="type">Allocator</span> = cute::TMEM::Allocator1Sm;    <span class="cm">// 单CTA用1Sm分配器</span>
+<span class="ln">38</span>     <span class="kw">using</span> <span class="type">ab_dtype_t</span> = cutlass::bfloat16_t;
+<span class="ln">39</span>
+<span class="ln">40</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kSwizzleAMode = <span class="num">128</span>;       <span class="cm">// smem A 的swizzle大小(字节)</span>
+<span class="ln">41</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kSwizzleBMode = <span class="num">128</span>;
+<span class="ln">42</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kSwizzleCDMode = <span class="num">128</span>;
+<span class="ln">43</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> LAYOUT_AD_M = <span class="num">128</span>;         <span class="cm">// UMMA 描述符的 M 维度</span>
+<span class="ln">44</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> WAVE_BLOCK_M = cute::min&lt;uint32_t&gt;(BLOCK_M, LAYOUT_AD_M); <span class="cm">// =128</span>
+<span class="ln">45</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumMWaves = BLOCK_M / WAVE_BLOCK_M;  <span class="cm">// =1</span>
+<span class="ln">46</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumTMAStoreStages = <span class="num">2</span>;      <span class="cm">// CD双缓冲</span>
+<span class="ln">47</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumRSWarps = kNumRSThreads / <span class="num">32</span>;
+<span class="ln">48</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kGemmWarpBase = kNumRSWarps;    <span class="cm">// GEMM warp起始编号</span>
+<span class="ln">49</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumThreads = kNumRSThreads + kNumNonEpilogueThreads + kNumEpilogueThreads;
+<span class="ln">50</span>     DG_STATIC_ASSERT(BLOCK_M == <span class="num">128</span> and BLOCK_N == <span class="num">128</span> and BLOCK_K == <span class="num">64</span>, ...);
+<span class="ln">51</span>     DG_STATIC_ASSERT(kNumRSThreads % <span class="num">32</span> == <span class="num">0</span> and kNumRSThreads &gt;= <span class="num">128</span>, ...);
+<span class="ln">52</span>     DG_STATIC_ASSERT(kNumNonEpilogueThreads == <span class="num">128</span> and kNumEpilogueThreads == <span class="num">128</span>, ...);
+<span class="ln">53</span>
+<span class="ln">54</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> UMMA_M = LAYOUT_AD_M;        <span class="cm">// =128</span>
+<span class="ln">55</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> UMMA_N = BLOCK_N;              <span class="cm">// =128</span>
+<span class="ln">56</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> UMMA_K = <span class="num">16</span>;                   <span class="cm">// 每条UMMA指令的K步长</span>
+<span class="ln">57</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> LOAD_BLOCK_M = BLOCK_M;         <span class="cm">// TMA加载的M block</span>
+<span class="ln">58</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> LOAD_BLOCK_N = BLOCK_N;         <span class="cm">// TMA加载的N block</span>
+<span class="ln">59</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> STORE_BLOCK_M = cute::min&lt;uint32_t&gt;(BLOCK_M, LAYOUT_AD_M); <span class="cm">// =128</span>
+<span class="ln">60</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> STORE_BLOCK_N = kSwizzleCDMode / <span class="kw">sizeof</span>(cd_dtype_t);  <span class="cm">// BF16:64, FP32:32</span>
+<span class="ln">61</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumUMMAStoreThreads = STORE_BLOCK_M; <span class="cm">// =128, epilogue存储线程数</span>
+<span class="ln">62</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * <span class="kw">sizeof</span>(cd_dtype_t);
+<span class="ln">63</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
+<span class="ln">64</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * <span class="kw">sizeof</span>(ab_dtype_t);
+<span class="ln">65</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * <span class="kw">sizeof</span>(ab_dtype_t);
+<span class="ln">66</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumEpilogueStages = <span class="num">2</span>;       <span class="cm">// TMEM双缓冲</span>
+<span class="ln">67</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumAccumTmemCols = kNumEpilogueStages * UMMA_N;  <span class="cm">// =256</span>
+<span class="ln">68</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumTmemCols = get_num_aligned_tmem_cols&lt;kNumAccumTmemCols&gt;();
+<span class="ln">69</span>
+<span class="ln">70</span>     <span class="kw">const</span> <span class="type">uint32_t</span> shape_m = runtime_m_per_rank * kNumRanks;  <span class="cm">// 全局M (所有rank合计)</span>
+<span class="ln">71</span>     <span class="kw">const</span> <span class="type">uint32_t</span> num_m_blocks_per_rank = ceil_div(runtime_m_per_rank, BLOCK_M);
+<span class="ln">72</span>     <span class="kw">const</span> <span class="type">uint32_t</span> num_m_blocks = num_m_blocks_per_rank * kNumRanks;  <span class="cm">// 全局M block数</span>
+<span class="ln">73</span>     <span class="kw">const</span> <span class="type">uint32_t</span> num_n_blocks = ceil_div(shape_n, BLOCK_N);
+<span class="ln">74</span>     <span class="kw">const</span> <span class="type">bool</span> is_leader_cta = cute::block_rank_in_cluster() == <span class="num">0</span>;
+<span class="ln">75</span>     <span class="kw">const</span> <span class="type">uint32_t</span> sm_idx = blockIdx.x;
+<span class="ln">76</span>     <span class="kw">const</span> <span class="type">uint32_t</span> thread_idx = threadIdx.x;
+<span class="ln">77</span>     <span class="kw">const</span> <span class="type">uint32_t</span> warp_idx = cutlass::canonical_warp_idx_sync();
+<span class="ln">78</span>     <span class="kw">const</span> <span class="type">uint32_t</span> lane_idx = ptx::get_lane_idx();
+<span class="ln">79</span>     <span class="kw">const</span> <span class="type">uint32_t</span> rank_idx = sym_buffer.rank_idx;
+<span class="ln">80</span>     <span class="kw">const auto</span> workspace = layout::GemmRSWorkspace(
+<span class="ln">81</span>         sym_buffer.get_base_ptr(), kNumRanks, shape_m_per_rank, shape_n, <span class="kw">sizeof</span>(cd_dtype_t), BLOCK_M, BLOCK_N);</pre>
+</div>
+<div class="note">
+<strong>关键变量：</strong><br>
+<code>shape_m = runtime_m_per_rank × kNumRanks</code> — 全局M维度是所有rank的M之和<br>
+<code>num_m_blocks</code> — 全局M方向共有多少个BLOCK_M大小的块<br>
+<code>workspace</code> — 管理 partial 缓冲区和 ready flags 的内存布局
+</div>
+</div>
+
+<!-- ==================== 第3段：TMA预取和smem布局 ==================== -->
+<div class="card">
+<h2>第3段：TMA预取 + Shared Memory 布局 (L83-103)</h2>
+<button class="collapse-btn" onclick="toggleCode('code3')">展开/收起源码</button>
+<div id="code3" class="collapsible open">
+<pre><span class="ln">83</span>     <span class="kw">if</span> (warp_idx == kGemmWarpBase and cute::elect_one_sync()) {
+<span class="ln">84</span>         cute::prefetch_tma_descriptor(&amp;tensor_map_a);
+<span class="ln">85</span>         cute::prefetch_tma_descriptor(&amp;tensor_map_b);
+<span class="ln">86</span>     }
+<span class="ln">87</span>
+<span class="ln">88</span>     <span class="kw">extern</span> __shared__ __align__(<span class="num">1024</span>) <span class="type">uint8_t</span> smem_buffer[];
+<span class="ln">89</span>     <span class="kw">auto</span> smem_cd = utils::PatternVisitor([&](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) {
+<span class="ln">90</span>         <span class="kw">return</span> <span class="kw">reinterpret_cast</span>&lt;cd_dtype_t*&gt;(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
+<span class="ln">91</span>     });
+<span class="ln">92</span>     <span class="kw">auto</span> smem_a = utils::PatternVisitor([&](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) {
+<span class="ln">93</span>         <span class="kw">return</span> <span class="kw">reinterpret_cast</span>&lt;ab_dtype_t*&gt;(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+<span class="ln">94</span>     });
+<span class="ln">95</span>     <span class="kw">auto</span> smem_b = utils::PatternVisitor([&](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) {
+<span class="ln">96</span>         <span class="kw">return</span> <span class="kw">reinterpret_cast</span>&lt;ab_dtype_t*&gt;(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+<span class="ln">97</span>     });
+<span class="ln">98</span>     <span class="kw">auto</span> barrier_start_ptr = <span class="kw">reinterpret_cast</span>&lt;Barrier*&gt;(
+<span class="ln">99</span>         smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
+<span class="ln">100</span>     <span class="kw">auto</span> full_barriers = utils::PatternVisitor([=](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) { <span class="kw">return</span> barrier_start_ptr + i; });
+<span class="ln">101</span>     <span class="kw">auto</span> empty_barriers = utils::PatternVisitor([=](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) { <span class="kw">return</span> barrier_start_ptr + kNumStages + i; });
+<span class="ln">102</span>     <span class="kw">auto</span> tmem_full_barriers = utils::PatternVisitor([=](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) { <span class="kw">return</span> barrier_start_ptr + kNumStages * <span class="num">2</span> + i; });
+<span class="ln">103</span>     <span class="kw">auto</span> tmem_empty_barriers = utils::PatternVisitor([=](<span class="kw">const</span> <span class="type">uint32_t</span>&amp; i) { <span class="kw">return</span> barrier_start_ptr + kNumStages * <span class="num">2</span> + kNumEpilogueStages + i; });</pre>
+</div>
+<div class="diag">smem 布局 (从低地址到高地址):
+
+┌──────────────────────────────┐
+│ smem_cd[0]                    │ ← CD双缓冲 stage 0 (SMEM_CD_SIZE_PER_STAGE)
+├──────────────────────────────┤
+│ smem_cd[1]                    │ ← CD双缓冲 stage 1
+├──────────────────────────────┤
+│ smem_a[0]  ┐                  │ ← A stage 0
+│ smem_a[1]  ├ kNumStages 个    │ ← A stage 1
+│ ...        ┘                  │ ← ...
+├──────────────────────────────┤
+│ smem_b[0]  ┐                  │ ← B stage 0
+│ smem_b[1]  ├ kNumStages 个    │ ← B stage 1
+│ ...        ┘                  │
+├──────────────────────────────┤
+│ full_barriers[0..N-1]         │ ← TMA加载完成 → MMA可消费
+│ empty_barriers[0..N-1]       │ ← MMA消费完成 → TMA可覆盖
+│ tmem_full_barriers[0..1]      │ ← MMA累加完成 → Epilogue可读TMEM
+│ tmem_empty_barriers[0..1]     │ ← Epilogue读完TMEM → MMA可覆盖
+│ tmem_ptr_in_smem              │ ← TMEM分配信息 (2个uint32_t)
+└──────────────────────────────┘</div>
+</div>
+
+<!-- ==================== 第4段：初始化 ==================== -->
+<div class="card">
+<h2>第4段：Barrier/TMEM 初始化 (L105-120)</h2>
+<button class="collapse-btn" onclick="toggleCode('code4')">展开/收起源码</button>
+<div id="code4" class="collapsible open">
+<pre><span class="ln">105</span>     <span class="kw">if</span> (warp_idx == kGemmWarpBase + <span class="num">1</span> and cute::elect_one_sync()) {    <span class="cm">// MMA warp</span>
+<span class="ln">106</span>         <span class="dir">#pragma unroll</span>
+<span class="ln">107</span>         <span class="kw">for</span> (<span class="type">uint32_t</span> i = <span class="num">0</span>; i &lt; kNumStages; ++ i) {
+<span class="ln">108</span>             full_barriers[i]-&gt;init(<span class="num">1</span>);       <span class="cm">// 1个生产者(TMA) arrive后释放</span>
+<span class="ln">109</span>             empty_barriers[i]-&gt;init(<span class="num">1</span>);      <span class="cm">// 1个消费者(MMA) arrive后释放</span>
+<span class="ln">110</span>         }
+<span class="ln">111</span>         <span class="dir">#pragma unroll</span>
+<span class="ln">112</span>         <span class="kw">for</span> (<span class="type">uint32_t</span> i = <span class="num">0</span>; i &lt; kNumEpilogueStages; ++ i) {
+<span class="ln">113</span>             tmem_full_barriers[i]-&gt;init(<span class="num">1</span>);     <span class="cm">// MMA完成 → 1个arrive释放</span>
+<span class="ln">114</span>             tmem_empty_barriers[i]-&gt;init(kNumUMMAStoreThreads); <span class="cm">// 128个epilogue线程 arrive后释放</span>
+<span class="ln">115</span>         }
+<span class="ln">116</span>         cutlass::arch::fence_barrier_init();
+<span class="ln">117</span>     } <span class="kw">else if</span> (warp_idx == kGemmWarpBase + <span class="num">2</span>) {  <span class="cm">// TMEM分配warp</span>
+<span class="ln">118</span>         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
+<span class="ln">119</span>     }
+<span class="ln">120</span>     __syncthreads();   <span class="cm">// ← 全CTA同步, 确保初始化完成</span></pre>
+</div>
+<div class="note">
+<strong>Barrier init 数量：</strong><br>
+<code>full_barriers</code>/<code>empty_barriers</code>: init(1) = 1个线程arrive即释放<br>
+<code>tmem_empty_barriers</code>: init(128) = 128个epilogue线程都arrive后才释放（因为128线程并行读TMEM）
+</div>
+</div>
+
+<!-- ==================== 第5段：Ready清零 + NVLink barrier ==================== -->
+<div class="card">
+<h2>第5段：Ready Flag 清零 + NVLink 同步 (L122-130)</h2>
+<button class="collapse-btn" onclick="toggleCode('code5')">展开/收起源码</button>
+<div id="code5" class="collapsible open">
+<pre><span class="ln">122</span>     <span class="kw">for</span> (<span class="type">uint32_t</span> i = sm_idx * kNumThreads + thread_idx;
+<span class="ln">123</span>          i &lt; kNumRanks * workspace.get_num_m_blocks_per_rank() * workspace.get_num_n_blocks();
+<span class="ln">124</span>          i += kNumSMs * kNumThreads) {
+<span class="ln">125</span>         <span class="kw">auto</span>* ready_base = workspace.get_ready_ptr();
+<span class="ln">126</span>         ready_base[i] = <span class="num">0</span>;    <span class="cm">// 清零所有ready flag</span>
+<span class="ln">127</span>     }
+<span class="ln">128</span>     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kAfterReadyCleanBarrierTag = <span class="num">41</span>;
+<span class="ln">129</span>     comm::nvlink_barrier&lt;kNumRanks, kNumSMs, kNumThreads, <span class="num">0</span>, kAfterReadyCleanBarrierTag&gt;(
+<span class="ln">130</span>         workspace, sym_buffer, sm_idx, thread_idx, []() { __syncthreads(); }, <span class="kw">true</span>, <span class="kw">true</span>);</pre>
+</div>
+<div class="note">
+<strong>为什么需要 NVLink barrier：</strong>各rank的 ready flags 可能在不同rank的内存上，必须确保所有rank都清零完毕后，才能开始计算。否则某个rank可能读到残留的旧 ready=1，误以为 partial 数据已就绪。
+</div>
+</div>
+
+<!-- ==================== 第6段：块调度 ==================== -->
+<div class="card">
+<h2>第6段：块调度逻辑 get_next_block (L132-151) <span class="tag tag-sched">SCHED</span></h2>
+<button class="collapse-btn" onclick="toggleCode('code6')">展开/收起源码</button>
+<div id="code6" class="collapsible open">
+<pre><span class="ln">132</span>     <span class="type">uint32_t</span> stage_idx = <span class="num">0</span>, phase = <span class="num">0</span>;
+<span class="ln">133</span>     <span class="kw">auto</span> advance_pipeline = [&amp;](<span class="type">uint32_t</span>&amp; k_block_idx) {
+<span class="ln">134</span>         ++ k_block_idx;
+<span class="ln">135</span>         stage_idx = stage_idx == kNumStages - <span class="num">1</span> ? <span class="num">0</span> : stage_idx + <span class="num">1</span>;
+<span class="ln">136</span>         phase ^= stage_idx == <span class="num">0</span>;
+<span class="ln">137</span>     };
+<span class="ln">138</span>     <span class="kw">auto</span> get_next_block = [&amp;](<span class="type">uint32_t</span>&amp; block_idx, <span class="type">uint32_t</span>&amp; m_block_idx,
+<span class="ln">139</span>                                <span class="type">uint32_t</span>&amp; n_block_idx, <span class="type">uint32_t</span>&amp; iter_idx) {
+<span class="ln">140</span>         <span class="kw">if</span> (block_idx &gt;= num_m_blocks * num_n_blocks)
+<span class="ln">141</span>             <span class="kw">return false</span>;
+<span class="ln">142</span>         <span class="kw">const</span> <span class="type">uint32_t</span> m_rank_wave = block_idx / (num_m_blocks_per_rank * num_n_blocks);
+<span class="ln">143</span>         <span class="kw">const</span> <span class="type">uint32_t</span> rem = block_idx - m_rank_wave * num_m_blocks_per_rank * num_n_blocks;
+<span class="ln">144</span>         <span class="kw">const</span> <span class="type">uint32_t</span> local_m_block_idx = rem / num_n_blocks;
+<span class="ln">145</span>         n_block_idx = rem - local_m_block_idx * num_n_blocks;
+<span class="ln">146</span>         <span class="kw">const</span> <span class="type">uint32_t</span> dst_rank = (m_rank_wave + <span class="num">1</span> &lt; kNumRanks) ?
+<span class="ln">147</span>             (rank_idx + m_rank_wave + <span class="num">1</span>) % kNumRanks : rank_idx;
+<span class="ln">148</span>         m_block_idx = dst_rank * num_m_blocks_per_rank + local_m_block_idx;
+<span class="ln">149</span>         block_idx += kNumSMs;
+<span class="ln">150</span>         ++ iter_idx;
+<span class="ln">151</span>         <span class="kw">return true</span>;</pre>
+</div>
+<h3>调度算法详解</h3>
+<p><code>block_idx</code> 是全局递增的块号，stride=kNumSMs。每次从 block_idx 反推出：</p>
+<ul>
+  <li><code>m_rank_wave</code>：第几轮"遍历所有rank"（0,1,2...）</li>
+  <li><code>local_m_block_idx</code> + <code>n_block_idx</code>：块内坐标</li>
+  <li><code>dst_rank</code>：这个块的计算结果应该发给哪个 rank</li>
+</ul>
+<div class="diag">假设 kNumRanks=4, num_m_blocks_per_rank=2, num_n_blocks=3:
+
+block_idx=0:  wave=0, local_m=0, n=0 → dst_rank=(0+0+1)%4=1
+block_idx=1:  wave=0, local_m=0, n=1 → dst_rank=1
+block_idx=2:  wave=0, local_m=0, n=2 → dst_rank=1
+block_idx=3:  wave=0, local_m=1, n=0 → dst_rank=1
+block_idx=4:  wave=0, local_m=1, n=1 → dst_rank=1
+block_idx=5:  wave=0, local_m=1, n=2 → dst_rank=1
+block_idx=6:  wave=1, local_m=0, n=0 → dst_rank=(0+1+1)%4=2
+...
+block_idx=12: wave=2, local_m=0, n=0 → dst_rank=(0+2+1)%4=3
+...
+block_idx=18: wave=3, local_m=0, n=0 → dst_rank=(0+3+1)%4=0 (自己!)
+</div>
+<div class="note">
+<strong>设计精髓：</strong>每个CTA计算的tile，其M坐标属于dst_rank，所以计算完的结果刚好是dst_rank需要的partial数据。Epilogue直接NVLink发过去，不需要额外的数据搬运。
+</div>
+</div>
+
+<!-- ==================== 第7段：TMA Load Warp ==================== -->
+<div class="card">
+<h2>第7段：TMA Load Warp (L153-168) <span class="tag tag-load">LOAD</span></h2>
+<button class="collapse-btn" onclick="toggleCode('code7')">展开/收起源码</button>
+<div id="code7" class="collapsible open">
+<pre><span class="ln">153</span>     <span class="kw">if</span> (warp_idx == kGemmWarpBase and cute::elect_one_sync()) {   <span class="cm">// 仅1个线程执行TMA</span>
+<span class="ln">154</span>         <span class="type">uint32_t</span> block_idx = blockIdx.x, iter_idx = <span class="num">0</span>, m_block_idx, n_block_idx;
+<span class="ln">155</span>         <span class="kw">while</span> (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+<span class="ln">156</span>             <span class="kw">const</span> <span class="type">uint32_t</span> global_m = m_block_idx * BLOCK_M;
+<span class="ln">157</span>             <span class="kw">const</span> <span class="type">uint32_t</span> n_idx = n_block_idx * BLOCK_N;
+<span class="ln">158</span>             <span class="kw">const</span> <span class="type">uint32_t</span> num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+<span class="ln">159</span>             <span class="kw">for</span> (<span class="type">uint32_t</span> k_block_idx = <span class="num">0</span>; k_block_idx &lt; num_total_k_blocks; advance_pipeline(k_block_idx)) {
+<span class="ln">160</span>                 empty_barriers[stage_idx]-&gt;wait(phase ^ <span class="num">1</span>);   <span class="cm">// 等MMA消费完 → smem可覆盖</span>
+<span class="ln">161</span>                 <span class="kw">const</span> <span class="type">uint32_t</span> k_idx = k_block_idx * BLOCK_K;
+<span class="ln">162</span>                 tma::copy&lt;BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t&gt;(   <span class="cm">// A: K-major, inner=K</span>
+<span class="ln">163</span>                     &amp;tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, global_m, <span class="num">1</span>);
+<span class="ln">164</span>                 tma::copy&lt;BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t&gt;(   <span class="cm">// B: K-major, inner=K</span>
+<span class="ln">165</span>                     &amp;tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, <span class="num">1</span>);
+<span class="ln">166</span>                 full_barriers[stage_idx]-&gt;arrive_and_expect_tx(   <span class="cm">// 通知MMA: 数据已就绪</span>
+<span class="ln">167</span>                     SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+<span class="ln">168</span>             }
+<span class="ln">169</span>         }</pre>
+</div>
+<div class="diag">TMA Load 流水线 (kNumStages=3):
+
+stage:  0     1     2     0     1     2     ...
+K0:    [TMA]  .     .    [MMA]  .     .     
+K1:     .    [TMA]  .     .    [MMA]  .     
+K2:     .     .    [TMA]  .     .    [MMA]  
+K3:    [TMA]  .     .    [MMA]  .     .     ← stage 0 复用
+
+       ↑ empty_barrier.wait() 确保 MMA 已消费完
+       ↑ full_barrier.arrive()   通知 MMA 可以消费</div>
+</div>
+
+<!-- ==================== 第8段：MMA Issue Warp ==================== -->
+<div class="card">
+<h2>第8段：MMA Issue Warp (L169-207) <span class="tag tag-mma">MMA</span></h2>
+<button class="collapse-btn" onclick="toggleCode('code8')">展开/收起源码</button>
+<div id="code8" class="collapsible open">
+<pre><span class="ln">169</span>     } <span class="kw">else if</span> (warp_idx == kGemmWarpBase + <span class="num">1</span> and is_leader_cta) {  <span class="cm">// 仅leader CTA的MMA warp</span>
+<span class="ln">170</span>         <span class="kw">auto</span> instr_desc = cute::UMMA::make_instr_desc&lt;ab_dtype_t, ab_dtype_t, <span class="type">float</span>,
+<span class="ln">171</span>                                                        UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K&gt;();
+<span class="ln">172</span>         <span class="kw">auto</span> a_desc = make_umma_desc&lt;cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode&gt;(smem_a[<span class="num">0</span>], <span class="num">0</span>, <span class="num">0</span>);
+<span class="ln">173</span>         <span class="kw">auto</span> b_desc = make_umma_desc&lt;cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode&gt;(smem_b[<span class="num">0</span>], <span class="num">0</span>, <span class="num">0</span>);
+<span class="ln">174</span>         <span class="type">uint32_t</span> a_desc_lo = lane_idx &lt; kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / <span class="num">16</span> : <span class="num">0u</span>;
+<span class="ln">175</span>         <span class="type">uint32_t</span> b_desc_lo = lane_idx &lt; kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / <span class="num">16</span> : <span class="num">0u</span>;
+<span class="ln">176</span>         <span class="type">uint32_t</span> block_idx = blockIdx.x, iter_idx = <span class="num">0</span>, m_block_idx, n_block_idx;
+<span class="ln">177</span>         <span class="kw">while</span> (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+<span class="ln">178</span>             <span class="kw">auto</span> accum_stage_idx = (iter_idx - <span class="num">1</span>) % kNumEpilogueStages;       <span class="cm">// TMEM双缓冲stage</span>
+<span class="ln">179</span>             <span class="kw">auto</span> accum_phase_idx = ((iter_idx - <span class="num">1</span>) / kNumEpilogueStages) &amp; <span class="num">1</span>; <span class="cm">// phase翻转</span>
+<span class="ln">180</span>             tmem_empty_barriers[accum_stage_idx]-&gt;wait(accum_phase_idx ^ <span class="num">1</span>); <span class="cm">// 等epilogue读完TMEM</span>
+<span class="ln">181</span>             ptx::tcgen05_after_thread_sync();
+<span class="ln">182</span>             <span class="kw">auto</span> empty_barrier_arrive = [&amp;](<span class="kw">const bool</span>&amp; do_tmem_full_arrive) {
+<span class="ln">183</span>                 cutlass::arch::umma_arrive(<span class="kw">reinterpret_cast</span>&lt;<span class="type">uint64_t</span>*&gt;(empty_barriers[stage_idx]));
+<span class="ln">184</span>                 <span class="kw">if</span> (do_tmem_full_arrive)    <span class="cm">// 最后一个K-block时</span>
+<span class="ln">185</span>                     cutlass::arch::umma_arrive(<span class="kw">reinterpret_cast</span>&lt;<span class="type">uint64_t</span>*&gt;(tmem_full_barriers[accum_stage_idx]));
+<span class="ln">186</span>                 __syncwarp();
+<span class="ln">187</span>             };
+<span class="ln">188</span>             <span class="kw">const</span> <span class="type">uint32_t</span> num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+<span class="ln">189</span>             <span class="kw">for</span> (<span class="type">uint32_t</span> k_block_idx = <span class="num">0</span>; k_block_idx &lt; num_total_k_blocks; advance_pipeline(k_block_idx)) {
+<span class="ln">190</span>                 full_barriers[stage_idx]-&gt;wait(phase);        <span class="cm">// 等TMA加载完</span>
+<span class="ln">191</span>                 ptx::tcgen05_after_thread_sync();
+<span class="ln">192</span>                 <span class="kw">using</span> <span class="type">mma_t</span> = ptx::SM100_MMA_F16BF16_SS;
+<span class="ln">193</span>                 <span class="kw">const auto</span> runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
+<span class="ln">194</span>                 <span class="kw">const auto</span> a_desc_base_lo = __shfl_sync(<span class="num">0xffffffff</span>, a_desc_lo, <span class="kw">static_cast</span>&lt;<span class="type">int</span>&gt;(stage_idx));
+<span class="ln">195</span>                 <span class="kw">const auto</span> b_desc_base_lo = __shfl_sync(<span class="num">0xffffffff</span>, b_desc_lo, <span class="kw">static_cast</span>&lt;<span class="type">int</span>&gt;(stage_idx));
+<span class="ln">196</span>                 <span class="kw">if</span> (cute::elect_one_sync()) {
+<span class="ln">197</span>                     <span class="dir">#pragma unroll</span>
+<span class="ln">198</span>                     <span class="kw">for</span> (<span class="type">uint32_t</span> k = <span class="num">0</span>; k &lt; BLOCK_K / UMMA_K; ++ k) {   <span class="cm">// 64/16=4条UMMA</span>
+<span class="ln">199</span>                         a_desc.lo = advance_umma_desc_lo&lt;...&gt;(a_desc_base_lo, <span class="num">0</span>, k * UMMA_K);
+<span class="ln">200</span>                         b_desc.lo = advance_umma_desc_lo&lt;...&gt;(b_desc_base_lo, <span class="num">0</span>, k * UMMA_K);
+<span class="ln">201</span>                         mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
+<span class="ln">202</span>                                    k_block_idx &gt; <span class="num">0</span> or k &gt; <span class="num">0</span>, runtime_instr_desc);  <span class="cm">// 累加到TMEM</span>
+<span class="ln">203</span>                     }
+<span class="ln">204</span>                 }
+<span class="ln">205</span>                 empty_barrier_arrive(k_block_idx == num_total_k_blocks - <span class="num">1</span>); <span class="cm">// 最后K:通知epilogue</span>
+<span class="ln">206</span>             }
+<span class="ln">207</span>         }</pre>
+</div>
+<div class="note">
+<strong>关键设计：</strong><br>
+① <code>a_desc_lo/b_desc_lo</code>: 每个 lane 预计算一个 stage 的 smem descriptor 偏移，通过 <code>__shfl_sync</code> 按需取出当前 stage 的描述符<br>
+② <code>accum_stage_idx</code>: TMEM 双缓冲索引，iter_idx=0 时写 stage 0，iter_idx=1 时写 stage 1，交替<br>
+③ <code>do_tmem_full_arrive</code>: 仅在最后一个 K-block 时触发，通知 Epilogue "整个 tile 的 MMA 计算完毕"
+</div>
+</div>
+
+<!-- ==================== 第9段：Epilogue Warps ==================== -->
+<div class="card">
+<h2>第9段：Epilogue Warps — TMEM→smem→NVLink Scatter (L208-294) <span class="tag tag-epi">EPILOGUE</span></h2>
+<button class="collapse-btn" onclick="toggleCode('code9')">展开/收起源码</button>
+<div id="code9" class="collapsible open">
+<pre><span class="ln">208</span>     } <span class="kw">else if</span> (warp_idx &gt;= (kNumRSThreads + kNumNonEpilogueThreads) / <span class="num">32</span> and
+<span class="ln">209</span>                warp_idx &lt; (kNumRSThreads + kNumNonEpilogueThreads + kNumUMMAStoreThreads) / <span class="num">32</span>) {
+<span class="ln">210</span>         <span class="kw">const auto</span> epilogue_warp_idx = warp_idx - (kNumRSThreads + kNumNonEpilogueThreads) / <span class="num">32</span>;
+<span class="ln">211</span>         <span class="kw">const</span> <span class="type">uint32_t</span> epilogue_thread_idx = epilogue_warp_idx * <span class="num">32</span> + lane_idx;
+<span class="ln">212</span>         <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumBankGroupBytes = <span class="num">16</span>;
+<span class="ln">213</span>         <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumElemsPerBankGroup = kNumBankGroupBytes / <span class="kw">sizeof</span>(cd_dtype_t);
+<span class="ln">214</span>         <span class="type">uint32_t</span> tma_stage_idx = <span class="num">0</span>;
+<span class="ln">215</span>         <span class="kw">auto</span> advance_store_pipeline = [&amp;]() { tma_stage_idx = (tma_stage_idx + <span class="num">1</span>) % kNumTMAStoreStages; };
+<span class="ln">216</span>         <span class="type">uint32_t</span> block_idx = blockIdx.x, iter_idx = <span class="num">0</span>, m_block_idx, n_block_idx;
+<span class="ln">217</span>         <span class="kw">while</span> (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+<span class="ln">218</span>             <span class="kw">auto</span> accum_stage_idx = (iter_idx - <span class="num">1</span>) % kNumEpilogueStages;
+<span class="ln">219</span>             <span class="kw">auto</span> accum_phase_idx = ((iter_idx - <span class="num">1</span>) / kNumEpilogueStages) &amp; <span class="num">1</span>;
+<span class="ln">220</span>             tmem_full_barriers[accum_stage_idx]-&gt;wait(accum_phase_idx);  <span class="cm">// 等MMA算完</span>
+<span class="ln">221</span>             ptx::tcgen05_after_thread_sync();
+<span class="ln">222</span>             <span class="kw">const</span> <span class="type">uint32_t</span> dst_rank = m_block_idx / num_m_blocks_per_rank;    <span class="cm">// 目标rank</span>
+<span class="ln">223</span>             <span class="kw">const</span> <span class="type">uint32_t</span> local_m_block_idx = m_block_idx - dst_rank * num_m_blocks_per_rank;
+<span class="ln">224</span>             <span class="kw">const</span> <span class="type">uint32_t</span> local_m = local_m_block_idx * BLOCK_M;
+<span class="ln">225</span>             <span class="dir">#pragma unroll</span>
+<span class="ln">226</span>             <span class="kw">for</span> (<span class="type">uint32_t</span> w = <span class="num">0</span>; w &lt; kNumMWaves; ++ w) {            <span class="cm">// kNumMWaves=1</span>
+<span class="ln">227</span>                 <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumStores = BLOCK_N / STORE_BLOCK_N; <span class="cm">// 按STORE_BLOCK_N切N</span>
+<span class="ln">228</span>                 <span class="dir">#pragma unroll</span>
+<span class="ln">229</span>                 <span class="kw">for</span> (<span class="type">uint32_t</span> s = <span class="num">0</span>; s &lt; kNumStores; ++ s, advance_store_pipeline()) {
+<span class="ln">230</span>                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, <span class="num">0</span>); <span class="cm">// 128线程同步</span>
+<span class="ln">231</span>                     <span class="kw">const</span> <span class="type">uint32_t</span> n_idx = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
+<span class="ln">232</span>                     <span class="dir">#pragma unroll</span>
+<span class="ln">233</span>                     <span class="kw">for</span> (<span class="type">uint32_t</span> i = <span class="num">0</span>; i &lt; STORE_BLOCK_N / kNumElemsPerBankGroup; ++ i) {
+<span class="ln">234</span>                         <span class="kw">auto</span> bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
+<span class="ln">235</span>                         <span class="kw">constexpr bool</span> kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == <span class="num">8</span>;
+<span class="ln">236</span>                         <span class="kw">auto</span> row = kHasShortcut ? (i / <span class="num">8</span> + lane_idx) : (bank_group_index / <span class="num">8</span>);
+<span class="ln">237</span>                         <span class="kw">auto</span> col = kHasShortcut ? (i) : (bank_group_index % <span class="num">8</span>);
+<span class="ln">238</span>                         col ^= row % (kSwizzleCDMode / <span class="num">16</span>);              <span class="cm">// swizzle解交织</span>
+<span class="ln">239</span>                         <span class="type">uint32_t</span> tmem_addr = accum_stage_idx * UMMA_N + s * STORE_BLOCK_N
+<span class="ln">240</span>                                                + i * kNumElemsPerBankGroup;
+<span class="ln">241</span>                         <span class="kw">auto</span> smem_ptr = <span class="kw">reinterpret_cast</span>&lt;<span class="type">uint8_t</span>*&gt;(smem_cd[tma_stage_idx]) +
+<span class="ln">242</span>                                         epilogue_warp_idx * <span class="num">32</span> * kSwizzleCDMode +
+<span class="ln">243</span>                                         row * (kNumBankGroupBytes * <span class="num">8</span>) + col * kNumBankGroupBytes;
+<span class="ln">244</span>                         <span class="type">uint32_t</span> values[kNumElemsPerBankGroup];
+<span class="ln">245</span>                         <span class="kw">if constexpr</span> (cute::is_same_v&lt;cd_dtype_t, <span class="type">float</span>&gt;) {
+<span class="ln">246</span>                             cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr, values[<span class="num">0</span>..<span class="num">3</span>]);
+<span class="ln">247</span>                             cutlass::arch::fence_view_async_tmem_load();
+<span class="ln">248</span>                             ptx::st_shared(smem_ptr, values[<span class="num">0</span>..<span class="num">3</span>]);
+<span class="ln">249</span>                         } <span class="kw">else</span> {   <span class="cm">// BF16: 8个float → 4对BF16</span>
+<span class="ln">250</span>                             cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr, values[<span class="num">0</span>..<span class="num">7</span>]);
+<span class="ln">251</span>                             cutlass::arch::fence_view_async_tmem_load();
+<span class="ln">252</span>                             ptx::st_shared(smem_ptr,
+<span class="ln">253</span>                                            cast_into_bf16_and_pack(values[<span class="num">0</span>], values[<span class="num">1</span>]),
+<span class="ln">254</span>                                            cast_into_bf16_and_pack(values[<span class="num">2</span>], values[<span class="num">3</span>]),
+<span class="ln">255</span>                                            cast_into_bf16_and_pack(values[<span class="num">4</span>], values[<span class="num">5</span>]),
+<span class="ln">256</span>                                            cast_into_bf16_and_pack(values[<span class="num">6</span>], values[<span class="num">7</span>]));
+<span class="ln">257</span>                         }
+<span class="ln">258</span>                     }
+<span class="ln">259</span>                     <span class="kw">if</span> (w == kNumMWaves - <span class="num">1</span> and s == BLOCK_N / STORE_BLOCK_N - <span class="num">1</span>) {
+<span class="ln">260</span>                         ptx::tcgen05_before_thread_sync();
+<span class="ln">261</span>                         tmem_empty_barriers[accum_stage_idx]-&gt;arrive(<span class="num">0u</span>); <span class="cm">// 通知MMA: TMEM可重用</span>
+<span class="ln">262</span>                     }
+<span class="ln">263</span>                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, <span class="num">0</span>); <span class="cm">// 等128线程都写完smem</span>
+<span class="ln">264</span>                     <span class="kw">constexpr</span> <span class="type">uint32_t</span> kNumBankGroupsPerRow = STORE_BLOCK_N / kNumElemsPerBankGroup;
+<span class="ln">265</span>                     <span class="kw">auto</span>* remote_partial_ptr = sym_buffer.map(            <span class="cm">// ← 映射到远端rank</span>
+<span class="ln">266</span>                         workspace.get_partial_ptr&lt;cd_dtype_t&gt;(rank_idx, local_m + w * WAVE_BLOCK_M, n_idx), dst_rank);
+<span class="ln">267</span>                     <span class="dir">#pragma unroll 1</span>
+<span class="ln">268</span>                     <span class="kw">for</span> (<span class="type">uint32_t</span> vec_idx = epilogue_thread_idx; vec_idx &lt; WAVE_BLOCK_M * kNumBankGroupsPerRow;
+<span class="ln">269</span>                          vec_idx += kNumUMMAStoreThreads) {
+<span class="ln">270</span>                         <span class="kw">const</span> <span class="type">uint32_t</span> row = vec_idx / kNumBankGroupsPerRow;
+<span class="ln">271</span>                         <span class="kw">const</span> <span class="type">uint32_t</span> bank_group_idx = vec_idx - row * kNumBankGroupsPerRow;
+<span class="ln">272</span>                         <span class="kw">const</span> <span class="type">uint32_t</span> col = bank_group_idx * kNumElemsPerBankGroup;
+<span class="ln">273</span>                         <span class="kw">if</span> (local_m + w * WAVE_BLOCK_M + row &lt; runtime_m_per_rank and n_idx + col &lt; shape_n) {
+<span class="ln">274</span>                             <span class="kw">const</span> <span class="type">uint32_t</span> warp_row = row / <span class="num">32</span>;
+<span class="ln">275</span>                             <span class="kw">const</span> <span class="type">uint32_t</span> row_in_warp = row - warp_row * <span class="num">32</span>;
+<span class="ln">276</span>                             <span class="kw">const</span> <span class="type">uint32_t</span> swizzled_bg_idx = bank_group_idx ^ (row_in_warp % (kSwizzleCDMode / kNumBankGroupBytes));
+<span class="ln">277</span>                             <span class="kw">const auto</span>* smem_vec_ptr = <span class="kw">reinterpret_cast</span>&lt;<span class="kw">const</span> <span class="type">uint4</span>*&gt;(
+<span class="ln">278</span>                                 <span class="kw">reinterpret_cast</span>&lt;<span class="kw">const</span> <span class="type">uint8_t</span>*&gt;(smem_cd[tma_stage_idx]) +
+<span class="ln">279</span>                                 warp_row * <span class="num">32</span> * kSwizzleCDMode +
+<span class="ln">280</span>                                 row_in_warp * (kNumBankGroupBytes * <span class="num">8</span>) +
+<span class="ln">281</span>                                 swizzled_bg_idx * kNumBankGroupBytes);
+<span class="ln">282</span>                             <span class="kw">auto</span>* remote_vec_ptr = <span class="kw">reinterpret_cast</span>&lt;<span class="type">uint4</span>*&gt;(remote_partial_ptr + row * shape_n + col);
+<span class="ln">283</span>                             *remote_vec_ptr = ptx::ld_shared(smem_vec_ptr);   <span class="cm">// smem → NVLink远端</span>
+<span class="ln">284</span>                         }
+<span class="ln">285</span>                     }
+<span class="ln">286</span>                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, <span class="num">0</span>);
+<span class="ln">287</span>                     <span class="kw">if</span> (w == kNumMWaves - <span class="num">1</span> and s == BLOCK_N / STORE_BLOCK_N - <span class="num">1</span>
+<span class="ln">288</span>                         and epilogue_thread_idx == <span class="num">0</span>) {
+<span class="ln">289</span>                         __threadfence_system();     <span class="cm">// 确保partial写入对远端可见</span>
+<span class="ln">290</span>                         <span class="kw">auto</span>* remote_ready_ptr = sym_buffer.map(
+<span class="ln">291</span>                             workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx), dst_rank);
+<span class="ln">292</span>                         *remote_ready_ptr = <span class="num">1</span>;      <span class="cm">// 设置ready flag</span>
+<span class="ln">293</span>                     }
+<span class="ln">294</span>                 }  <span class="cm">// end for s</span></pre>
+</div>
+<div class="diag">Epilogue 3步循环 (对每个sub-tile):
+
+① TMEM → smem (L232-258)
+   - 128线程并行, 每线程从TMEM读4或8个float
+   - BF16模式: 8个float → cast_into_bf16_and_pack → 4对BF16 → smem
+   - FP32模式: 4个float → 直接写smem
+   - 写入时做swizzle解交织
+
+② smem → NVLink远端 partial (L265-284)
+   - sym_buffer.map() 将本地地址映射到远端rank
+   - 128线程并行, 每线程以uint4(16B)粒度搬运
+   - 从smem的swizzled布局读取, 写入远端行优先布局
+
+③ 设置 ready flag (L287-292)
+   - __threadfence_system(): 确保NVLink写操作对远端可见
+   - 只有最后一个sub-tile的thread 0执行
+   - 写入远端rank的ready[slot][m_block][n_block] = 1</div>
+</div>
+
+<!-- ==================== 第10段：RS Warps ==================== -->
+<div class="card">
+<h2>第10段：RS Warps — Reduce-Scatter 收集 (L295-328) <span class="tag tag-rs">RS</span></h2>
+<button class="collapse-btn" onclick="toggleCode('code10')">展开/收起源码</button>
+<div id="code10" class="collapsible open">
+<pre><span class="ln">295</span>     } <span class="kw">else if</span> (warp_idx &lt; kNumRSWarps) {         <span class="cm">// RS warps: warp 0 ~ kNumRSWarps-1</span>
+<span class="ln">296</span>         <span class="kw">auto</span> to_float = [](<span class="kw">const</span> cd_dtype_t&amp; value) {
+<span class="ln">297</span>             <span class="kw">if constexpr</span> (cute::is_same_v&lt;cd_dtype_t, <span class="type">float</span>&gt;) <span class="kw">return</span> value;
+<span class="ln">298</span>             <span class="kw">else return static_cast</span>&lt;<span class="type">float</span>&gt;(value);
+<span class="ln">299</span>         };
+<span class="ln">300</span>         <span class="kw">auto</span> from_float = [](<span class="kw">const</span> <span class="type">float</span>&amp; value) {
+<span class="ln">301</span>             <span class="kw">if constexpr</span> (cute::is_same_v&lt;cd_dtype_t, <span class="type">float</span>&gt;) <span class="kw">return</span> value;
+<span class="ln">302</span>             <span class="kw">else return</span> cd_dtype_t(value);
+<span class="ln">303</span>         };
+<span class="ln">304</span>         <span class="kw">auto</span>* y_ptr = <span class="kw">static_cast</span>&lt;cd_dtype_t*&gt;(y);
+<span class="ln">305</span>         <span class="kw">const</span> <span class="type">uint32_t</span> num_local_tiles = num_m_blocks_per_rank * num_n_blocks;
+<span class="ln">306</span>         <span class="kw">for</span> (<span class="type">uint32_t</span> tile_idx = sm_idx * kNumRSWarps + warp_idx;   <span class="cm">// 跨SM轮询</span>
+<span class="ln">307</span>              tile_idx &lt; num_local_tiles;
+<span class="ln">308</span>              tile_idx += kNumSMs * kNumRSWarps) {
+<span class="ln">309</span>             <span class="kw">const</span> <span class="type">uint32_t</span> local_m_block_idx = tile_idx / num_n_blocks;
+<span class="ln">310</span>             <span class="kw">const</span> <span class="type">uint32_t</span> n_block_idx = tile_idx - local_m_block_idx * num_n_blocks;
+<span class="ln">311</span>             <span class="kw">const</span> <span class="type">uint32_t</span> n_base = n_block_idx * BLOCK_N;
+<span class="ln">312</span>             <span class="kw">for</span> (<span class="type">uint32_t</span> elem_idx = lane_idx; elem_idx &lt; BLOCK_M * BLOCK_N; elem_idx += <span class="num">32</span>) {
+<span class="ln">313</span>                 <span class="kw">const</span> <span class="type">uint32_t</span> row = elem_idx / BLOCK_N;
+<span class="ln">314</span>                 <span class="kw">const</span> <span class="type">uint32_t</span> col = elem_idx - row * BLOCK_N;
+<span class="ln">315</span>                 <span class="kw">if</span> (local_m_block_idx * BLOCK_M + row &gt;= runtime_m_per_rank or n_base + col &gt;= shape_n)
+<span class="ln">316</span>                     <span class="kw">continue</span>;               <span class="cm">// 跳过padding元素</span>
+<span class="ln">317</span>                 <span class="type">float</span> acc = <span class="num">0.0f</span>;
+<span class="ln">318</span>                 <span class="dir">#pragma unroll 1</span>
+<span class="ln">319</span>                 <span class="kw">for</span> (<span class="type">uint32_t</span> src_rank = <span class="num">0</span>; src_rank &lt; kNumRanks; ++ src_rank) {
+<span class="ln">320</span>                     <span class="kw">auto</span>* ready_ptr = workspace.get_ready_ptr(src_rank, local_m_block_idx, n_block_idx);
+<span class="ln">321</span>                     <span class="kw">while</span> (ptx::ld_acq_sys(ready_ptr) == <span class="num">0</span>);    <span class="cm">// 自旋等待!</span>
+<span class="ln">322</span>                     <span class="kw">const auto</span>* partial_ptr = workspace.get_partial_ptr&lt;cd_dtype_t&gt;(
+<span class="ln">323</span>                         src_rank, local_m_block_idx * BLOCK_M + row, n_base + col);
+<span class="ln">324</span>                     acc += to_float(*partial_ptr);
+<span class="ln">325</span>                 }
+<span class="ln">326</span>                 y_ptr[(local_m_block_idx * BLOCK_M + row) * shape_n + n_base + col] = from_float(acc);
+<span class="ln">327</span>             }
+<span class="ln">328</span>         }</pre>
+</div>
+<div class="diag">RS 收集流程 (每个元素):
+
+对每个 (row, col) in tile:
+  acc = 0
+  for src_rank = 0 to kNumRanks-1:
+    ┌─────────────────────────────────────────────┐
+    │  while (ready[src_rank][m_block][n_block]==0)│ ← 自旋等待
+    │      // 什么也不做, 等待远端epilogue写完      │
+    └─────────────────────────────────────────────┘
+    acc += partial[src_rank][row][col]               ← 读远端partial
+  y[row][col] = acc                                  ← 写最终输出
+
+特点:
+- 逐元素串行累加所有rank的partial (非向量化)
+- 用 ld_acq_sys 保证读到ready=1后partial数据可见
+- 与GEMM计算完全并行: RS warps和GEMM warps没有barrier关系</div>
+</div>
+
+<!-- ==================== 第11段：收尾 ==================== -->
+<div class="card">
+<h2>第11段：收尾 (L331-338)</h2>
+<button class="collapse-btn" onclick="toggleCode('code11')">展开/收起源码</button>
+<div id="code11" class="collapsible open">
+<pre><span class="ln">331</span>     __syncthreads();
+<span class="ln">332</span>     <span class="kw">if</span> (warp_idx == <span class="num">0</span>)
+<span class="ln">333</span>         Allocator().free(<span class="num">0</span>, kNumTmemCols);    <span class="cm">// 释放TMEM</span>
+<span class="ln">334</span> <span class="dir">#else</span>
+<span class="ln">335</span>     <span class="kw">if</span> (blockIdx.x == <span class="num">0</span> and threadIdx.x == <span class="num">0</span>)
+<span class="ln">336</span>         DG_DEVICE_ASSERT(<span class="kw">false</span> and <span class="str">"This kernel only supports sm_100f"</span>);
+<span class="ln">337</span> <span class="dir">#endif</span>
+<span class="ln">338</span> }</pre>
+</div>
+</div>
+
+<!-- ==================== 全局时间线 ==================== -->
+<div class="card">
+<h2>全局并行时间线</h2>
+<div class="diag">时间 ──────────────────────────────────────────────────────────────────→
+
+<span style="color:#1565c0">[TMA Load]</span>   │tile0 K0│tile0 K1│...│tile0 Kn│tile1 K0│tile1 K1│...
+                ↓wait    ↓wait       ↓wait    ↓wait    ↓wait
+<span style="color:#2e7d32">[MMA]</span>        │        │t0 K0  │...│t0 Kn  │        │t1 K0  │...
+                                                                
+<span style="color:#e65100">[Epilogue]</span>   │        │        │   │       │wait_tmem│TMEM→smem→NVLink│
+                         │        │        │       │        │set ready=1│
+
+<span style="color:#c62828">[RS Warps]</span>   │自旋等待ready[0][...]│累加partial[0..3]│写y│
+               │(独立运行, 不参与GEMM barrier)      │
+
+────────────────────────────────────────────────────────────────────
+
+关键: GEMM和RS完全并行, 没有跨组barrier!
+Epilogue的NVLink scatter和RS的自旋等待+累加自然同步(通过ready flag)</div>
+</div>
+
+<!-- ==================== Workspace ==================== -->
+<div class="card">
+<h2>GemmRSWorkspace 内存布局 (gemm_rs.cuh)</h2>
+<button class="collapse-btn" onclick="toggleCode('code12')">展开/收起源码</button>
+<div id="code12" class="collapsible open">
+<pre><span class="ln"> 1</span> <span class="dir">#pragma once</span>
+<span class="ln"> 2</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/common/math.cuh&gt;</span>
+<span class="ln"> 3</span> <span class="dir">#include</span> <span class="str">&lt;deep_gemm/common/exception.cuh&gt;</span>
+<span class="ln"> 4</span> <span class="kw">namespace</span> deep_gemm::layout {
+<span class="ln"> 5</span>
+<span class="ln"> 6</span> <span class="kw">struct</span> <span class="type">GemmRSWorkspace</span> {
+<span class="ln"> 7</span>     <span class="kw">void</span>* base;
+<span class="ln"> 8</span>     <span class="type">uint32_t</span> num_ranks;
+<span class="ln"> 9</span>     <span class="type">uint32_t</span> num_max_tokens_per_rank;  <span class="cm">// = shape_m_per_rank</span>
+<span class="ln">10</span>     <span class="type">uint32_t</span> hidden;                    <span class="cm">// = shape_n</span>
+<span class="ln">11</span>     <span class="type">uint32_t</span> elem_size;                 <span class="cm">// sizeof(cd_dtype_t)</span>
+<span class="ln">12</span>     <span class="type">uint32_t</span> block_m, block_n;
+<span class="ln">13</span>
+<span class="ln">14</span>     <span class="kw">static constexpr</span> <span class="type">uint64_t</span> kNumBarrierSignalBytes = <span class="num">32</span>;
+<span class="ln">15</span>
+<span class="ln">16</span>     <span class="cm">// ... 构造函数省略 ...</span>
+<span class="ln">17</span>
+<span class="ln">18</span>     <span class="cm">// Partial 缓冲区: 每个 rank 的 partial 结果矩阵</span>
+<span class="ln">19</span>     <span class="cm">// 布局: partial[slot_idx][token_idx * hidden + hidden_idx]</span>
+<span class="ln">20</span>     <span class="cm">// slot_idx = 哪个rank写的 (0..kNumRanks-1)</span>
+<span class="ln">21</span>     <span class="kw">template</span> &lt;<span class="kw">typename</span> <span class="type">dtype_t</span> = <span class="kw">void</span>&gt;
+<span class="ln">22</span>     CUTLASS_HOST_DEVICE dtype_t* get_partial_ptr(<span class="kw">const</span> <span class="type">uint32_t</span>&amp; slot_idx = <span class="num">0</span>,
+<span class="ln">23</span>                                                  <span class="kw">const</span> <span class="type">uint32_t</span>&amp; token_idx = <span class="num">0</span>,
+<span class="ln">24</span>                                                  <span class="kw">const</span> <span class="type">uint32_t</span>&amp; hidden_idx = <span class="num">0</span>) <span class="kw">const</span> {
+<span class="ln">25</span>         <span class="kw">const</span> <span class="type">uint64_t</span> offset = kNumBarrierSignalBytes +
+<span class="ln">26</span>             (<span class="kw">static_cast</span>&lt;<span class="type">uint64_t</span>&gt;(slot_idx) * num_max_tokens_per_rank * hidden +
+<span class="ln">27</span>              <span class="kw">static_cast</span>&lt;<span class="type">uint64_t</span>&gt;(token_idx) * hidden + hidden_idx) * elem_size;
+<span class="ln">28</span>         <span class="kw">return</span> math::advance_ptr&lt;dtype_t&gt;(base, offset);
+<span class="ln">29</span>     }
+<span class="ln">30</span>
+<span class="ln">31</span>     <span class="cm">// Ready Flags: 每个 rank 的每个 tile 一个 uint32</span>
+<span class="ln">32</span>     CUTLASS_HOST_DEVICE <span class="type">uint32_t</span>* get_ready_ptr(<span class="kw">const</span> <span class="type">uint32_t</span>&amp; slot_idx = <span class="num">0</span>,
+<span class="ln">33</span>                                                 <span class="kw">const</span> <span class="type">uint32_t</span>&amp; m_block_idx = <span class="num">0</span>,
+<span class="ln">34</span>                                                 <span class="kw">const</span> <span class="type">uint32_t</span>&amp; n_block_idx = <span class="num">0</span>) <span class="kw">const</span> {
+<span class="ln">35</span>         <span class="kw">const</span> <span class="type">uint64_t</span> base_offset = kNumBarrierSignalBytes + get_num_partial_bytes();
+<span class="ln">36</span>         <span class="kw">const</span> <span class="type">uint64_t</span> idx = (<span class="kw">static_cast</span>&lt;<span class="type">uint64_t</span>&gt;(slot_idx) * get_num_m_blocks_per_rank() + m_block_idx) * get_num_n_blocks() + n_block_idx;
+<span class="ln">37</span>         <span class="kw">return</span> math::advance_ptr&lt;<span class="type">uint32_t</span>&gt;(base, base_offset + idx * <span class="kw">sizeof</span>(<span class="type">uint32_t</span>));
+<span class="ln">38</span>     }
+<span class="ln">39</span> };</pre>
+</div>
+<div class="diag">Workspace 连续内存:
+
+┌──────────────────────┐
+│ Barrier 信号区 (32B)  │ ← grid sync + NVLink barrier (复用MegaMoE布局)
+├──────────────────────┤
+│                       │
+│ Partial 缓冲区         │ ← kNumRanks × shape_m_per_rank × shape_n × elem_size
+│ partial[0][row][col]  │    rank 0 的 partial 结果
+│ partial[1][row][col]  │    rank 1 的 partial 结果 (由rank 1的epilogue写入)
+│ ...                   │    ...
+│ partial[K-1][row][col]│    rank K-1 的 partial 结果
+│                       │
+├──────────────────────┤
+│ Ready Flags           │ ← kNumRanks × num_m_blocks_per_rank × num_n_blocks × 4B
+│ ready[0][m0][n0]      │    rank 0 的 tile(0,0) 是否就绪
+│ ready[0][m0][n1]      │    rank 0 的 tile(0,1) 是否就绪
+│ ...                   │
+│ ready[K-1][...][...]  │    rank K-1 的所有tile是否就绪
+└──────────────────────┘</div>
+</div>
+
+<!-- ==================== 设计总结 ==================== -->
+<div class="card">
+<h2>设计要点总结</h2>
+<ol>
+  <li><strong>计算通信完全重叠</strong>：Epilogue 做 scatter 的同时 RS warps 做 gather+reduce，零额外延迟</li>
+  <li><strong>无锁同步</strong>：跨 rank 通过 ready_flag 的 acquire/release 语义 + NVLink barrier，无需 NCCL</li>
+  <li><strong>调度决定通信</strong>：get_next_block 让每个 CTA 计算目标 rank 需要的数据，结果直接 NVLink 发送</li>
+  <li><strong>TMEM 双缓冲</strong>：kNumEpilogueStages=2，MMA 计算下一 tile 时 Epilogue 同时读上一个 TMEM 结果</li>
+  <li><strong>RS 逐元素串行</strong>：L312-327 逐元素遍历 + 逐 rank 串行累加，不是向量化 reduce。这是简化实现，未来可优化</li>
+  <li><strong>自旋等待</strong>：RS 用 <code>while(ld_acq_sys(ready_ptr)==0)</code> 忙等，延迟最低但浪费算力</li>
+</ol>
+</div>
+
+<script>
+function toggleCode(id) {
+  const el = document.getElementById(id);
+  el.classList.toggle('open');
+}
+</script>
+</body>
+</html>

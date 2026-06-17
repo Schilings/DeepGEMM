@@ -1576,8 +1576,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     }
 
                     // Iterate all atoms in the store block
-                    // 每个 ATOM Tile = ATOM_M(8) × (BLOCK_N/4) 列, 由 1 个 warp 处理
-                    // warp 内 32 lane: 每 4 lane 处理同一 token 的 hidden 维连续元素
+                    //
+                    // 单个 ATOM Tile = ATOM_M(8) × (BLOCK_N/4=32) 元素, 由 1 个 warp 处理
+                    //
+                    // ┌──── 1 个 warp (32 lane) 的 thread 到数据映射 ────────────────┐
+                    // │                                                                │
+                    // │  TMEM 侧 (AB-swap, gate/up 行间交替):                         │
+                    // │     8 列 (M dim, ATOM_M) × 32 行 (N dim, BLOCK_N/4)          │
+                    // │                                                                │
+                    // │  thread → token 映射 (stride=4):                               │
+                    // │     Token 0: lane  0, 4, 8,12,16,20,24,28  (8 线程)          │
+                    // │     Token 1: lane  1, 5, 9,13,17,21,25,29                     │
+                    // │     Token 2: lane  2, 6,10,14,18,22,26,30                     │
+                    // │     Token 3: lane  3, 7,11,15,19,23,27,31                     │
+                    // │                                                                │
+                    // │  每 thread 从 TMEM_LOAD×2 得到 values[0..7] (8 个 FP32):       │
+                    // │    values[0,1] → gate.x, gate.y  (k=0, 连续 2 N 元素)          │
+                    // │    values[2,3] → up.x,   up.y                                 │
+                    // │    values[4,5] → gate.x, gate.y  (k=1, 跳 32 行后)            │
+                    // │    values[6,7] → up.x,   up.y                                 │
+                    // │                                                                │
+                    // │  warp_reduce<4, true>: 每 4 lane 跨 token 求 amax            │
+                    // │    以 Token 0 为例: {lane 0,4,8,12} 为一组 → max             │
+                    // │                   {lane 16,20,24,28} 为另一组 → max           │
+                    // └────────────────────────────────────────────────────────────────┘
                     float2 swiglu_values[kNumAtomsPerStore * 2];
                     float2 amax_values[kNumAtomsPerStore];
                     #pragma unroll
