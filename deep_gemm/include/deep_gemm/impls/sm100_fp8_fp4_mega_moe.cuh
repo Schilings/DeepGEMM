@@ -1424,9 +1424,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         // 4.5 Epilogue Warp — 覆盖 L1 Epilogue / L2 Epilogue / Combine 三阶段
         //
         // 8 个 epilogue warp (256 线程, reg=208) 分为 2 个 WarpGroup (WG):
-        //   - 每个 WG 负责 BLOCK_M / 2 行 (M 维上半/下半)
-        //   - WG 内 4 个 warp 在 N 维平铺, 各负责 BLOCK_N / 4 列
-        //   - M 维进一步切为 STORE_BLOCK_M → ATOM_M = 8 (最小存储粒度)
+        //
+        // 数据切分 (以 BLOCK_M=128, BLOCK_N=128, STORE_BLOCK_M=32 为例):
+        //
+        //   M=0                                M=127
+        //   ┌──────────────────────────────────┐
+        //   │           WG 0                   │  WG_BLOCK_M = 64
+        //   │  ┌────────────┐ ┌────────────┐   │
+        //   │  │ STORE 0    │ │ STORE 1    │   │  STORE_BLOCK_M = 32
+        //   │  │┌──┐┌──┐┌──┐│ │            │   │
+        //   │  ││A0││A1││A2││ │  ...       │   │  ATOM_M = 8
+        //   │  ││A3││A4││A5││ │            │   │
+        //   │  │└──┘└──┘└──┘│ │            │   │
+        //   │  └────────────┘ └────────────┘   │
+        //   ├──────────────────────────────────┤
+        //   │           WG 1                   │  WG_BLOCK_M = 64
+        //   │  ┌────────────┐ ┌────────────┐   │
+        //   │  │ STORE 2    │ │ STORE 3    │   │
+        //   │  └────────────┘ └────────────┘   │
+        //   └──────────────────────────────────┘
+        //
+        //   WG 内 N 维平铺 (BLOCK_N=128 → 每 warp 32 列):
+        //           warp0    warp1    warp2    warp3
+        //     N=0 ┌──────┬────────┬────────┬──────┐ N=127
+        //         │ 32列 │  32列  │  32列  │ 32列 │
+        //         └──────┴────────┴────────┴──────┘
+        //
+        //   每个 Atom = ATOM_M(8行) × (BLOCK_N/4=32列), 由 1 个 warp 处理
+        //   每个 warp 内 32 lane: 每 4 lane 处理同一 token 的 N 维连续元素
         //
         // ┌──────────────────────────────────────────────────────────────────┐
         // │  L1 Epilogue: TMEM→SwiGLU(silu(gate)*up*weight)→amax→FP8量化  │
@@ -1443,10 +1468,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
         DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
 
-        // 4.5.1 初始化阶段 — 多级 ID 分解
+        // 4.5.1 初始化阶段 — 多级 ID 分解 (详见上方全景图)
         //
-        // 数据切分层级 (M 维):
-        //   BLOCK_M ──▶ WG_BLOCK_M (每 warpgroup 半区)
+        // 数据切分层级: BLOCK_M → WG_BLOCK_M → STORE_BLOCK_M → ATOM_M(8)
         //           ──▶ STORE_BLOCK_M (TMA store 粒度)
         //           ──▶ ATOM_M = 8 (最小 TMEM_LOAD/SwiGLU/amax 粒度)
         //
@@ -1524,7 +1548,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                 //   │         │                                        │
                 //   │         ▼ split                                 │
                 //   │  ┌─────────────────┐  ┌─────────────────┐       │
-                //   │  │ gate (N/2 列)  │  │   up (N/2 列)   │       │
+                //   │  │ gate (N/2 列)   │  │   up (N/2 列)   │       │
                 //   │  └─────────────────┘  └─────────────────┘       │
                 //   │         │                    │                 │
                 //   │         ▼                    ▼                 │
