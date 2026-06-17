@@ -1651,6 +1651,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                                                                values[4], values[5], values[6], values[7]);
                         cutlass::arch::fence_view_async_tmem_load(); // TMEM load 异步, 等待寄存器可见
 
+                        // j 是 wg 内的全局 atom 索引——当 j == WG_BLOCK_M/ATOM_M - 1 时表示本 wg 的 最后一个 atom, 
+                        // 此刻 TMEM 已完整读出, 可以通知 MMA warp 覆写这个 accumulator 槽.
                         // Signal tensor memory consumed on the last atom
                         if (j == WG_BLOCK_M / ATOM_M - 1) {
                             ptx::tcgen05_before_thread_sync();
