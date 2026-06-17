@@ -1577,29 +1577,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
                     // Iterate all atoms in the store block
                     //
-                    // 单个 ATOM Tile = ATOM_M(8) × (BLOCK_N/4=32) 元素, 由 1 个 warp 处理
+                    // 单个 ATOM Tile = ATOM_M(8) × 32 个元素, 32 个 thread 各处理 1 行 × 8 列
                     //
-                    // ┌──── 1 个 warp (32 lane) 的 thread 到数据映射 ────────────────┐
-                    // │                                                                │
-                    // │  TMEM 侧 (AB-swap, gate/up 行间交替):                         │
-                    // │     8 列 (M dim, ATOM_M) × 32 行 (N dim, BLOCK_N/4)          │
-                    // │                                                                │
-                    // │  thread → token 映射 (stride=4):                               │
-                    // │     Token 0: lane  0, 4, 8,12,16,20,24,28  (8 线程)          │
-                    // │     Token 1: lane  1, 5, 9,13,17,21,25,29                     │
-                    // │     Token 2: lane  2, 6,10,14,18,22,26,30                     │
-                    // │     Token 3: lane  3, 7,11,15,19,23,27,31                     │
-                    // │                                                                │
-                    // │  每 thread 从 TMEM_LOAD×2 得到 values[0..7] (8 个 FP32):       │
-                    // │    values[0,1] → gate.x, gate.y  (k=0, 连续 2 N 元素)          │
-                    // │    values[2,3] → up.x,   up.y                                 │
-                    // │    values[4,5] → gate.x, gate.y  (k=1, 跳 32 行后)            │
-                    // │    values[6,7] → up.x,   up.y                                 │
-                    // │                                                                │
-                    // │  warp_reduce<4, true>: 每 4 lane 跨 token 求 amax            │
-                    // │    以 Token 0 为例: {lane 0,4,8,12} 为一组 → max             │
-                    // │                   {lane 16,20,24,28} 为另一组 → max           │
-                    // └────────────────────────────────────────────────────────────────┘
+                    //  列: g=gate, u=up (interleaved)       token 分组 (stride=4, 每 8 lane 1 token)
+                    //   col 0  1  2  3  4  5  6  7           T=0  T=1  T=2  T=3
+                    //   ┌──┬──┬──┬──┬──┬──┬──┬──┐
+                    // 0 │g0│u0│g1│u1│g2│u2│g3│u3│ lane  0  L0
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤
+                    // 1 │g0│u0│g1│u1│g2│u2│g3│u3│ lane  1  │L1
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤
+                    // 2 │g0│u0│g1│u1│g2│u2│g3│u3│ lane  2  │ │L2
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤
+                    // 3 │g0│u0│g1│u1│g2│u2│g3│u3│ lane  3  │ │ │L3
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤
+                    // 4 │g0│u0│g1│u1│g2│u2│g3│u3│ lane 4   L4 │ │ │
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤         ↑stride=4, 同一 token
+                    // 5 │g0│u0│g1│u1│g2│u2│g3│u3│ lane 5
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤
+                    // ...                                 Token 0 lanes: {0,4,8,12,16,20,24,28}
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤         Token 1 lanes: {1,5,9,13,17,21,25,29}
+                    // 28│g0│u0│g1│u1│g2│u2│g3│u3│ lane28  Token 2 lanes: {2,6,10,14,18,22,26,30}
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤         Token 3 lanes: {3,7,11,15,19,23,27,31}
+                    // 29│g0│u0│g1│u1│g2│u2│g3│u3│ lane29
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤
+                    // 30│g0│u0│g1│u1│g2│u2│g3│u3│ lane30  每 thread 的 8 个 values[]:
+                    //   ├──┼──┼──┼──┼──┼──┼──┼──┤       TMEM_LOAD 1: values[0..3] (行 0..15)
+                    // 31│g0│u0│g1│u1│g2│u2│g3│u3│ lane31  TMEM_LOAD 2: values[4..7] (行 16..31)
+                    //   └──┴──┴──┴──┴──┴──┴──┴──┘
+                    //   每行 8 值 → SwiGLU: silu(g0)u0, silu(g1)u1, silu(g2)u2, silu(g3)u3 → ×weight
                     float2 swiglu_values[kNumAtomsPerStore * 2];
                     float2 amax_values[kNumAtomsPerStore];
                     #pragma unroll
