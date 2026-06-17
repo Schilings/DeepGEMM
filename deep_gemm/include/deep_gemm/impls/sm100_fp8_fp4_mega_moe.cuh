@@ -1622,6 +1622,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                         }
 
                         // 从寄存器缓存读 weight: exchange(src_lane) 取对应 lane 的 weight
+                        //
+                        // 32 lane 存 32 个连续的 weight, 但 stride-4 分组使得 8 个 lane 共享同 1 token 的 weight:
+                        //   Token 0 lanes {0,4,8,12,16,20,24,28} → 全需 weight[M+0] → 从 source lane 0 广播
+                        //   Token 1 lanes {1,5,9,13,17,21,25,29} → 全需 weight[M+1] → 从 source lane 2 广播
+                        //   Token 2 lanes {2,6,10,14,18,22,26,30} → 全需 weight[M+2] → 从 source lane 4 广播
+                        //   Token 3 lanes {3,7,11,15,19,23,27,31} → 全需 weight[M+3] → 从 source lane 6 广播
+                        //
+                        // source_lane = (lane_idx % 4) * 2 + {0,1}
+                        //   lane_idx%4=0 → src 0;  %4=1 → src 2;  %4=2 → src 4;  %4=3 → src 6
+                        //   ×2: 跳过 gate 列占位; +0/+1: 取 k 循环的连续两个 weight (weights.x / weights.y)
                         const float2 weights = {
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
