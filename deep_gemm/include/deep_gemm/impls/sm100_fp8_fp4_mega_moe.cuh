@@ -706,28 +706,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
             /* After the NVLink barrier, there is a grid sync */ true
         );
 
-        // Dispatch-Epilogue 握手屏障
+        // 4.5.2 与 Dispatch Warp 同步
         //
-        // 目的：dispatch线程和epilogue线程共享同一个CTA，但执行不同的流水线阶段。
-        // 这个屏障确保dispatch线程完成NVLink barrier后，epilogue线程才继续执行，
-        // 反之亦然。防止以下竞态：
-        //   - dispatch线程在拉取数据时，epilogue线程可能还在使用shared memory做
-        //     上一个iter的combine归约，两者可能写冲突
-        //   - dispatch线程还没完成拉取，epilogue线程就开始消费尚未就绪的数据
+        // 两次同步, 解决 SMEM 和 workspace 所有权切换:
         //
-        // 为什么用 sync_unaligned 而非 sync_aligned：
-        //   参与同步的线程数 = kNumDispatchThreads + kNumEpilogueThreads，
-        //   kNumEpilogueThreads可能不是32的倍数，不满足bar.sync的对齐要求，
-        //   因此使用 barrier.sync（unaligned版本）
+        // 第 1 次 (此处):
+        //   dispatch 的 smem_send_buffers (pull TMA 1D 落地区)
+        //   与 epilogue combine 阶段的 combine_load/combine_store 复用 smem
+        //   同步后: dispatch pull 阶段和 epilogue 阶段互不干扰
         //
-        // kDispatchWithEpilogueBarrierIdx = 1：使用第1号barrier资源，
-        //   与第0号(kDispatchBarrierIdx，仅dispatch线程间)互不干扰
+        // 第 2 次 (Dispatch 清理 workspace 前):
+        //   epilogue combine 需要复用 smem 做 chunk 缓冲
+        //   dispatch 需要等 combine 启动后才能安全清理 workspace
         //
-        // 该屏障在整个kernel中被多次使用，形成dispatch和epilogue之间的流水线握手：
-        //   第1次(此处): dispatch拉取前，等待epilogue就绪
-        //   第2次(859行): dispatch清理workspace前，等待epilogue完成
-        //   第3次(1294行): L2 GEMM的dispatch拉取前
-        //   第4次(1664行): combine归约前，等待dispatch完成
+        // 使用 sync_unaligned: dispatch (128 线程) 和 epilogue (256 线程)
+        //   线程数不同且 warp 边界不对齐, 只能用 bar.sync unaligned 变体
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Pull token data and SF from remote ranks into local L1 buffer
@@ -1428,44 +1421,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // ============================================================
-        // 【Epilogue Warps - 结果处理与写回】
+        // 4.5 Epilogue Warp — 覆盖 L1 Epilogue / L2 Epilogue / Combine 三阶段
         //
-        //  ┌──────────────────────────────────────────────────────────────────────┐
-        //  │  TMEM (Accumulator)                                                   │
-        //  │        │                                                             │
-        //  │        ▼                                                             │
-        //  │  ┌─────────────────────────────────────┐                            │
-        //  │  │      SwiGLU Activation (L1 only)      │                            │
-        //  │  │                                     │                            │
-        //  │  │   gate = intermediate[:, :N/2]     │                            │
-        //  │  │   up   = intermediate[:, N/2:]     │                            │
-        //  │  │   output = SiLU(gate) * up           │                            │
-        //  │  └─────────────────────────────────────┘                            │
-        //  │        │                                                             │
-        //  │        ▼                                                             │
-        //  │  ┌─────────────────────────────────────┐                            │
-        //  │  │       Type Convert (FP8 → BF16)       │                            │
-        //  │  └─────────────────────────────────────┘                            │
-        //  │        │                                                             │
-        //  │        ▼                                                             │
-        //  │  ┌─────────────────────────────────────┐                            │
-        //  │  │     Global Memory Store (TMA)      │                            │
-        //  │  │                                     │                            │
-        //  │  │  y[pool_idx, :] = result            │                            │
-        //  │  └─────────────────────────────────────┘                            │
-        //  └──────────────────────────────────────────────────────────────────────┘
+        // 8 个 epilogue warp (256 线程, reg=208) 分为 2 个 WarpGroup (WG):
+        //   - 每个 WG 负责 BLOCK_M / 2 行 (M 维上半/下半)
+        //   - WG 内 4 个 warp 在 N 维平铺, 各负责 BLOCK_N / 4 列
+        //   - M 维进一步切为 STORE_BLOCK_M → ATOM_M = 8 (最小存储粒度)
         //
-        // Epilogue Warp分工:
-        //   - 4个warps组成1个warpgroup
-        //   - Warpgroup负责处理 BLOCK_M / 2 的行
-        //   - 每个warp负责 BLOCK_N / 4 的列
+        // ┌──────────────────────────────────────────────────────────────────┐
+        // │  L1 Epilogue: TMEM→SwiGLU(silu(gate)*up*weight)→amax→FP8量化  │
+        // │               →TMA store l2_token_buffer→red_or(l2_arrival_mask)│
+        // │  L2 Epilogue: TMEM→BF16→STSM smem→NVLink 远端写 combine_buffer   │
+        // │  Combine:     双缓冲 topk BF16→float累加→cast BF16→TMA store y  │
+        // └──────────────────────────────────────────────────────────────────┘
         //
-        // SwiGLU激活函数:
-        //   gate = SiLU(intermediate[:, :intermediate_dim])
-        //   up = intermediate[:, intermediate_dim:]
-        //   output = gate * up
-        //
-        // Adjust registers
+        // Adjust registers: epilogue 需要 208 寄存器 (SwiGLU/amax/combine 开销大)
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
@@ -1473,11 +1443,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
         DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
 
-        // GEMM epilogue warps
-        const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
-        const auto epilogue_wg_idx = epilogue_warp_idx / 4;
-        const auto epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
-        const auto warp_idx_in_wg = epilogue_warp_idx % 4;
+        // 4.5.1 初始化阶段 — 多级 ID 分解
+        //
+        // 数据切分层级 (M 维):
+        //   BLOCK_M ──▶ WG_BLOCK_M (每 warpgroup 半区)
+        //           ──▶ STORE_BLOCK_M (TMA store 粒度)
+        //           ──▶ ATOM_M = 8 (最小 TMEM_LOAD/SwiGLU/amax 粒度)
+        //
+        // 每个 warp (32 lane) 负责 WG_BLOCK_M × (BLOCK_N/4) 的子块
+        const auto epilogue_warp_idx = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps); // 0..7
+        const auto epilogue_wg_idx = epilogue_warp_idx / 4;               // WG 编号: 0 或 1
+        const auto epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx; // WG 内线程号
+        const auto warp_idx_in_wg = epilogue_warp_idx % 4;                // WG 内 warp 编号: 0..3
         DG_STATIC_ASSERT((kNumDispatchWarps + kNumMMANonEpilogueWarps) % 4 == 0 and
                          kNumEpilogueWarps % 4 == 0, "Invalid epilogue warps");
 
@@ -1496,45 +1473,42 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         DG_STATIC_ASSERT(STORE_BLOCK_M % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
 
-        // Dispatch-Epilogue 握手屏障
+        // 4.5.2 与 Dispatch Warp 同步
         //
-        // 目的：dispatch线程和epilogue线程共享同一个CTA，但执行不同的流水线阶段。
-        // 这个屏障确保dispatch线程完成NVLink barrier后，epilogue线程才继续执行，
-        // 反之亦然。防止以下竞态：
-        //   - dispatch线程在拉取数据时，epilogue线程可能还在使用shared memory做
-        //     上一个iter的combine归约，两者可能写冲突
-        //   - dispatch线程还没完成拉取，epilogue线程就开始消费尚未就绪的数据
+        // 两次同步, 解决 SMEM 和 workspace 所有权切换:
         //
-        // 为什么用 sync_unaligned 而非 sync_aligned：
-        //   参与同步的线程数 = kNumDispatchThreads + kNumEpilogueThreads，
-        //   kNumEpilogueThreads可能不是32的倍数，不满足bar.sync的对齐要求，
-        //   因此使用 barrier.sync（unaligned版本）
+        // 第 1 次 (此处):
+        //   dispatch 的 smem_send_buffers (pull TMA 1D 落地区)
+        //   与 epilogue combine 阶段的 combine_load/combine_store 复用 smem
+        //   同步后: dispatch pull 阶段和 epilogue 阶段互不干扰
         //
-        // kDispatchWithEpilogueBarrierIdx = 1：使用第1号barrier资源，
-        //   与第0号(kDispatchBarrierIdx，仅dispatch线程间)互不干扰
+        // 第 2 次 (Dispatch 清理 workspace 前):
+        //   epilogue combine 需要复用 smem 做 chunk 缓冲
+        //   dispatch 需要等 combine 启动后才能安全清理 workspace
         //
-        // 该屏障在整个kernel中被多次使用，形成dispatch和epilogue之间的流水线握手：
-        //   第1次(此处): dispatch拉取前，等待epilogue就绪
-        //   第2次(859行): dispatch清理workspace前，等待epilogue完成
-        //   第3次(1294行): L2 GEMM的dispatch拉取前
-        //   第4次(1664行): combine归约前，等待dispatch完成
+        // 使用 sync_unaligned: dispatch (128 线程) 和 epilogue (256 线程)
+        //   线程数不同且 warp 边界不对齐, 只能用 bar.sync unaligned 变体
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Persistently schedule over blocks
+        // 4.5.3 Block 循环 — 与 TMA/MMA warp 共享同一 scheduler.for_each_block
+        //
+        // 循环内按 Phase 分支: Linear1 → L1 Epilogue (SwiGLU+FP8量化)
+        //                   Linear2 → L2 Epilogue (BF16+NVLink远端写)
+        // 循环结束后 → Combine 阶段
         uint32_t current_iter_idx = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            // ⚠️  Wait UMMA arrival
+            // 等待 UMMA arrival: tmem_full_barriers→init(1), 仅 leader CTA arrive 一次
+            // 2-CTA UMMA 在两个 CTA 的 TMEM 上都写了结果, leader arrive 后硬件保证两侧就绪
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
-            // ⚠️ wait TMEM
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
-            ptx::tcgen05_after_thread_sync();
+            ptx::tcgen05_after_thread_sync(); // 普通线程同步对 tcgen05 可见
 
-            // Compute offsets
-            // NOTES: use shuffle here to let NVCC know warp divergence won't happen
+            // 计算 block 在全局坐标系的起点
+            // ptx::exchange(..., 0): 从 lane 0 广播 valid_m, 显式告诉编译器全 warp 一致
             const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -1578,13 +1552,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     }
 
                     // Iterate all atoms in the store block
+                    // 每个 ATOM Tile = ATOM_M(8) × (BLOCK_N/4) 列, 由 1 个 warp 处理
+                    // warp 内 32 lane: 每 4 lane 处理同一 token 的 hidden 维连续元素
                     float2 swiglu_values[kNumAtomsPerStore * 2];
                     float2 amax_values[kNumAtomsPerStore];
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         const uint32_t j = s * kNumAtomsPerStore + i;
 
-                        // Load weights from global into register cache per 32 tokens
+                        // 4.5.4.2 加载 topk_weight: 每 4 atom (32 行) 做 1 次 GMEM 加载
+                        // stored_cached_weight 缓存接下来 32 个 token 的权重
+                        // 中间 3 atom 通过 ptx::exchange shuffle 直接取
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
                         if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *l1_topk_weights_buffer
@@ -1592,20 +1570,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                                 .get_base_ptr<float>();
                         }
 
-                        // Load weights from register cache
+                        // 从寄存器缓存读 weight: exchange(src_lane) 取对应 lane 的 weight
                         const float2 weights = {
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
                         };
 
-                        // Load from TMEM
+                        // 4.5.4.3 TMEM 加载: 两次 SM100_TMEM_LOAD_16dp256b1x 凑满 32 行
+                        // - accum_stage_idx * UMMA_N: 选 accumulator 槽 (AB-swap 后 UMMA_N 对应 M 方向)
+                        // - epilogue_wg_idx * WG_BLOCK_M: warpgroup 半区偏移
+                        // - j * ATOM_M: atom 内 M 偏移
+                        // - | 0x00100000: 跳到下半 16 行 (256bit×16行 = ATOM_M×16, 再读 16 行凑 32)
+                        //   gate/up 在行间交替, Thread 0 的 v[0],v[2] 构成一对 (gate,up)
                         uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
                                                                values[4], values[5], values[6], values[7]);
-                        cutlass::arch::fence_view_async_tmem_load();
+                        cutlass::arch::fence_view_async_tmem_load(); // TMEM load 异步, 等待寄存器可见
 
                         // Signal tensor memory consumed on the last atom
                         if (j == WG_BLOCK_M / ATOM_M - 1) {
@@ -1613,22 +1596,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
-                        // Gate/up pairs: (0, 2), (1, 3), (4, 6), (5, 7)
+                        // 4.5.4.5 SwiGLU: silu(gate) × up × weight
+                        // FP32→BF16 截断降低精度需求, gate/up 对: (0,2), (1,3), (4,6), (5,7)
+                        // k 循环 2 次: 每 atom 两对 (gate,up), 8 元素→4 个 float2 结果
                         auto fp32_values = reinterpret_cast<float*>(values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
                             auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
 
-                            // Clamp
+                            // Clamp: gate ≤ kActivationClamp, up ∈ [-kActivationClamp, kActivationClamp]
                             if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
                                 bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
                                 bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
                             }
 
-                            // SwiGLU
+                            // SiLU: gate / (1 + exp(-gate))
+                            // fastMath 用 __expf + fast_rcp 近似, 避免 SFU 算力瓶颈
                             auto gate = __bfloat1622float2(bf16_gate);
                             auto neg_gate_exp = make_float2(
                                 kFastMath ? __expf(-gate.x) : expf(-gate.x),
@@ -1640,10 +1625,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                                 gate = {gate.x / denom.x, gate.y / denom.y};
                             }
                             const auto up = __bfloat1622float2(bf16_up);
-                            swiglu_values[i * 2 + k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                            swiglu_values[i * 2 + k] = __fmul2_rn(__fmul2_rn(gate, up), weights); // silu(gate)*up*weight
                         }
 
-                        // Amax reduction
+                        // 4.5.4.6 Amax 归约 — 第一层: warp 内 4-lane 规约
+                        // 同一 token 在 N 维跳步为 4 (T0,T4,T8,...T28), warp_reduce<4,true> 求 max
                         amax_values[i].x = math::warp_reduce<4, true>(
                             cute::max(cute::abs(swiglu_values[i * 2 + 0].x), cute::abs(swiglu_values[i * 2 + 1].x)),
                             math::ReduceMax<float>());
@@ -1651,9 +1637,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                             cute::max(cute::abs(swiglu_values[i * 2 + 0].y), cute::abs(swiglu_values[i * 2 + 1].y)),
                             math::ReduceMax<float>());
 
-                        // ⚠️smem_amax_reduction 的含义
-                        // 这是 L1 epilogue 阶段用于 amax（绝对值最大值）跨 warp 归约的共享内存。
-                        // 用途是计算每个 ATOM_M（8行）的缩放因子 SF——要量化成 FP8 输出，需要知道每组的最大绝对值。
+                        // 第二层: 写 smem_amax_reduction, 每个 warp 写自己的槽位
+                        // 前 4 个 lane 已在 broadcast 中得到 max 值, 只由它们写入
                         if (lane_idx < 4)
                             smem_amax_reduction[epilogue_warp_idx * (STORE_BLOCK_M / 2) + i * (ATOM_M / 2) + lane_idx] = amax_values[i];
                         __syncwarp();
@@ -1678,24 +1663,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                         float2 sf, sf_inv;
                         math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
 
-                        // Cast
+                        // 4.5.4.7 FP8 量化: amax→UE8M0 SF, sf_inv 缩放后 cast E4M3
+                        // __nv_fp8x4_e4m3: 一次把 4 个 float 打包成 32-bit (4×E4M3)
                         const float2 upper = __fmul2_rn(swiglu_values[i * 2 + 0], sf_inv);
                         const float2 lower = __fmul2_rn(swiglu_values[i * 2 + 1], sf_inv);
                         const auto fp8x4_values = __nv_fp8x4_e4m3(make_float4(upper.x, upper.y, lower.x, lower.y));
 
-                        // STSM
-                        uint32_t row = lane_idx;
-                        uint32_t col = warp_idx_in_wg;
+                        // STSM: stmatrix.sync.aligned.m16n8.x1.trans, 16行×8列 FP8 → smem
+                        // col ^ (row/2): XOR swizzle 消 bank conflict (与 BF16 epilogue 不同)
+                        uint32_t row = lane_idx;       // 0..31, 同一 warp 32 行
+                        uint32_t col = warp_idx_in_wg; // 0..3, WG 内 4 个 warp 在 N 维的列段
                         const auto smem_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N
                                                                      + i * ATOM_M * L1_OUT_BLOCK_N
-                                                                     + row * L1_OUT_BLOCK_N
-                                                                     + (col ^ (row / 2)) * kNumBankGroupBytes;
+                                                                     + row * L1_OUT_BLOCK_N              // 每行 L1_OUT_BLOCK_N 字节
+                                                                     + (col ^ (row / 2)) * kNumBankGroupBytes; // XOR swizzle 解交织
                         ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_values, smem_ptr);
 
-                        // Store SF to `l2_sf_buffer` as UE8M0 (MN-major layout)
-                        // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
-                        // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)  
-                        if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
+                    // 4.5.4.7 FP8 量化: cast E4M3 + STSM swizzle 写 smem
+                    // 
+                    // 4.5.4.8 写入 L2 input SF (UE8M0): 只有偶数 warp 写
+                    // 相邻 warp pair (warp0↔warp1) 共享同一 SF, 每 4 lane 写 2 行 (sf.x, sf.y)
+                    if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
                             const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2; 
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
@@ -1722,7 +1710,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Issue TMA store after all atoms in this store block
+                    // 4.5.4.9 TMA store L1 output → l2_token_buffer (供 L2 TMA-A 加载)
+                    // SwiGLU 后 N 减半: L1_OUT_BLOCK_N = BLOCK_N/2
                     if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
                         uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
                         cute::tma_store_fence();
@@ -1736,7 +1725,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     __syncwarp();
                 }
 
-                // Notify L2
+                // 通知 L2: red_or_rel_gpu(l2_arrival_mask) 
+                // l2_arrival_mask 是 bitmap, 每 bit 对应一个 N-block
+                // TMA-A warp L2 阶段自旋 ld_acq_gpu 等待全 bit 就绪
                 // TODO: less epilogue sync scope
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -1816,9 +1807,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         }
 
-                        // Store into shared memory
-                        // NOTES: only use first 16 lanes for address
-                        // NOTES: 2 warps share a BF16 swizzle atom
+                        // 4.5.5.2 转换为 BF16 并保存到 SMEM
+                        // 2 个 warp 共享一个 BF16 swizzle atom (128B)
+                        // col ^ row: BF16 版本的 XOR swizzle 消 bank conflict
                         uint32_t row = lane_idx % 8;
                         uint32_t col = (epilogue_warp_idx % 2) * 4 + lane_idx / 8;
                         const auto smem_ptr = smem_cd_l2 +
@@ -1839,8 +1830,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     // Wait shared memory ready
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Write into remote buffers
-                    // One warp per row, now the layout is different from shared memory storing
+                    // 4.5.5.3 NVLink 远端写: 每 warp 独占整行, 16 lane 分 16 个 float4
+                    // 通过 sym_buffer.map 跨 rank 写入 combine_token_buffer[dst_topk][dst_token]
+                    // 读取 dispatch 阶段写入的 TokenSrcMetadata 确定目标路由
                     const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
                     const uint32_t bank_group_idx = lane_idx % 8;
 
@@ -1881,38 +1873,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
             }
         });
 
-        // Deallocate tensor memory
-        // NOTES: must be called by the same logical warp ID on both CTAs
+        // 4.5.6 Combine 阶段 — top-k BF16 归约, 写出最终 y[num_tokens, hidden]
+        //
+        // 把各 rank 经 NVLink 写入 combine_token_buffer 的带权 BF16 部分和
+        // 按 token 做 top-k reduction → BF16 → TMA store 最终输出
+        //
+        // Deallocate tensor memory: 两个 CTA 必须由相同的逻辑 warp ID 调用
         if (epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
 
-        // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
+        // NVLink barrier: 等待所有 rank 的 L2 输出已写入各 combine buffer (~4us)
+        // grid_sync → 跨 rank NVLink barrier → 再次 grid_sync
         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
-        // Barrier with dispatch warps, so that they can do clean workspace
+        // 与 dispatch warp 再次同步: combine 需要占用 SMEM (smem_buffer→barrier 区间)
+        // dispatch 此刻可以安全清理 workspace, 两者 overlap
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Combine: reduce top-k results and write back
-        // NOTES: reuse shared memory from start up to the barriers
-        // 1 token, 1 topk latency: ~3 us
+        // 4.5.6.2/4.5.6.3 工作切分与内存布局
+        // 每个 warp 处理 1 个 token, hidden 维切 1 或 2 个 chunk (受 SMEM 约束)
+        // 3 个 chunk 槽: 2 个 TMA load 双缓冲 + 1 个 store
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
-
-        // 3 slots of chunk is needed: 2 load stages and 1 store
         constexpr uint32_t kNumChunkSlots = 3;
         constexpr uint32_t kNumMaxRegistersForBuffer = 128;
-
-        // NOTES: either 1 or 2 chunks for simplicity
-        // NOTES: Restrict on both smem and register
+        // kNumChunks: 1 或 2, 受 SMEM + 寄存器双重约束
         constexpr uint32_t kNumChunks =
             kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE and kHidden <= 32 * kNumMaxRegistersForBuffer ? 1 : 2;
         constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
-        constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
+        constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32; // 每个 lane 的 uint4 数
         DG_STATIC_ASSERT(kHidden % kNumChunks == 0, "Hidden must be divisible by number of chunks");
         DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= SMEM_BEFORE_BARRIER_SIZE, "Hidden is too large");
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
@@ -1924,43 +1918,42 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
         DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= static_cast<uint32_t>(
             reinterpret_cast<uint8_t*>(barrier_start_ptr) - smem_buffer));
 
-        // Per-warp buffer: 2 stage load buffers + 1 store buffer
+        // 4.5.6.3 SMEM 分布: 外层 slot、内层 warp 的 stripe pattern
+        // 每个 warp 3 个 chunk 槽: 槽 0/1 双缓冲 load, 槽 2 store
         const auto combine_load_buffer = utils::PatternVisitor([&](const uint32_t& i) {
             return math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + i * kNumEpilogueWarps) * kNumChunkBytes);
         });
         const auto combine_store_buffer  = math::advance_ptr<uint4>(smem_buffer, (epilogue_warp_idx + kNumEpilogueWarps * 2) * kNumChunkBytes);
 
-        // Per-warp barriers
+        // 每个 warp 2 个 mbarrier (对应 load slot 0/1)
         auto combine_load_barriers = utils::PatternVisitor([&](const uint32_t& i) {
             return combine_barriers[i + epilogue_warp_idx * 2];
         });
 
-        // Iterate over all tokens
+        // 4.5.6.4 主循环: 按 warp 粒度遍历所有 token, 步长 = kNumSMs * kNumEpilogueWarps
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
-            // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
+            // 每个 lane 读一个 topk 槽 (-1 表示未使用)
             DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
-            const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+            const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0); // 32 lane valid 位编织成 mask
 
-            // Iterate all chunks
+            // 4.5.6.5 Chunk 循环: 每个 chunk 执行三段 — 预取→累加→写出, ping-pong 流水
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
-                // Move mask and load
+                // 4.5.6.6 move_mask_and_load: 用 __ffs(mask)-1 按位遍历 valid top-k 槽
+                // mask 中逐 bit 消费, elect_one 选 1 个 lane 发 TMA 1D load
                 uint32_t mask = total_mask;
                 const auto move_mask_and_load = [&](const uint32_t& i) {
                     if (mask) {
-                        // Move
-                        const uint32_t slot_idx = __ffs(mask) - 1;
-                        mask ^= 1 << slot_idx;
-
-                        // Load
-                        if (cute::elect_one_sync()) {
+                        const uint32_t slot_idx = __ffs(mask) - 1;   // 取最低 bit 对应 rank
+                        mask ^= 1 << slot_idx;                       // 从 mask 移除
+                        if (cute::elect_one_sync()) {                // 选 1 个 lane 发起 TMA
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
                                                     .get_data_buffer(token_idx).get_base_ptr(),
@@ -1974,16 +1967,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     return false;
                 };
 
-                // Load the first selection
+                // 启动第一次 TMA load
                 bool do_reduce = move_mask_and_load(load_stage_idx);
 
-                // Accumulate all top-k contributions for this chunk in float registers
+                // 4.5.6.7 累加循环: Ping-Pong 预取 pattern
+                // 当前 stage 累加时, 先把下一 stage 的 TMA 发出去
+                // ptx::accumulate: BF16→FP32 累加, 避免精度损失
                 float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
                 while (do_reduce) {
-                    // Prefetch next top-k into the buffer while current is being accumulated
+                    // 预取下一个 top-k 到另一个 stage (while 当前 stage 正在累加)
                     do_reduce = move_mask_and_load(load_stage_idx ^ 1);
 
-                    // Accumulate
+                    // 等待当前 stage TMA 完成 → BF16→FP32 累加
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
@@ -1993,11 +1988,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                         for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
                             ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
                     }
-                    combine_phase ^= load_stage_idx;
+                    combine_phase ^= load_stage_idx; // stage 翻一整圈才翻 phase
                     load_stage_idx ^= 1;
                 }
 
-                // Cast
+                // 4.5.6.8 Cast BF16 + Store: FP32 累加结果→BF16→写 SMEM→TMA store
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                     uint4 casted;
@@ -2006,7 +2001,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                     for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
                         casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
 
-                    // Wait share memory release and write
+                    // 等待上一轮 TMA store 完成, 写 SMEM combine_store_buffer
                     if (j == 0) {
                         ptx::tma_store_wait<0>();
                         __syncwarp();
@@ -2016,7 +2011,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,                                            
                 }
                 __syncwarp();
 
-                // TMA store the token chunk
+                // TMA 1D store: 将本 chunk 写入 y[token_idx][chunk_byte_offset:]
                 if (cute::elect_one_sync()) {
                     cute::tma_store_fence();
                     ptx::tma_store_1d(
