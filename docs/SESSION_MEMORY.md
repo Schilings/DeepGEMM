@@ -1,6 +1,6 @@
 # GEMM-RS 会话接班记忆（主线）
 
-> 最后更新：2026-06-18 04:38
+> 最后更新：2026-06-18 04:52
 > 目标：新会话 5 分钟内无缝接手。
 
 ---
@@ -18,13 +18,11 @@
 ## B. 当前关键事实
 
 - 当前口径是唯一主线：`bf16_gemm_rs_nt`。
-- 项目目标已明确对齐 **Megatron SP 中大 shape**（`1024/2048/4096` + `N/K=4096/7168` 组合）。
-- 学习方向：参考 `flux` GEMM-RS（H 卡稳定上线）的成熟策略，在 B 卡上做可复现适配。
-- 其它算子健康：
-  - `test_a2a_gemm.py 2` 通过（6/6）
-  - `test_ag_gemm.py 2`（限 1 shape）通过（1/1）
-- 主线 GEMM-RS 正确性通过：`test_gemm_rs.py 2`（6/6）
-- benchmark 脚本已收敛为主线对比（separate vs main fused）。
+- shape 口径已按用户指定切到固定 13 shape，并有重点 5 shape 子集。
+- 学习方向：参考 `flux` GEMM-RS（H 卡稳定上线），在 B 卡做可复现适配。
+- 主线 benchmark 已支持：
+  - `DG_BENCH_FOCUS_ONLY=1`（重点 5 shape）
+  - `DG_BENCH_SHAPES="M,N,K;..."`（自定义显式列表）
 
 ---
 
@@ -38,25 +36,26 @@ python3 setup.py build_ext --inplace --force
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
 python tests/test_gemm_rs.py 2
 
-DG_BENCH_MAX_SHAPES=10 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 2 5
+MASTER_PORT=29681 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
+python benchmarks/bench_gemm_rs.py 2 4
+
+MASTER_PORT=29682 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
+python benchmarks/bench_gemm_rs.py 2 6
 ```
 
 ---
 
-## D. 当前中大 shape 基线摘要
+## D. 当前基线摘要
 
-- 中大 shape（前 10 shapes，2 GPU，5 iter）：
-  - **geo mean ≈ 1.076x**
-  - **best ≈ 1.18x**（`4096x7168x4096`）
-  - **worst ≈ 0.96x**（`2048x7168x2048`）
-  - 平均 TFLOPS：fused `1102.5T` vs separate `1018.5T`
+- 指定 13 shape（2 GPU，4 iter）：**geo mean ≈ 1.103x**
+- 重点 5 shape（2 GPU，6 iter）：**geo mean ≈ 1.149x**
+- 当前主要短板：`2048x7168x2048`（约 `0.96x`）
+- 重点集最弱点：`4096x4096x7168`（约 `1.04x`）
 
 ---
 
 ## E. 下一步最短路径
 
-1. 先盯 `2048x7168x2048`（当前短板）做单点优化。
-2. 再回归中大 shape 集合复测，观察几何均值是否持续抬升。
-3. 每轮结束后立即更新 `PROGRESS.md` 并 `commit + push`。
-4. 优先验证可从 `flux` 迁移的稳定优化思想（尤其调度与通信重叠）。
+1. 继续针对 `K=7168` 场景做定向优化。
+2. 每次改动后先跑重点 5 shape，确认主目标集合不退化。
+3. 阶段性立即 `commit + push`，避免服务器被回收导致进度丢失。

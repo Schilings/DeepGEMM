@@ -28,34 +28,54 @@ from deep_gemm.utils.dist import init_dist
 
 
 SHAPES_STANDARD = [
-    # Medium
-    (1024, 4096, 7168),
+    # User-specified Megatron SP oriented shape set
     (1024, 7168, 4096),
     (2048, 4096, 7168),
     (2048, 7168, 4096),
-    (2048, 7168, 2048),
-    # Large
-    (4096, 7168, 2048),
-    (4096, 2048, 7168),
     (4096, 4096, 4096),
     (4096, 7168, 4096),
     (4096, 4096, 7168),
-    # Very Large / Extreme
-    (8192, 7168, 2048),
-    (8192, 2048, 7168),
     (8192, 4096, 4096),
     (8192, 7168, 4096),
-    (16384, 7168, 2048),
-    (16384, 2048, 7168),
-    (16384, 4096, 4096),
-    (16384, 7168, 4096),
     (8192, 7168, 7168),
+    (2048, 7168, 2048),
+    (4096, 7168, 2048),
+    (16384, 7168, 4096),
     (16384, 7168, 7168),
-    (20480, 7168, 2048),
+]
+
+SHAPES_FOCUS = [
+    # User-highlighted medium/large focus set
+    (4096, 4096, 4096),
+    (4096, 7168, 4096),
+    (4096, 4096, 7168),
+    (8192, 4096, 4096),
+    (8192, 7168, 4096),
 ]
 
 
+def parse_shapes_list(shapes_str: str):
+    shapes = []
+    for item in shapes_str.split(";"):
+        token = item.strip().lower().replace("x", ",")
+        if not token:
+            continue
+        m_str, n_str, k_str = [x.strip() for x in token.split(",")]
+        shapes.append((int(m_str), int(n_str), int(k_str)))
+    return shapes
+
+
 def get_shapes_to_run():
+    explicit_shapes = os.getenv("DG_BENCH_SHAPES", "").strip()
+    if explicit_shapes:
+        parsed = parse_shapes_list(explicit_shapes)
+        if parsed:
+            return parsed
+
+    focus_only = bool(int(os.getenv("DG_BENCH_FOCUS_ONLY", "0")))
+    if focus_only:
+        return SHAPES_FOCUS
+
     single_shape = os.getenv("DG_BENCH_SINGLE_SHAPE", "").strip()
     if single_shape:
         m_str, n_str, k_str = [x.strip() for x in single_shape.split(",")]
@@ -225,11 +245,13 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             print(f"    Worst speedup: {min(speedups):.2f}x")
 
         print("\n  By Scenario:")
+        focus_set = set(SHAPES_FOCUS)
         scenarios = [
             ("N=7168 (large hidden)", lambda r: r["n_dim"] == 7168),
             ("K=7168 (large input)", lambda r: r["k_dim"] == 7168),
             ("M/rank>=2048 (long ctx)", lambda r: r["tokens_per_rank"] >= 2048),
             ("M/rank>=8192 (very long)", lambda r: r["tokens_per_rank"] >= 8192),
+            ("User focus medium/large", lambda r: (r["tokens_per_rank"], r["n_dim"], r["k_dim"]) in focus_set),
         ]
         for label, pred in scenarios:
             subset = [r for r in results if pred(r)]

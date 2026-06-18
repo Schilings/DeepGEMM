@@ -109,13 +109,18 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int num_m_blocks_mc2 = (m_per_rank + 128 - 1) / 128;
     const bool m_blocks_even = (num_m_blocks_mc2 % 2 == 0);
 
-    if (m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
+    // Megatron-SP 中大 shape 特化：
+    // 对 m_per_rank=2048, n=7168, k=2048 一类 case，multicast=2 的 cluster 协作开销会放大，
+    // 实测可能吞掉 fused 收益。此处优先关闭 multicast，避免 2-CTA cluster 额外同步/调度成本。
+    const bool prefer_mc1_for_mid_shape = (k <= 2048 && m_per_rank <= 2048 && n >= 7168);
+
+    if (!prefer_mc1_for_mid_shape && m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
         // Enough tiles for multicast=2, block_m=128, and M-blocks are even
         block_m = 128;
         num_multicast = 2;
     } else if (m_per_rank >= 128) {
         // block_m=128 but not enough tiles for multicast=2
-        // Use multicast=1 to avoid wasting SM resources
+        // or explicitly prefer multicast=1 for selected mid-shapes.
         block_m = 128;
         num_multicast = 1;
     } else {
