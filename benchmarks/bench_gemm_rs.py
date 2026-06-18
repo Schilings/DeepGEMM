@@ -132,13 +132,19 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
     shapes_to_run = get_shapes_to_run()
 
     if rank_idx == 0:
-        print(f"\n{'=' * 108}")
-        print(f"  GEMM-RS Benchmark (Main Fused vs Separate), GPUs={num_ranks}, iters={num_iters}")
+        print(f"\n{'=' * 144}")
+        print(f"  GEMM-RS Benchmark (Fused vs Torch-Native/DeepGEMM-Separate), GPUs={num_ranks}, iters={num_iters}")
         print(f"  GPU: {torch.cuda.get_device_name(local_rank)}")
-        print(f"{'=' * 108}\n")
-        print(f"  {'Shape':<22} | {'Separate':>10} {'Fused':>10} | {'Sep TFLOPS':>11} {'Fused TFLOPS':>12} | {'Speedup':>9}")
-        print(f"  {'(M/rank x N x K)':<22} | {'(us)':>10} {'(us)':>10} | {'':>11} {'':>12} | {'vs Sep':>9}")
-        print(f"  {'-' * 22}-+-{'-' * 10}-{'-' * 10}-+-{'-' * 11}-{'-' * 12}-+-{'-' * 9}")
+        print(f"{'=' * 144}\n")
+        print(
+            f"  {'Shape':<22} | {'Torch':>10} {'Separate':>10} {'Fused':>10} | "
+            f"{'Torch TFLOPS':>12} {'Sep TFLOPS':>11} {'Fused TFLOPS':>12} | {'vs Torch':>9} {'vs Sep':>9}"
+        )
+        print(
+            f"  {'(M/rank x N x K)':<22} | {'(us)':>10} {'(us)':>10} {'(us)':>10} | "
+            f"{'':>12} {'':>11} {'':>12} | {'speedup':>9} {'speedup':>9}"
+        )
+        print(f"  {'-' * 22}-+-{'-' * 10}-{'-' * 10}-{'-' * 10}-+-{'-' * 12}-{'-' * 11}-{'-' * 12}-+-{'-' * 9}-{'-' * 9}")
 
     results = []
 
@@ -149,7 +155,9 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
         b = torch.randn((n_dim, k_dim), dtype=torch.bfloat16, device=device)
         y_fused = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16, device=device)
         y_sep = torch.zeros_like(y_fused)
+        y_torch = torch.zeros_like(y_fused)
         d_full = torch.zeros((total_m, n_dim), dtype=torch.bfloat16, device=device)
+        d_full_torch = torch.zeros_like(d_full)
 
         try:
             sym_buffer = deep_gemm.get_symm_buffer_for_gemm_rs(group, tokens_per_rank, n_dim, out_dtype=torch.bfloat16)
@@ -161,6 +169,10 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
         dist.barrier(group)
 
+        def run_torch_native():
+            torch.matmul(a, b.t(), out=d_full_torch)
+            dist.reduce_scatter_tensor(y_torch, d_full_torch, op=dist.ReduceOp.SUM, group=group)
+
         def run_separate():
             deep_gemm.bf16_gemm_nt(a, b, d_full)
             dist.reduce_scatter_tensor(y_sep, d_full, op=dist.ReduceOp.SUM, group=group)
@@ -169,10 +181,11 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             deep_gemm.bf16_gemm_rs_nt(y_fused, a, b, sym_buffer, tokens_per_rank, compiled_dims="nk")
 
         try:
+            time_torch_ms = bench_fn(run_torch_native, num_iters=num_iters, barrier_group=group)
             time_separate_ms = bench_fn(run_separate, num_iters=num_iters, barrier_group=group)
         except Exception as e:
             if rank_idx == 0:
-                print(f"  {tokens_per_rank}x{n_dim}x{k_dim:<5} | SKIP (separate failed: {e})")
+                print(f"  {tokens_per_rank}x{n_dim}x{k_dim:<5} | SKIP (baseline failed: {e})")
             try:
                 sym_buffer.destroy()
             finally:
@@ -186,10 +199,13 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             if rank_idx == 0:
                 print(f"  fused failed for {tokens_per_rank}x{n_dim}x{k_dim}: {e}")
 
+        time_torch_us = time_torch_ms * 1000.0
         time_separate_us = time_separate_ms * 1000.0
         time_fused_us = time_fused_ms * 1000.0 if time_fused_ms != float("inf") else float("inf")
 
-        speedup = time_separate_us / time_fused_us if time_fused_us not in (0, float("inf")) else 0.0
+        speedup_vs_torch = time_torch_us / time_fused_us if time_fused_us not in (0, float("inf")) else 0.0
+        speedup_vs_sep = time_separate_us / time_fused_us if time_fused_us not in (0, float("inf")) else 0.0
+        tflops_torch = compute_tflops(total_m, n_dim, k_dim, time_torch_ms)
         tflops_sep = compute_tflops(total_m, n_dim, k_dim, time_separate_ms)
         tflops_fused = compute_tflops(total_m, n_dim, k_dim, time_fused_ms) if time_fused_ms != float("inf") else 0.0
 
@@ -197,9 +213,12 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             "tokens_per_rank": tokens_per_rank,
             "n_dim": n_dim,
             "k_dim": k_dim,
+            "time_torch_us": time_torch_us,
             "time_separate_us": time_separate_us,
             "time_fused_us": time_fused_us,
-            "speedup": speedup,
+            "speedup_vs_torch": speedup_vs_torch,
+            "speedup_vs_sep": speedup_vs_sep,
+            "tflops_torch": tflops_torch,
             "tflops_separate": tflops_sep,
             "tflops_fused": tflops_fused,
         })
@@ -208,11 +227,13 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             shape_str = f"{tokens_per_rank}x{n_dim}x{k_dim}"
             fused_time_str = f"{time_fused_us:>8.1f}" if time_fused_us != float("inf") else "    FAIL"
             fused_tflops_str = f"{tflops_fused:>8.1f}T" if tflops_fused > 0 else "    FAIL"
-            speedup_str = f"{speedup:.2f}x" if speedup > 0 else "FAIL"
+            speedup_torch_str = f"{speedup_vs_torch:.2f}x" if speedup_vs_torch > 0 else "FAIL"
+            speedup_sep_str = f"{speedup_vs_sep:.2f}x" if speedup_vs_sep > 0 else "FAIL"
 
             print(
-                f"  {shape_str:<22} | {time_separate_us:>8.1f}u {fused_time_str}u | "
-                f"{tflops_sep:>9.1f}T {fused_tflops_str:>12} | {speedup_str:>9}"
+                f"  {shape_str:<22} | {time_torch_us:>8.1f}u {time_separate_us:>8.1f}u {fused_time_str}u | "
+                f"{tflops_torch:>10.1f}T {tflops_sep:>9.1f}T {fused_tflops_str:>12} | "
+                f"{speedup_torch_str:>9} {speedup_sep_str:>9}"
             )
 
         # Surface async failure before teardown
@@ -231,18 +252,24 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
         dist.barrier(group)
 
     if rank_idx == 0 and results:
-        print(f"\n{'=' * 108}")
+        print(f"\n{'=' * 144}")
         print(f"  Summary ({num_ranks} GPUs)")
-        print(f"{'=' * 108}")
+        print(f"{'=' * 144}")
 
-        speedups = [r["speedup"] for r in results if r["speedup"] > 0]
-        geo_speedup = math.exp(sum(math.log(s) for s in speedups) / len(speedups)) if speedups else 0.0
+        speedups_vs_torch = [r["speedup_vs_torch"] for r in results if r["speedup_vs_torch"] > 0]
+        speedups_vs_sep = [r["speedup_vs_sep"] for r in results if r["speedup_vs_sep"] > 0]
+        geo_vs_torch = math.exp(sum(math.log(s) for s in speedups_vs_torch) / len(speedups_vs_torch)) if speedups_vs_torch else 0.0
+        geo_vs_sep = math.exp(sum(math.log(s) for s in speedups_vs_sep) / len(speedups_vs_sep)) if speedups_vs_sep else 0.0
 
-        print("\n  Overall Statistics (vs Separate GEMM+NCCL RS):")
-        print(f"    Main fused geo_mean speedup: {geo_speedup:.3f}x")
-        if speedups:
-            print(f"    Best speedup: {max(speedups):.2f}x")
-            print(f"    Worst speedup: {min(speedups):.2f}x")
+        print("\n  Overall Statistics:")
+        print(f"    Main fused geo_mean speedup vs torch-native: {geo_vs_torch:.3f}x")
+        print(f"    Main fused geo_mean speedup vs deepgemm-separate: {geo_vs_sep:.3f}x")
+        if speedups_vs_torch:
+            print(f"    Best speedup vs torch-native: {max(speedups_vs_torch):.2f}x")
+            print(f"    Worst speedup vs torch-native: {min(speedups_vs_torch):.2f}x")
+        if speedups_vs_sep:
+            print(f"    Best speedup vs deepgemm-separate: {max(speedups_vs_sep):.2f}x")
+            print(f"    Worst speedup vs deepgemm-separate: {min(speedups_vs_sep):.2f}x")
 
         print("\n  By Scenario:")
         focus_set = set(SHAPES_FOCUS)
@@ -257,19 +284,26 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
             subset = [r for r in results if pred(r)]
             if not subset:
                 continue
-            subset_speedups = [r["speedup"] for r in subset if r["speedup"] > 0]
-            subset_geo = math.exp(sum(math.log(s) for s in subset_speedups) / len(subset_speedups)) if subset_speedups else 0.0
-            print(f"    {label:<28} speedup={subset_geo:.3f}x  ({len(subset)} shapes)")
+            subset_vs_torch = [r["speedup_vs_torch"] for r in subset if r["speedup_vs_torch"] > 0]
+            subset_vs_sep = [r["speedup_vs_sep"] for r in subset if r["speedup_vs_sep"] > 0]
+            subset_geo_vs_torch = math.exp(sum(math.log(s) for s in subset_vs_torch) / len(subset_vs_torch)) if subset_vs_torch else 0.0
+            subset_geo_vs_sep = math.exp(sum(math.log(s) for s in subset_vs_sep) / len(subset_vs_sep)) if subset_vs_sep else 0.0
+            print(
+                f"    {label:<28} vs_torch={subset_geo_vs_torch:.3f}x  "
+                f"vs_sep={subset_geo_vs_sep:.3f}x  ({len(subset)} shapes)"
+            )
 
+        avg_torch = sum(r["tflops_torch"] for r in results) / len(results)
         avg_sep = sum(r["tflops_separate"] for r in results) / len(results)
         fused_valid = [r["tflops_fused"] for r in results if r["tflops_fused"] > 0]
         avg_fused = sum(fused_valid) / len(fused_valid) if fused_valid else 0.0
 
         print("\n  Average TFLOPS:")
-        print(f"    Separate:   {avg_sep:.1f} TFLOPS")
-        print(f"    Main fused: {avg_fused:.1f} TFLOPS")
+        print(f"    Torch native:       {avg_torch:.1f} TFLOPS")
+        print(f"    DeepGEMM separate:  {avg_sep:.1f} TFLOPS")
+        print(f"    Main fused:         {avg_fused:.1f} TFLOPS")
 
-        print(f"\n{'=' * 108}\n")
+        print(f"\n{'=' * 144}\n")
 
     dist.barrier(group)
     dist.destroy_process_group()

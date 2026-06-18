@@ -39,14 +39,15 @@
 
 运行（最新复测）：
 
-- `MASTER_PORT=29684 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM python benchmarks/bench_gemm_rs.py 2 5`
+- `MASTER_PORT=29708 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM python benchmarks/bench_gemm_rs.py 2 4`
 
 结果摘要：
 
-- **geo mean speedup = 1.155x**
-- **Best = 1.19x**
-- **Worst = 1.04x**（`4096x4096x7168`）
-- 平均 TFLOPS：fused **1304.8T** vs separate **1132.3T**
+- **geo mean speedup vs torch-native = 1.166x**
+- **geo mean speedup vs deepgemm-separate = 1.163x**
+- **Best vs torch-native = 1.22x**
+- **Worst vs torch-native = 1.04x**（`4096x4096x7168`）
+- 平均 TFLOPS：fused **1306.2T** vs separate **1124.7T** vs torch-native **1123.4T**
 
 ---
 

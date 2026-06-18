@@ -47,10 +47,10 @@ python benchmarks/bench_gemm_rs.py 2 5
 
 ## D. 当前基线摘要
 
-- 指定 13 shape（2 GPU，3 iter）：**geo mean ≈ 1.102x**
-- 重点 5 shape（2 GPU，5 iter）：**geo mean ≈ 1.155x**
-- 当前短板：`2048x7168x2048`（约 `0.97x`）
-- 重点集最弱点：`4096x4096x7168`（约 `1.04x`，已从约 `1.04x`→`1.06x` 单点改善）
+- 指定 13 shape（2 GPU，3 iter）：**geo mean ≈ 1.111x（vs torch） / 1.100x（vs sep）**
+- 重点 5 shape（2 GPU，4 iter）：**geo mean ≈ 1.166x（vs torch） / 1.163x（vs sep）**
+- 当前短板：`2048x7168x2048`（约 `0.98x vs torch / 0.96x vs sep`）
+- 重点集最弱点：`4096x4096x7168`（约 `1.04x`）
 
 ---
 

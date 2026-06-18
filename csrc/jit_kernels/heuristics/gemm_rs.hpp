@@ -80,26 +80,8 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int block_k = 128 / elem_size_ab;
 
     // Block M selection:
-    // When multicast=2 (2-CTA cluster), UMMA 2x1SM requires each CTA to have 128 rows (LAYOUT_AD_M=128).
-    // Therefore block_m must be >= 128 when multicast is enabled.
-    // For smaller M, we disable multicast to allow block_m < 128.
-    const int num_n_blocks = (n + block_n - 1) / block_n;
-    auto compute_waves = [&](int bm, int mc) {
-        int num_m_blocks = (m_per_rank + bm - 1) / bm;
-        int total_blocks = num_m_blocks * num_n_blocks * num_ranks;
-        // With multicast, effective SM count is halved (2 CTAs per cluster share work)
-        int effective_sms = num_sms / mc;
-        return static_cast<float>(total_blocks) / effective_sms;
-    };
-
-    // Prefer multicast=2 with block_m=128 when we have enough tiles
-    // Fall back to multicast=1 with smaller block_m for small M scenarios
-    //
-    // kIsMulticastOnA=false (matching standard BF16 GEMM non-swap-AB):
-    //   - A matrix is TMA multicast: one HBM read, data goes to both CTA's smem
-    //   - B matrix is split: CTA 0 loads B[:, 0:64], CTA 1 loads B[:, 64:128]
-    //   - UMMA 2x1SM reads from both SMs to produce UMMA_M=256 output
-    //   - Net effect: halved HBM bandwidth for A, doubled compute throughput
+    // 主线策略按 SM100 2-CTA cluster（mc=2）优先，遵循 SM100_2CTA_CLUSTER 文档。
+    // 仅当 M 过小或无法形成偶数 M-block 对时才回退到 mc=1。
     int block_m;
     int num_multicast;
     bool is_multicast_on_a = false;  // A is multicast, B is split (standard non-swap config)
@@ -108,27 +90,17 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     // So num_m_blocks_per_rank must be even (divisible by 2).
     const int num_m_blocks_mc2 = (m_per_rank + 128 - 1) / 128;
     const bool m_blocks_even = (num_m_blocks_mc2 % 2 == 0);
+    const bool prefer_mc2_cluster = (m_per_rank >= 128 && m_blocks_even);
 
-    // Megatron-SP 中大 shape 特化：
-    // 对 m_per_rank=2048, n=7168, k=2048 一类 case，multicast=2 的 cluster 协作开销会放大，
-    // 实测可能吞掉 fused 收益。此处优先关闭 multicast，避免 2-CTA cluster 额外同步/调度成本。
-    const bool prefer_mc1_for_mid_shape = (k <= 2048 && m_per_rank <= 2048 && n >= 7168);
-    // K-heavy 中大shape（例如 4096x4096x7168）在 B 卡上有时受 2-CTA cluster 协作开销影响，
-    // 尝试关闭 multicast 观察 fused 的端到端收益是否更好。
-    const bool prefer_mc1_for_k_heavy_mid_shape = (k >= 7168 && n <= 4096 && m_per_rank <= 4096);
-
-    if (!(prefer_mc1_for_mid_shape || prefer_mc1_for_k_heavy_mid_shape) && m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
-        // Enough tiles for multicast=2, block_m=128, and M-blocks are even
+    if (prefer_mc2_cluster) {
         block_m = 128;
         num_multicast = 2;
     } else if (m_per_rank >= 128) {
-        // block_m=128 but not enough tiles for multicast=2
-        // or explicitly prefer multicast=1 for selected mid-shapes.
+        // Fallback when M-block pairing for cluster is not possible
         block_m = 128;
         num_multicast = 1;
     } else {
-        // Very small M (< 128 tokens per rank): use block_m=128 anyway
-        // with multicast=1, the GEMM portion will just be underutilized
+        // Very small M (< 128 tokens per rank): use block_m=128 with multicast=1
         block_m = 128;
         num_multicast = 1;
     }
@@ -163,8 +135,13 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const int smem_fixed = smem_cd + smem_barriers_fixed + smem_comm + smem_comm_barriers + 256;  // +256 for alignment
     const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + barriers_per_stage * 8;
 
-    const int num_stages = (SM100ArchSpec::smem_capacity - smem_fixed) / smem_per_stage;
+    int num_stages = (SM100ArchSpec::smem_capacity - smem_fixed) / smem_per_stage;
     DG_HOST_ASSERT(num_stages >= 2);
+
+    // mc=2 主线下对小K+大N场景降低stage深度，减少流水线启动/同步开销。
+    if (num_multicast == 2 && k <= 2048 && n >= 7168 && m_per_rank <= 2048) {
+        num_stages = std::max(2, std::min(num_stages, 6));
+    }
 
     const int smem_size = smem_fixed + num_stages * smem_per_stage;
 
