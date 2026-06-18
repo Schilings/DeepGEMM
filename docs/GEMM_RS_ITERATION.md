@@ -266,14 +266,53 @@ P2P load → 更多 outstanding 请求 → 更高 NVLink 有效带宽。这是 l
 
 ---
 
-## 下一步计划（核心：TMA-engine overlap，冲 >1.0x）
+## 2026-06-18：Iteration 8 — 跨卡传输 fused 进 epilogue（push-scatter），冲 >1.0x（保留）
 
-1. **TMA 流水线 reduce**：用 `cp.async.bulk`(`tma_load_1d`) 把远端 slot[R] 的**连续段**异步搬进 smem
-   多级 buffer（chunk 在 slot 内是 [token][hidden] 行连续 → 可纯 1D bulk copy，无需 2D 描述符/strided
-   gather），SM 仅做 FP32 加法 → 把 NVLink 搬运从 LSU 移到 TMA 引擎。先验证 SM100 远端 P2P TMA load。
-2. 让 reduce 与 GEMM 真正共驻 overlap（GEMM 让出少量 smem/warp 槽，reduce TMA 不抢 tensor core）。
-3. 继续 `K=7168` 弱势点定向优化。
-4. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
+### 决策依据（实测物理结论）
+
+Iter 6/7 后又做了两组实验，**证明分离 reduce kernel 在本硬件结构性无法 overlap**：
+- **SM carveout**（切 SM 给 reduce）：零和——GEMM tensor 吞吐降 C/148，延迟-bound 的 reduce 又需很多 SM，
+  代数最优点 fused ≈ 串行甚至更差（大小 shape 均验证）。
+- **smem reserve 让 reduce 共驻**：单调更差。根因——GEMM 用 `__launch_bounds__(256,1)` 独占寄存器，
+  独立 reduce 要共驻须把 GEMM 寄存器砍半 → spilling（正是要避免的）。
+- 每种配置实测 fused ≈ GEMM + reduce_tail，**零 overlap**。
+
+结论：`separate = GEMM + NCCL_RS`，要 >1.0x 必须让 RS **藏进 GEMM**。唯一可行 = **把跨卡 NVLink 传输
+放进 GEMM epilogue 用 TMA async store，与后续 tile 的 MMA 重叠**；reduce 只读「本地」已汇聚 partial。
+这正是 Flux 融合 GemmRS 让 comm 藏进 compute 的本质（也是本仓库历史 push-v3 实测 1.10x 的架构）。
+
+### Change（仅改 epilogue 目标指针 + reduce 读本地，非大重写）
+
+- `impls/sm100_bf16_gemm_rs.cuh` epilogue：每个 tile（我对 chunk dst_rank 的 partial）经 `tma_store_1d`
+  **push 到 dst_rank 的 buffer slot[rank_idx]**（`sym_buffer.map` 到 dst；self 即本地），
+  并置 dst_rank 的 `flag[rank_idx][m][n]`（`st_rel_sys`）。跨卡传输由 TMA 引擎发射、与 MMA 重叠。
+- `impls/sm100_rs_reduce.cuh`：reduce 改为**纯本地**累加——各 src 已把对本 rank chunk 的 partial
+  push 进本地 slot[s]，故 `slot_base[s]/flag_base[s]` 直接取本地（去掉 `map`），poll 本地 flag
+  （release.sys 由 peer 写入）→ 本地 FP32 求和 → output → reset 本地 flag。本地 HBM，极快。
+
+### Result
+
+- 正确性：`tests/test_gemm_rs.py 2` → **6/6 PASS, max_diff=0.0**。
+- 性能（2 GPU，6 iter，13 shape）：geo_mean **0.964x vs torch / 0.973x vs sep**，avg fused **1054T**
+  （Iter 7 的 0.835x/906T → 0.964x/1054T，**+0.13x**）。
+  **多个 shape 已 >1.0x**：16384x7168x4096 **1.09x**、8192x4096x4096 1.06x、8192x7168x4096 1.05x、
+  4096x7168x4096 1.04x、16384x7168x4096... (vs sep)。
+- 弱势点：小 K（2048x7168x2048 0.83x、4096x7168x2048 0.89x，GEMM 短→本地 reduce tail 占比大）；
+  超大 N·K（16384x7168x7168 0.95x，push 体量大、NVLink 接近饱和）。
+
+### Verdict
+
+- **保留**。这是冲过 1.0x 的关键架构步（单步 +0.13x，多 shape 破 1.0x）。
+- 本会话累计：**0.61x → 0.973x（vs sep），660T → 1054T**。
+
+---
+
+## 下一步计划（把 geo_mean 推过 1.0x）
+
+1. **小 K 弱势点**：本地 reduce tail 占比大 → 现在 reduce 又快又只读本地，尝试让它与 GEMM 共驻
+   overlap（本地读不抢 NVLink，可能终于有效），或进一步精简本地 reduce。
+2. **超大 N·K**：epilogue push 体量大，优化 TMA store 调度/分摊使其更好地被 MMA 掩盖。
+3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---
 

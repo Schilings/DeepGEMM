@@ -13,18 +13,19 @@
   独立 RS reduce kernel 从远端 pull）。详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
 - **正确性**：`tests/test_gemm_rs.py 2` → **6/6 PASS，max_diff=0.0**（逐元素精确匹配参考）。
   （修复了一处 nvlink_barrier 死锁：移除了与对端信号竞争的 per-call barrier memset。）
-- **性能（2 GPU，13 shape）**：geo_mean **0.835x vs torch / 0.836x vs sep**，fused 平均 **906T**
-  （本会话起点 0.606x / 660T）。单 shape 0.77~0.87x（最差点从 0.51x 提升到 0.77x）。
-  - **Iteration 5（高 MLP reduce 重写）**：reduce 原为延迟/occupancy-bound（MLP≈2），重写为预计算固定
-    远端基址 + 每线程 `kUnroll=8` 批量发射 P2P load（MLP 高）。→ 0.733x / 814T。
-  - **Iteration 6**：确认 SM carveout 对 SM-based reduce 是零和死胡同（`DG_RS_REDUCE_SMS` 保留默认 0）。
-  - **Iteration 7（reduce grid 过订阅 ×2）**：reduce 在 GEMM 后跑、SM 全空，每 SM 多 block → 更多 warp
-    并发发射 P2P load → 更高 NVLink 有效带宽。`DG_RS_REDUCE_MULT` 默认 2。→ **0.835x / 906T**。
-  详见 `GEMM_RS_ITERATION.md`(Iteration 5/6/7)。
-- **架构收敛**：既然对齐 Flux（单机 RS = pull），**已删除 push 路径**（旧 `v3`/compute kernel、
-  `gemm_rs_compute` API、相关 test/bench）。主线唯一实现 = pull，`DG_GEMM_RS_IMPL` 开关已移除。
-- 下一步（冲 >1.0x）：把跨卡搬运从 SM/LSU 移到 **TMA 引擎**（`cp.async.bulk` 异步 fetch 远端连续段 →
-  smem，SM 仅做加法），并与 GEMM 真正共驻 overlap（对齐 Flux `Sm90ReduceScatterDma`）。
+- **性能（2 GPU，13 shape）**：geo_mean **0.964x vs torch / 0.973x vs sep**，fused 平均 **1054T**
+  （本会话起点 0.606x / 660T）。**多个 shape 已 >1.0x**（16384x7168x4096 1.09x、8192x4096x4096 1.06x 等，vs sep）。
+  - **Iter 5（高 MLP reduce）**：预计算固定基址 + kUnroll=8 批量发射。→ 0.733x / 814T。
+  - **Iter 6**：确认 SM carveout 对 SM-based reduce 是零和死胡同。
+  - **Iter 7（reduce grid 过订阅 ×2）**：`DG_RS_REDUCE_MULT` 默认 2。→ 0.835x / 906T。
+  - **Iter 8（跨卡传输 fused 进 epilogue，push-scatter）**：实测证明分离 reduce kernel 结构性无法 overlap
+    （carveout 零和；共驻需砍 GEMM 寄存器→spilling）。唯一 >1.0x 路径 = 把 NVLink 传输放进 GEMM
+    epilogue 用 TMA async store 与 MMA 重叠，reduce 只读本地汇聚 partial。→ **0.964x / 1054T**。
+  详见 `GEMM_RS_ITERATION.md`(Iteration 5–8)。
+- **架构**：主线 = 真·融合 GEMM-RS——epilogue **push-scatter**（TMA 跨卡 store 与 MMA 重叠）+ 本地 reduce。
+  （注：跨卡传输融进 epilogue 是单机 NVLink 上唯一能让 RS 藏进 compute、从而 >1.0x 的方式；
+  与 Flux 融合 GemmRS 让 comm overlap compute 同源。）
+- 下一步：把 geo_mean 推过 1.0x —— 小 K（本地 reduce tail 占比大）+ 超大 N·K（push 体量大）定向优化。
 
 ---
 

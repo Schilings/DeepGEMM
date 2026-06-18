@@ -121,7 +121,14 @@ static GemmRSComputeConfig get_gemm_rs_compute_config(const int& m, const int& n
     const int smem_fixed = smem_cd + smem_barriers_fixed + 256;
     const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + barriers_per_stage * 8;
 
-    const int num_stages = (SM100ArchSpec::smem_capacity - smem_fixed) / smem_per_stage;
+    // Optionally reserve smem headroom so that a separate RS-reduce block can become
+    // CO-RESIDENT on the same SM as the GEMM block (enabling true compute/comm overlap).
+    // By default the GEMM fills all of smem (max stages) → no room for a 2nd resident block,
+    // so the reduce can only run in the GEMM tail (no overlap). DG_GEMM_RS_RESERVE_SMEM_KB
+    // caps the GEMM stage count to leave `KB` KiB free for the reduce kernel.
+    const int reserve_bytes = get_env<int>("DG_GEMM_RS_RESERVE_SMEM_KB", 0) * 1024;
+    const int avail_smem = SM100ArchSpec::smem_capacity - reserve_bytes;
+    const int num_stages = (avail_smem - smem_fixed) / smem_per_stage;
     DG_HOST_ASSERT(num_stages >= 2);
 
     const int smem_size = smem_fixed + num_stages * smem_per_stage;

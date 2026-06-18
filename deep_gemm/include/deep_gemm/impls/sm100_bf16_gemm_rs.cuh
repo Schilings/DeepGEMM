@@ -350,11 +350,13 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 4~7 (Epilogue): TMEM → smem → LOCAL scatter write + local flag
+    //  Warp 4~7 (Epilogue): TMEM → smem → PUSH (remote TMA store) + remote flag
     // ════════════════════════════════════════════════════════════════
     //
-    //  Flux-style scatter write: 把每个 tile 按 dst_rank 写到「本地」slot[dst_rank]，
-    //  不跨 NVLink。RS reduce kernel 之后从远端拉取(pull)并 reduce。
+    //  Fused RS scatter: 每个 tile(我对 chunk dst_rank 的 partial) 经 TMA async store 推到
+    //  dst_rank 的 buffer slot[rank_idx]，并置 dst_rank 的 flag[rank_idx][m][n]。
+    //  跨卡 NVLink 传输由 TMA 引擎发射、与后续 tile 的 MMA 重叠（这是 fused 跑赢 separate 的关键）；
+    //  之后各 rank 的 RS reduce 只读「本地」已汇聚的 slot[0..R] 求和 → output（本地 HBM，极快）。
     //
     else if (warp_idx >= kEpilogueWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumEpiRegisters>();
@@ -438,10 +440,15 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
                             auto* smem_row = smem_base_ptr + row * kRowBytesPerNSlice;
 
-                            // PULL: always write to LOCAL slot[dst_rank] (no remote push, no output write).
-                            auto* local_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                dst_rank, global_row, base_col);
-                            ptx::tma_store_1d(reinterpret_cast<void*>(local_ptr), smem_row, kRowBytesPerNSlice);
+                            // PUSH (overlap with MMA): TMA async-store my partial for chunk dst_rank
+                            // into dst_rank's buffer slot[rank_idx]. The cross-card NVLink transfer
+                            // is issued by the TMA engine here and overlaps with subsequent tiles'
+                            // MMA — this is what lets the fused path beat the separate baseline.
+                            // For self (dst_rank == rank_idx) the map returns a local pointer.
+                            auto* slot_ptr = workspace.get_partial_ptr<comm_dtype_t>(
+                                rank_idx, global_row, base_col);
+                            auto* push_ptr = sym_buffer.map(slot_ptr, dst_rank);
+                            ptx::tma_store_1d(reinterpret_cast<void*>(push_ptr), smem_row, kRowBytesPerNSlice);
                         }
 
                         cute::tma_store_arrive();
@@ -451,13 +458,15 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 }
             }
 
-            // Wait all TMA stores complete, then set LOCAL ready flag (system scope visible to peers)
+            // Wait all TMA stores (incl. the remote push) complete, then set the ready flag
+            // on dst_rank's buffer: flag[rank_idx][m][n] (release.sys, visible to dst's reduce).
             ptx::tma_store_wait<0>();
             cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                auto* local_flag_ptr = workspace.get_ready_ptr(dst_rank, local_m_block_idx, n_block_idx);
-                ptx::st_rel_sys(local_flag_ptr, 1u);
+                auto* flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
+                auto* push_flag = sym_buffer.map(flag_ptr, dst_rank);
+                ptx::st_rel_sys(push_flag, 1u);
             }
         }
     }

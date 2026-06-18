@@ -17,16 +17,18 @@ using namespace deep_gemm::math;
 //  sm100_rs_reduce_impl — TRUE Flux PULL-based RS Reduce kernel (Part 2)
 // ============================================================================================
 //
-//  Independent kernel that PULLS partial results from all ranks and reduces into the final
-//  output. Runs on a separate CUDA stream, overlapping with the GEMM compute kernel.
+//  Independent kernel that reduces the LOCAL partials gathered by the fused PUSH epilogue.
+//  Runs on a separate CUDA stream after the GEMM kernel.
 //
-//  Pull model (aligned with Flux Sm90ReduceScatterDma):
-//    The GEMM kernel only wrote LOCAL scatter buffer slot[dst_rank] + set LOCAL per-tile flag.
+//  Fused-push model:
+//    Each src rank s already TMA-pushed (in its GEMM epilogue, overlapped with MMA) its
+//    partial for THIS rank's chunk into our LOCAL buffer slot[s], and set our LOCAL flag[s].
 //    Here rank R, for each tile of its own chunk:
-//      1. polls every src rank's REMOTE flag[R][m][n] (mapped via sym_buffer.map),
-//      2. FP32-accumulates every src rank's REMOTE slot[R] (self maps back to local),
+//      1. polls every src rank's LOCAL flag[s][m][n] (set via release.sys by the peer push),
+//      2. FP32-accumulates every src rank's LOCAL slot[s] (pure HBM, no NVLink),
 //      3. writes the final output,
-//      4. resets the remote flags it consumed (Flux wait_eq_reset semantics).
+//      4. resets the local flags it consumed (single producer = peer s's GEMM, single
+//         consumer = this reduce → no race).
 //
 //  Performance design (high memory-level parallelism):
 //    * The per-src mapped base pointers to slot[R] (elem 0) and flag[R] are CONSTANT for the
@@ -72,16 +74,18 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
     constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
 
     // ── Precompute per-src CONSTANT base pointers (hoisted out of the hot loop) ──
-    // slot_base[s] : remote pointer to src rank s's scatter slot[rank_idx] element (0,0).
-    // flag_base[s] : remote pointer to src rank s's ready-flag array for slot[rank_idx] (block 0,0).
+    // In the PUSH/fused model every src rank s has already TMA-pushed its partial for THIS
+    // rank's chunk into our LOCAL buffer slot[s], and set our LOCAL flag[s]. So the reduce is
+    // a pure LOCAL accumulation (HBM, no NVLink) — the cross-card cost was already paid in the
+    // GEMM epilogue, overlapped with MMA.
+    //   slot_base[s] : LOCAL pointer to slot[s] element (0,0).
+    //   flag_base[s] : LOCAL pointer to the ready-flag array for slot[s] (block 0,0).
     const comm_dtype_t* slot_base[kNumRanks];
     uint32_t* flag_base[kNumRanks];
     #pragma unroll
     for (uint32_t s = 0; s < kNumRanks; ++ s) {
-        slot_base[s] = sym_buffer.map(
-            workspace.get_partial_ptr<comm_dtype_t>(rank_idx, 0, 0), s);
-        flag_base[s] = reinterpret_cast<uint32_t*>(sym_buffer.map(
-            workspace.get_ready_ptr(rank_idx, 0, 0), s));
+        slot_base[s] = workspace.get_partial_ptr<comm_dtype_t>(s, 0, 0);
+        flag_base[s] = workspace.get_ready_ptr(s, 0, 0);
     }
 
     // Process tiles assigned to this CTA
