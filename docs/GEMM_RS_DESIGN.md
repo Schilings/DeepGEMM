@@ -15,14 +15,34 @@
 
 ---
 
-## 2. 主线实现
+## 2. 主线实现（真·Flux pull 式 dual-kernel）
 
-- **算子入口**：`deep_gemm.bf16_gemm_rs_nt`
-- **核心实现**：`deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`
+自 2026-06-18 起，主线由「单 kernel push + in-kernel reduce」重构为
+**真·Flux pull 式双 kernel**（对齐 Flux 的 `Sm90AuxStoreReduceScatter` + `Sm90ReduceScatterDma`）：
+
+- **算子入口**：`deep_gemm.bf16_gemm_rs_nt`（默认 `DG_GEMM_RS_IMPL=pull`）
+- **Kernel 1（GEMM compute）**：`deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`
+  - 256T(8 warps)，无 comm warps（消除旧 384T 的寄存器 spilling）；
+  - epilogue 纯本地 scatter write：tile 按 `dst_rank` 写本地 `slot[dst_rank]` + 置本地 ready flag；
+  - **GEMM epilogue 不跨 NVLink**（核心收益）。
+- **Kernel 2（RS reduce, pull）**：`deep_gemm/include/deep_gemm/impls/sm100_rs_reduce.cuh`（`kPullBased=true`）
+  - rank R 对自身 chunk 每个 tile：poll 各 src 的远端 flag → 累加各 src 的远端 `slot[R]`（FP32）→ 写 output → 远端 reset flag。
 - **JIT 运行时**：`csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp`
-- **Python 接口**：`deep_gemm/gemm_rs/__init__.py`
+  - dual-kernel 编排：`compute_stream` 跑 GEMM、`comm_stream` 跑 pull reduce、CUDA event 同步实现流级 + tile 级 overlap。
+- **RS reduce 运行时**：`csrc/jit_kernels/impls/sm100_rs_reduce.hpp`（`pull_based` 开关；push v3 复用同一 runtime）。
+- **Python 接口**：`deep_gemm/gemm_rs/__init__.py`（`pull` 默认；`v3/push` 为旧 push dual-kernel 备选）。
 - **测试**：`tests/test_gemm_rs.py`、`tests/test_gemm_rs_quick.py`
 - **性能脚本**：`benchmarks/bench_gemm_rs.py`
+
+### 数据 / flag 契约
+
+- 每 rank 计算完整 partial `[total_m=num_ranks*m_per_rank, N]`，按 M 切成 num_ranks 个 chunk。
+- GEMM(r) 把 chunk-for-d 写本地 `slot[d]` 并置本地 `flag[d][m][n]`；
+- Reduce(R) 读各 src 的远端 `slot[R]`（`sym_buffer.map`，self 映射回本地）求和 → output。
+- 跨迭代正确性：GEMM 起始 `nvlink_barrier` + host event 门控，保证「上一轮所有 reduce(含远端 reset) 完成 → 本轮 set」。
+
+> 通信通道选型：单机 NVLink 下采用 **P2P 直读 `sym_buffer.map`**（pull）而非 host CE DMA，
+> 以获得 tile 级细粒度 overlap，并把跨卡通信全部移出 GEMM epilogue 关键路径。
 
 ---
 

@@ -2,6 +2,12 @@
 
 > ⚠️ 历史研究文档：用于架构参考，不代表当前代码状态。
 > 当前真实进度请以 `docs/PROGRESS.md` 为准。
+>
+> 📌 落地更新（2026-06-18）：本文档第 5 节的「双 kernel」方向已落地为主线，
+> 并进一步采用**真·Flux pull 式**（GEMM epilogue 纯本地 scatter write + 独立 RS reduce
+> kernel 从远端 pull），而非方案 C 的 host CE DMA。实现细节见 `GEMM_RS_DESIGN.md`，
+> 迭代记录见 `GEMM_RS_ITERATION.md`(Iteration 3)。注意通信通道选型与本文 5.3 推荐不同：
+> 单机 NVLink 下直接用 `sym_buffer.map` P2P 直读(pull)，以获得 tile 级细粒度 overlap。
 
 > 研究日期：2026-06-15
 > 目标：分析 ByteDance Flux (SM90 Hopper) GEMM+RS 架构原理，提取可借鉴到 DeepGEMM (SM100 Blackwell) 的设计思想

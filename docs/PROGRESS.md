@@ -1,6 +1,6 @@
 # DeepGEMM GEMM-RS 进度（唯一主线）
 
-> 最后更新：2026-06-18 04:56
+> 最后更新：2026-06-18 07:18
 > 分支：`main`
 > 口径：仅保留当前上线主线 `bf16_gemm_rs_nt`
 
@@ -8,9 +8,14 @@
 
 ## 当前结论（本机实测）
 
-- **主线 GEMM-RS 正确性稳定**：`tests/test_gemm_rs.py 2` 通过（6/6）。
-- **benchmark 口径已固定为用户指定 13 shape**，并单独追踪重点 5 个中大 shape。
-- 本轮迭代以 Megatron SP 中大 shape 为主目标；`flux` GEMM-RS（H 卡）作为方法学参考，在 B 卡做适配验证。
+- **【架构重构，进行中】** 主线 `bf16_gemm_rs_nt` 已重构为**真·Flux pull 式 dual-kernel**
+  （GEMM 256T 无 comm warps + epilogue 纯本地 scatter write；独立 RS reduce kernel 从远端 pull）。
+  详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
+- **状态**：C++ 扩展编译通过、已 commit & push；首轮 `tests/test_gemm_rs.py 2` 进程异常退出
+  （崩溃栈落在 `CUDASymmetricMemory` 析构处，疑为上游 kernel 运行期错误/超时），**正在排查 root cause**。
+- 旧 push 式 dual-kernel 仍可通过 `DG_GEMM_RS_IMPL=v3`（或 `push`）回退使用。
+- 历史基线（push 路径）：`tests/test_gemm_rs.py 2` 6/6 通过；geo mean ≈ 1.10x。
+  pull 路径基线待跑通正确性后重测。
 
 ---
 
@@ -88,6 +93,9 @@ python benchmarks/bench_gemm_rs.py 2 4
 
 ## 下一步（正在执行）
 
-1. 继续压低 `K=7168` 弱势点（重点 `4096x4096x7168`）。
-2. 保持重点 5 shape 为主目标集合，优先提升其几何均值。
-3. 每轮收益落盘并立即 `commit + push`（防止实例中断丢进度）。
+1. **排查 pull 路径首轮 2-GPU 运行期错误**：抓首屏真实报错（kernel assert / nvlink barrier timeout / IMA），
+   定位 pull 同步或寻址问题，跑通 `tests/test_gemm_rs.py 2`（目标 6/6）。
+2. 跑通后用 `bench_gemm_rs.py` 重测 pull 基线，与旧 push(v3) 对比；验证 GEMM 吞吐是否因消除
+   寄存器 spilling 而显著提升。
+3. 继续压低 `K=7168` 弱势点（重点 `4096x4096x7168`）。
+4. 每轮收益落盘并立即 `commit + push`（防止实例中断丢进度）。

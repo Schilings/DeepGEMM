@@ -1,6 +1,6 @@
 # GEMM-RS 会话接班记忆（主线）
 
-> 最后更新：2026-06-18 04:56
+> 最后更新：2026-06-18 07:18
 > 目标：新会话 5 分钟内无缝接手。
 
 ---
@@ -18,6 +18,12 @@
 ## B. 当前关键事实
 
 - 当前口径是唯一主线：`bf16_gemm_rs_nt`。
+- **【最新】主线已重构为真·Flux pull 式 dual-kernel**（2026-06-18, Iteration 3）：
+  - Kernel 1 `sm100_bf16_gemm_rs.cuh`：256T 无 comm warps，epilogue 纯本地 scatter write `slot[dst_rank]` + 本地 flag；
+  - Kernel 2 `sm100_rs_reduce.cuh`（`kPullBased=true`）：从各远端 rank pull `slot[R]` 做 FP32 reduce → output，读后远端 reset flag；
+  - host `sm100_bf16_gemm_rs.hpp` 双流编排（compute_stream + comm_stream + event）。
+  - 旧 push dual-kernel 仍可 `DG_GEMM_RS_IMPL=v3/push` 回退。
+- **当前状态**：已编译 + push；首轮 `test_gemm_rs.py 2` 崩在 `CUDASymmetricMemory` 析构（上游 kernel 错误的下游表现），**正在排查 root cause**，尚未跑通正确性。
 - shape 集合已固定为用户指定 13 个，重点 5 个 shape 单独追踪。
 - 学习方向：参考 `flux` GEMM-RS（H 卡稳定上线），在 B 卡做策略适配。
 - 主线策略：按 `SM100_2CTA_CLUSTER`，中大 shape 优先 `mc=2`（2-CTA cluster）。
@@ -52,15 +58,17 @@ python benchmarks/bench_gemm_rs.py 2 5
 
 ## D. 当前基线摘要
 
-- 指定 13 shape（2 GPU，3 iter）：**geo mean ≈ 1.110x（vs torch） / 1.100x（vs sep）**
-- 重点 5 shape（2 GPU，4 iter）：**geo mean ≈ 1.174x（vs torch） / 1.161x（vs sep）**
-- 当前短板：`2048x7168x2048`（约 `0.98x vs torch / 0.98x vs sep`）
-- 重点集最弱点：`4096x4096x7168`（约 `1.05x`）
+- **历史基线为旧 push 路径**（`DG_GEMM_RS_IMPL=v3` 可复现）：
+  - 指定 13 shape（2 GPU，3 iter）：geo mean ≈ 1.110x（vs torch） / 1.100x（vs sep）
+  - 重点 5 shape（2 GPU，4 iter）：geo mean ≈ 1.174x（vs torch） / 1.161x（vs sep）
+  - 短板：`2048x7168x2048` ≈ 0.98x；重点集最弱 `4096x4096x7168` ≈ 1.05x
+- **新 pull 路径基线：待跑通正确性后重测**（预期 GEMM 吞吐因消除 384T 寄存器 spilling 而提升）。
 
 ---
 
 ## E. 下一步最短路径
 
-1. 继续针对 `K=7168` 场景做定向优化。
-2. 每次改动后先跑重点 5 shape，确认主目标集合不退化。
-3. 阶段性立即 `commit + push`，避免服务器回收导致进度丢失。
+1. **排查 pull 路径 2-GPU 运行期错误**（首屏真实报错：kernel assert / nvlink barrier timeout / IMA），跑通 `test_gemm_rs.py 2`。
+2. 跑通后跑 `bench_gemm_rs.py` 重测 pull 基线，与 push(v3) 对比。
+3. 继续针对 `K=7168` 场景定向优化；每次改动先跑重点 5 shape 防回退。
+4. 阶段性立即 `commit + push`，避免服务器回收导致进度丢失。

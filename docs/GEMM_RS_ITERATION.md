@@ -84,17 +84,62 @@
 
 ---
 
+## 2026-06-18：Iteration 3 — 重构为真·Flux pull 式 dual-kernel（进行中）
+
+### Change
+
+把主线 `sm100_bf16_gemm_rs.cuh` 从「单 kernel push + in-kernel reduce」彻底重构为
+**真·Flux pull 式 dual-kernel**，对齐 Flux 的
+`Sm90AuxStoreReduceScatter`(GEMM 写本地 scatter buffer) + `Sm90ReduceScatterDma`(独立 kernel 从远端 pull)：
+
+- `impls/sm100_bf16_gemm_rs.cuh`（Kernel 1, GEMM compute）：
+  - 256T(8 warps)，**移除 comm warps**（旧版 384T → 寄存器 spilling 的根因被消除）；
+  - epilogue **纯本地 scatter write**：每个 tile 按 `dst_rank` 写到本地 `slot[dst_rank]`，
+    置**本地** per-tile ready flag（`st_rel_sys`，system scope 可被 peer 读到）；
+  - GEMM epilogue **不再跨 NVLink**（这是相对 push 式 v3 的核心收益）。
+- `impls/sm100_rs_reduce.cuh`：新增 `kPullBased` 模板分支：
+  - rank R 对自身 chunk 每个 tile，poll 各 src rank 的**远端** `flag[R][m][n]`（`sym_buffer.map` 到 src）；
+  - FP32 累加各 src 的**远端** `slot[R]`（map P2P，self 映射回本地）→ 写 output；
+  - 读完后远端 reset flag（Flux `wait_eq_reset` 语义）。
+- `jit_kernels/impls/sm100_bf16_gemm_rs.hpp`：改为 dual-kernel pull 编排
+  （compute_stream 跑 GEMM + comm_stream 跑 pull reduce + event 同步），复用 `GemmRSComputeConfig`。
+- `jit_kernels/impls/sm100_rs_reduce.hpp`：把 `pull_based` 透传到 Args/generate_impl（push v3 路径不受影响）。
+- `deep_gemm/gemm_rs/__init__.py`：默认路由切到 pull；保留 `DG_GEMM_RS_IMPL=v3/push` 旧 push 路径可选。
+
+跨迭代正确性：GEMM 起始 `nvlink_barrier` + host 端 `cudaStreamSynchronize(comm_stream)`/event 门控，
+保证「上一轮所有 rank 的 reduce(含远端 reset) 完成 → 本轮才 set flag」，杜绝 stale flag 读。
+
+### Result
+
+- C++ 扩展 `python3 setup.py build_ext` **编译通过**（host 侧），代码已 commit & push。
+- 首轮 2-GPU 正确性测试 `tests/test_gemm_rs.py 2`：进程异常退出（崩溃栈落在
+  `CUDASymmetricMemory` 析构处，通常是上游 kernel 运行期错误/超时的下游表现），**root cause 排查中**。
+
+### Verdict
+
+- **进行中**（pending）。下一步：抓取首屏真实报错（kernel assert / barrier timeout / IMA），
+  定位 pull 路径的同步或寻址问题后复测。
+
+---
+
 ## 下一步计划
 
-1. 在稳定内核上继续做 `K=7168` 弱势点定向优化（尤其 `4096x4096x7168`）；
-2. 设计“RS 本地缓冲 TMA fetch”可开关原型（先 2-rank 路径）；
-3. 每轮迭代都按本文件模板沉淀：**Change / Result / Verdict**。
+1. 排查 Iteration 3 的 2-GPU 运行期错误，跑通 `tests/test_gemm_rs.py 2`（6/6）；
+2. 跑通后用 `bench_gemm_rs.py` 复测 pull 路径，与旧 push(v3) 基线对比；
+3. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化；
+4. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---
 
 ## 本轮涉及文件
 
 - `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`
+- `deep_gemm/include/deep_gemm/impls/sm100_rs_reduce.cuh`
+- `csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp`
+- `csrc/jit_kernels/impls/sm100_rs_reduce.hpp`
+- `deep_gemm/gemm_rs/__init__.py`
 - `docs/PROGRESS.md`
+- `docs/GEMM_RS_DESIGN.md`
+- `docs/SESSION_MEMORY.md`
 - `docs/FLUX_GEMM_RS_STUDY.md`
 - `docs/GEMM_RS_ITERATION.md`
