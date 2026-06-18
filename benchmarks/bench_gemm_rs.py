@@ -66,6 +66,14 @@ SHAPES_STANDARD = [
     (20480, 7168, 2048),
 ]
 
+single_shape = os.getenv("DG_BENCH_SINGLE_SHAPE", "").strip()
+if single_shape:
+    m_str, n_str, k_str = [x.strip() for x in single_shape.split(",")]
+    SHAPES_TO_RUN = [(int(m_str), int(n_str), int(k_str))]
+else:
+    max_shapes = int(os.getenv("DG_BENCH_MAX_SHAPES", "0"))
+    SHAPES_TO_RUN = SHAPES_STANDARD[:max_shapes] if max_shapes > 0 else SHAPES_STANDARD
+
 
 def flush_l2():
     """Flush GPU L2 cache by allocating and zeroing a large tensor."""
@@ -84,9 +92,13 @@ def compute_comm_bytes(tokens_per_rank, n_dim, num_ranks, dtype_bytes=2):
 
 
 def bench_fn(fn, num_warmup=5, num_iters=20, barrier_group=None):
+    sync_each_iter = bool(int(os.getenv("DG_BENCH_SYNC_EACH_ITER", "0")))
+
     # Warmup
     for _ in range(num_warmup):
         fn()
+        if sync_each_iter:
+            torch.cuda.synchronize()
     torch.cuda.synchronize()
     if barrier_group is not None:
         dist.barrier(barrier_group)
@@ -103,6 +115,8 @@ def bench_fn(fn, num_warmup=5, num_iters=20, barrier_group=None):
     start.record()
     for _ in range(num_iters):
         fn()
+        if sync_each_iter:
+            torch.cuda.synchronize()
     end.record()
     torch.cuda.synchronize()
 
@@ -134,7 +148,7 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
     results = []
 
-    for tokens_per_rank, n_dim, k_dim in SHAPES_STANDARD:
+    for tokens_per_rank, n_dim, k_dim in SHAPES_TO_RUN:
         total_m = tokens_per_rank * num_ranks
         max_tokens_per_rank = tokens_per_rank
 
@@ -237,7 +251,19 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
                   f"{tflops_separate:>8.1f}T {tflops_v1_str} {tflops_v3_str} | "
                   f"{v1_str:>10} {v3_str:>10}")
 
-        sym_buffer.destroy()
+        # Ensure async kernel failures are surfaced before symmetric memory teardown.
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            if rank_idx == 0:
+                print(f"  CUDA sync failed for {tokens_per_rank}x{n_dim}x{k_dim}: {e}")
+
+        dist.barrier()
+        try:
+            sym_buffer.destroy()
+        except Exception as e:
+            if rank_idx == 0:
+                print(f"  sym_buffer.destroy failed for {tokens_per_rank}x{n_dim}x{k_dim}: {e}")
         dist.barrier()
 
     # -- Summary --
@@ -303,6 +329,10 @@ def run_benchmark(local_rank: int, num_local_ranks: int, num_iters: int = 20):
 
     dist.barrier()
     dist.destroy_process_group()
+
+    # Avoid CUDA object destructor ordering issues at Python shutdown in mp workers.
+    time.sleep(0.5)
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ public:
                             "--ptxas-options=--register-usage-level=10",
                             get_env<int>("DG_JIT_CPP_STANDARD", 20));
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
-            flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
+            flags += " --ptxas-options=--verbose --ptxas-options=--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
     }
@@ -334,16 +334,21 @@ public:
         size_t log_size;
         DG_NVRTC_CHECK(nvrtcGetProgramLogSize(program, &log_size));
         if (get_env<int>("DG_JIT_DEBUG", 0) or compile_result != NVRTC_SUCCESS) {
-            if (compile_result != NVRTC_SUCCESS)
-                DG_HOST_ASSERT(log_size > 1);
             if (log_size > 1) {
                 std::string compilation_log(log_size, '\0');
                 DG_NVRTC_CHECK(nvrtcGetProgramLog(program, compilation_log.data()));
-                printf("NVRTC log: %s\n", compilation_log.c_str());
+                fprintf(stderr, "NVRTC log: %s\n", compilation_log.c_str());
+                fflush(stderr);
+            } else if (compile_result != NVRTC_SUCCESS) {
+                fprintf(stderr, "NVRTC log is empty (log_size=%zu)\n", log_size);
+                fflush(stderr);
             }
         }
 
         if (compile_result != NVRTC_SUCCESS) {
+            fprintf(stderr, "NVRTC compilation failed with error: %s\n", nvrtcGetErrorString(compile_result));
+            fprintf(stderr, "NVRTC source file: %s\n", code_path.c_str());
+            fflush(stderr);
             DG_NVRTC_CHECK(nvrtcDestroyProgram(&program));
             DG_HOST_ASSERT(false and "NVRTC compilation failed");
         }
