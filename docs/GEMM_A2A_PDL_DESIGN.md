@@ -1,5 +1,8 @@
 # GEMM + A2A + PDL Local Reduce: Alternative Architecture Design
 
+> ⚠️ 历史备选架构文档：仅用于方案参考，不代表当前主线实现。
+> 当前唯一主线进度与运行口径请以 `docs/PROGRESS.md` 为准。
+
 ## 1. 动机
 
 ### 1.1 V3 双核架构的 NVLink Barrier Bug
