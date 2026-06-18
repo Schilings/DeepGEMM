@@ -13,11 +13,14 @@
   独立 RS reduce kernel 从远端 pull）。详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
 - **正确性**：`tests/test_gemm_rs.py 2` → **6/6 PASS，max_diff=0.0**（逐元素精确匹配参考）。
   （修复了一处 nvlink_barrier 死锁：移除了与对端信号竞争的 per-call barrier memset。）
-- **性能（2 GPU，3 iter，13 shape）**：geo_mean **0.584x vs torch / 0.582x vs sep**，
-  fused 628.5T vs sep 1065.2T —— 当前慢，根因：pull reduce 用朴素标量 P2P 读 + 与 GEMM 抢 SM；
-  下一步改为 TMA 流水线 fetch（Flux `Sm90ReduceScatterDma` 风格）。
+- **性能（2 GPU，13 shape）**：geo_mean **0.733x vs torch / 0.739x vs sep**，fused 平均 **814T**
+  （Iteration 5 后；此前 0.58x / 660T）。单 shape 普遍 0.77~0.83x。
+  - **Iteration 5（高 MLP reduce 重写）**：诊断出 reduce 是延迟/occupancy-bound（MLP≈2），重写为
+    预计算固定远端基址 + 每线程 `kUnroll=4` 批量发射 P2P load（MLP=8），少量 SM 即可逼近带宽。
+    单步收益 +0.13x geo / +150T。详见 `GEMM_RS_ITERATION.md`(Iteration 5)。
 - **架构收敛**：既然对齐 Flux（单机 RS = pull），**已删除 push 路径**（旧 `v3`/compute kernel、
   `gemm_rs_compute` API、相关 test/bench）。主线唯一实现 = pull，`DG_GEMM_RS_IMPL` 开关已移除。
+- 仍待优化：reduce 已近带宽-bound，下一步评估 **SM carveout + tile 级 overlap**（`DG_RS_REDUCE_SMS`，默认 0）。
 
 ---
 

@@ -159,12 +159,51 @@
 
 ---
 
+## 2026-06-18：Iteration 5 — pull RS reduce 高 MLP 重写（大幅提速，保留）
+
+### 背景诊断（AKO4ALL profile 思路）
+
+先用 SM carveout 实验探因：把 GEMM 限制在 `num_sms-C` 个 SM、reduce 用 `C` 个 SM。
+结果 carveout **越切越慢**（C=8 时 fused 飙到 2949us）。由此测得 reduce 吞吐随 SM 数**近似线性**
+（C=8→2782us、16→1439、24→1032、32→775、全 SM→158us，约 24000 SM·us 恒定），
+说明 reduce 是**延迟/occupancy-bound（MLP 太低）而非带宽-bound**。
+推算「最优 carveout 切分」最优点 C≈73 也只有 ~329us，与串行 325us 持平 → **carveout 在 reduce 低效时无意义**。
+结论：真正瓶颈是 **reduce kernel 自身 MLP 太低**，必须先把它做成带宽-bound。
+
+### Change
+
+文件：`deep_gemm/include/deep_gemm/impls/sm100_rs_reduce.cuh`
+
+- **预计算固定基址**：slot[rank_idx] 的远端基址 `slot_base[s]` 与 flag 基址 `flag_base[s]` 对整个
+  kernel 恒定 → 提到 hot loop 外只算一次，消除 inner 循环里每元素的 `get_partial_ptr`（64 位乘法）+ `map`。
+- **高 MLP 批处理**：Phase 2 每线程一次性处理 `kUnroll=4` 个 128-bit 向量，先把全部
+  `kUnroll × kNumRanks` 个 P2P load 发射出去、再统一消费 → MLP 从 ≈kNumRanks(2) 提升到 8，
+  少量 SM 即可逼近 P2P 带宽。
+- `__launch_bounds__(kNumThreads, 2)`（给 unroll 让出寄存器，避免 spill）。
+- 同时在 host `sm100_bf16_gemm_rs.hpp` 加入 SM carveout 机制（`DG_RS_REDUCE_SMS`，**默认 0 关闭**），
+  留作 reduce 变成带宽-bound 后再评估 overlap。
+
+### Result
+
+- 正确性：`tests/test_gemm_rs.py 2` → **6/6 PASS, max_diff=0.0**。
+- 性能（2 GPU，13 shape）：geo_mean **0.733x vs torch / 0.739x vs sep**（此前 0.606x / 0.611x），
+  avg fused **814T**（此前 660T）。单 shape 普遍升到 **0.77~0.83x**。
+  （注：全量顺序 bench 里 `4096x7168x4096` 偶发 0.33x，单独复测稳定 0.81x，系顺序跑的 L2/NCCL 干扰噪声。）
+
+### Verdict
+
+- **保留**。MLP 重写是迄今最大单步收益（+0.13x geo / +150T）。
+- 下一步：reduce 已接近带宽-bound，可重新评估 **SM carveout + tile 级 overlap**；
+  并尝试 self-rank 走本地快路径、`kUnroll` 调参、cp.async 预取。
+
+---
+
 ## 下一步计划
 
-1. **核心**：把 pull RS reduce 从朴素标量 P2P 读改造为 **TMA 流水线 fetch+reduce**
-   （远端→smem 的 producer/consumer，对齐 Flux `Sm90ReduceScatterDma`），并优化 GEMM/reduce 的 SM 划分与重叠；
-2. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化；
-3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
+1. 重新评估 **SM carveout + 调度 overlap**（reduce 已高 MLP，少 SM 即可跑满带宽）；
+2. reduce 微调：`kUnroll` 扫参、self-rank 本地快路径、cp.async 预取远端 → smem；
+3. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化；
+4. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---
 

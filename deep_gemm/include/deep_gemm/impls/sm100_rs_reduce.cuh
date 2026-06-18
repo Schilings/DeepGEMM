@@ -26,11 +26,17 @@ using namespace deep_gemm::math;
 //      1. polls every src rank's REMOTE flag[R][m][n] (mapped via sym_buffer.map),
 //      2. FP32-accumulates every src rank's REMOTE slot[R] (self maps back to local),
 //      3. writes the final output,
-//      4. resets the remote flags it consumed (Flux wait_eq_reset semantics — each
-//         flag[R][*][*] is consumed by exactly one rank, so no cross-consumer race).
+//      4. resets the remote flags it consumed (Flux wait_eq_reset semantics).
 //
-//  Precision: always FP32 accumulation regardless of comm_dtype (matches NCCL behaviour,
-//  eliminates multi-rank BF16 accumulation error).
+//  Performance design (high memory-level parallelism):
+//    * The per-src mapped base pointers to slot[R] (elem 0) and flag[R] are CONSTANT for the
+//      whole kernel → precomputed once, hoisted out of the hot loop (no per-element 64-bit
+//      `get_partial_ptr` mul / `map` add inside the inner loop).
+//    * Phase 2 batches `kUnroll` vectors per thread, issuing all (kUnroll × kNumRanks) 128-bit
+//      P2P loads BEFORE consuming any of them → MLP = kUnroll × kNumRanks outstanding loads,
+//      so a handful of SMs can approach P2P bandwidth (the latency-bound scalar version did not).
+//
+//  Precision: always FP32 accumulation regardless of comm_dtype.
 //
 // ============================================================================================
 
@@ -39,7 +45,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           typename cd_dtype_t,
           typename comm_dtype_t = cd_dtype_t,
           uint32_t kNumThreads = 256>
-__global__ void __launch_bounds__(kNumThreads, 4)
+__global__ void __launch_bounds__(kNumThreads, 2)
 sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
                       const layout::SymBuffer<kNumRanks> sym_buffer,
                       const uint32_t runtime_m_per_rank,
@@ -59,10 +65,24 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
     // Vectorization: 128-bit = uint4
     constexpr uint32_t kVecBytes = 16;
     constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);  // 8 for BF16, 4 for FP32
+    constexpr uint32_t kUnroll = 4;                                  // vectors-in-flight per thread
     const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
     const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 
     constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
+
+    // ── Precompute per-src CONSTANT base pointers (hoisted out of the hot loop) ──
+    // slot_base[s] : remote pointer to src rank s's scatter slot[rank_idx] element (0,0).
+    // flag_base[s] : remote pointer to src rank s's ready-flag array for slot[rank_idx] (block 0,0).
+    const comm_dtype_t* slot_base[kNumRanks];
+    uint32_t* flag_base[kNumRanks];
+    #pragma unroll
+    for (uint32_t s = 0; s < kNumRanks; ++ s) {
+        slot_base[s] = sym_buffer.map(
+            workspace.get_partial_ptr<comm_dtype_t>(rank_idx, 0, 0), s);
+        flag_base[s] = reinterpret_cast<uint32_t*>(sym_buffer.map(
+            workspace.get_ready_ptr(rank_idx, 0, 0), s));
+    }
 
     // Process tiles assigned to this CTA
     for (uint32_t tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
@@ -70,84 +90,94 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
         const uint32_t my_n_block = tile_idx - my_m_block * num_n_blocks;
         const uint32_t base_row = my_m_block * BLOCK_M;
         const uint32_t base_col = my_n_block * BLOCK_N;
+        const uint32_t flag_off = my_m_block * num_n_blocks + my_n_block;
 
         // ── Phase 1: Poll every src rank's REMOTE flag for our chunk (slot = rank_idx) ──
         if (tid < kNumRanks) {
             const uint32_t src_rank = tid;
-            auto* local_flag = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
-            auto* poll_ptr = reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag, src_rank));
+            auto* poll_ptr = flag_base[src_rank] + flag_off;
             const auto start_clock = clock64();
             while (ld_acq_sys(poll_ptr) == 0u) {
-                if (clock64() - start_clock >= kTimeoutCycles) {
-                    /* printf("RS reduce timeout: rank=%d, src=%d, tile=(%d,%d)\n",
-                           rank_idx, src_rank, my_m_block, my_n_block); */
+                if (clock64() - start_clock >= kTimeoutCycles)
                     break;
-                }
             }
         }
         __syncthreads();
 
-        // ── Phase 2: Vectorized PULL + FP32 accumulation ──
-        for (uint32_t vec_offset = tid; vec_offset < vecs_per_tile; vec_offset += kNumThreads) {
-            const uint32_t elem_offset = vec_offset * kVecSize;
-            const uint32_t tile_row = elem_offset / BLOCK_N;
-            const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
-            const uint32_t global_row = base_row + tile_row;
-            const uint32_t global_col = base_col + tile_col;
+        // ── Phase 2: Vectorized PULL + FP32 accumulation, kUnroll vectors in flight ──
+        for (uint32_t base_vec = tid; base_vec < vecs_per_tile; base_vec += kNumThreads * kUnroll) {
+            // Load phase: issue all (kUnroll × kNumRanks) 128-bit P2P loads up front.
+            uint4 reg[kUnroll][kNumRanks];
+            uint32_t lin[kUnroll];
+            bool valid[kUnroll];
 
-            if (global_row >= runtime_m_per_rank or global_col >= shape_n)
-                continue;
-
-            float acc[kVecSize];
             #pragma unroll
-            for (uint32_t i = 0; i < kVecSize; ++ i)
-                acc[i] = 0.0f;
-
-            // Sum every src rank's REMOTE slot[rank_idx] (self maps to local).
-            #pragma unroll 1
-            for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
-                auto* local_partial = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
-                const comm_dtype_t* partial_ptr = sym_buffer.map(local_partial, src_rank);
-                uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
-                if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
-                    const auto* bf16 = reinterpret_cast<const __nv_bfloat16*>(&data);
+            for (uint32_t u = 0; u < kUnroll; ++ u) {
+                const uint32_t vec_offset = base_vec + u * kNumThreads;
+                const uint32_t elem_offset = vec_offset * kVecSize;
+                const uint32_t tile_row = elem_offset / BLOCK_N;
+                const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
+                const uint32_t global_row = base_row + tile_row;
+                const uint32_t global_col = base_col + tile_col;
+                valid[u] = (vec_offset < vecs_per_tile) and
+                           (global_row < runtime_m_per_rank) and (global_col < shape_n);
+                lin[u] = global_row * shape_n + global_col;
+                if (valid[u]) {
                     #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i)
-                        acc[i] += __bfloat162float(bf16[i]);
-                } else {
-                    const auto* f32 = reinterpret_cast<const float*>(&data);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++ i)
-                        acc[i] += f32[i];
+                    for (uint32_t s = 0; s < kNumRanks; ++ s)
+                        reg[u][s] = *reinterpret_cast<const uint4*>(slot_base[s] + lin[u]);
                 }
             }
 
-            // Write final reduced result
-            auto* out_ptr = output + global_row * shape_n + global_col;
-            uint4 result;
-            if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
-                auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(&result);
+            // Reduce + store phase.
+            #pragma unroll
+            for (uint32_t u = 0; u < kUnroll; ++ u) {
+                if (not valid[u])
+                    continue;
+
+                float acc[kVecSize];
                 #pragma unroll
                 for (uint32_t i = 0; i < kVecSize; ++ i)
-                    out_bf16[i] = __float2bfloat16(acc[i]);
-            } else {
-                auto* out_f32 = reinterpret_cast<float*>(&result);
+                    acc[i] = 0.0f;
+
                 #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++ i)
-                    out_f32[i] = acc[i];
+                for (uint32_t s = 0; s < kNumRanks; ++ s) {
+                    if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
+                        const auto* bf16 = reinterpret_cast<const __nv_bfloat16*>(&reg[u][s]);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += __bfloat162float(bf16[i]);
+                    } else {
+                        const auto* f32 = reinterpret_cast<const float*>(&reg[u][s]);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += f32[i];
+                    }
+                }
+
+                auto* out_ptr = output + lin[u];
+                uint4 result;
+                if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
+                    auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(&result);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        out_bf16[i] = __float2bfloat16(acc[i]);
+                } else {
+                    auto* out_f32 = reinterpret_cast<float*>(&result);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        out_f32[i] = acc[i];
+                }
+                *reinterpret_cast<uint4*>(out_ptr) = result;
             }
-            *reinterpret_cast<uint4*>(out_ptr) = result;
         }
 
         // ── Phase 3: Reset the remote flags consumed for this tile (wait_eq_reset) ──
         // Each flag[rank_idx][m][n] is consumed only by this rank → no cross-consumer race.
-        // Must happen after all data for this tile is read.
         __syncthreads();
         if (tid < kNumRanks) {
             const uint32_t src_rank = tid;
-            auto* local_flag = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
-            auto* remote_flag = reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag, src_rank));
-            st_rel_sys(remote_flag, 0u);
+            st_rel_sys(flag_base[src_rank] + flag_off, 0u);
         }
     }
 }

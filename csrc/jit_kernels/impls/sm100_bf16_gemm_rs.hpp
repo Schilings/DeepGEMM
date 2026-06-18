@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <torch/python.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -176,6 +177,25 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
     DG_CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
     const auto compute_stream = at::cuda::getCurrentCUDAStream();
 
+    // ── SM carveout for compute/comm overlap ──
+    // The GEMM kernel is launched with `num_sms` blocks at 1 block/SM (__launch_bounds__(.,1)),
+    // so it saturates every SM. Without a carveout the pull RS-reduce kernel (on comm_stream)
+    // cannot become co-resident and only gets scheduled as GEMM blocks retire → ≈ zero overlap
+    // (fused ≈ gemm + reduce, serial). Reserve `reduce_sms` SMs for the reduce so both kernels
+    // run concurrently: GEMM keeps the tensor cores busy on (num_sms - reduce_sms) SMs while the
+    // memory-bound reduce streams remote partials over P2P on the reserved SMs.
+    //   DG_RS_REDUCE_SMS=0 → no carveout (gemm=num_sms, reduce=num_sms).
+    // NOTE: carveout only pays off once the reduce kernel saturates P2P bandwidth with few SMs
+    // (high MLP). With the latency-bound scalar reduce its throughput scales ~linearly with SM
+    // count, so a naive carveout regressed; default off until the reduce is bandwidth-bound.
+    int reduce_sms = 0;
+    if (const char* env = std::getenv("DG_RS_REDUCE_SMS"))
+        reduce_sms = std::atoi(env);
+    reduce_sms = std::max(0, std::min(reduce_sms, num_sms - static_cast<int>(config.num_multicast)));
+    int gemm_sms = num_sms - reduce_sms;
+    gemm_sms -= gemm_sms % static_cast<int>(config.num_multicast);  // keep multiple of cluster size
+    reduce_sms = num_sms - gemm_sms;
+
     // ── Create TMA descriptors ──
     // A: token activations [M, K] → TMA 2D load, multicast to 2 CTAs when mc=2
     const auto tensor_map_a = make_tma_2d_desc(a,
@@ -205,7 +225,7 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
         .output = y.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
-        .launch_args = LaunchArgs(num_sms,
+        .launch_args = LaunchArgs(gemm_sms,
                                   total_threads,
                                   config.smem_size,
                                   config.num_multicast)
@@ -226,7 +246,7 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
 
     const int total_tiles = (runtime_m_per_rank + config.block_m - 1) / config.block_m *
                             ((n + config.block_n - 1) / config.block_n);
-    const int grid_size = std::min(total_tiles, num_sms);
+    const int grid_size = std::min(total_tiles, reduce_sms > 0 ? reduce_sms : num_sms);
 
     const SM100RSReduceRuntime::Args reduce_args = {
         .runtime_m_per_rank = runtime_m_per_rank,
