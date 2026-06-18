@@ -21,7 +21,7 @@
 
 - 仓库：`https://github.com/Schilings/DeepGEMM.git`
 - 主分支：`main`
-- 当前环境可能无 `nvcc`，默认走 NVRTC：`DG_JIT_USE_NVRTC=1`
+- 当前环境可能无 `nvcc`，用的话优先用`nvcc`，没有就安装，安装不了再默认走 NVRTC：`DG_JIT_USE_NVRTC=1`
 
 ---
 
