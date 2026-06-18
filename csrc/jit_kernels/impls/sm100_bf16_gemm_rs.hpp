@@ -165,15 +165,16 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
     DG_HOST_ASSERT(config.block_k == 64);
     DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
 
-    // ── Step 0: reset NVLink barrier state and synchronize the comm stream ──
-    // The GEMM compute kernel uses nvlink_barrier which persists state in the first
-    // kNumBarrierSignalBytes(32) of sym_buffer; zero it before each launch to avoid stale state.
+    // ── Step 0: synchronize the comm stream (previous RS reduce must finish) ──
+    // NOTE: we deliberately DO NOT memset the NVLink barrier region per call.
+    // `comm::nvlink_barrier` is a self-resetting phase/sign protocol; the barrier region
+    // is zeroed once at sym_buffer creation (`buffer.zero_()`) and the +1/-1 sign alternation
+    // keeps the signal slots balanced across invocations. A per-call host memset on
+    // compute_stream races with the PEER rank's in-flight barrier signal writes (the peer's
+    // GEMM may signal our slot before our memset lands, wiping it → barrier deadlock).
     const auto comm_stream = get_gemm_rs_pull_comm_stream();
     DG_CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
     const auto compute_stream = at::cuda::getCurrentCUDAStream();
-    constexpr uint64_t kBarrierRegionBytes = 32;  // kNumBarrierSignalBytes from GemmRSWorkspace
-    DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(sym_buffer.data_ptr<int8_t>(), 0,
-                                           kBarrierRegionBytes, compute_stream.stream()));
 
     // ── Create TMA descriptors ──
     // A: token activations [M, K] → TMA 2D load, multicast to 2 CTAs when mc=2
