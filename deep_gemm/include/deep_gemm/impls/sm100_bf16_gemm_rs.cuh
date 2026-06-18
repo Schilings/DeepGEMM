@@ -4,6 +4,7 @@
 
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
+#include <cuda_device_runtime_api.h>
 
 #include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/common/math.cuh>

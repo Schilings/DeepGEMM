@@ -3,6 +3,7 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cutlass/arch/barrier.h>
+#include <cuda_device_runtime_api.h>
 
 #include <deep_gemm/scheduler/gemm.cuh>
 #include <deep_gemm/common/math.cuh>

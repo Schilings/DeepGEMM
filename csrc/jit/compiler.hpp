@@ -274,6 +274,13 @@ public:
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+        include_dirs += fmt::format("-I{} ", (cuda_home / "include" / "cccl").string());
+
+        // For source-tree development (editable mode), CUTLASS headers live under
+        // <repo_root>/third-party/cutlass/include rather than packaged include path.
+        const auto repo_cutlass_include = library_root_path.parent_path() / "third-party" / "cutlass" / "include";
+        if (std::filesystem::exists(repo_cutlass_include))
+            include_dirs += fmt::format("-I{} ", repo_cutlass_include.string());
 
         // Add PCH support for version 12.8 and above
         // NOTES: PCH is vital for compilation speed
@@ -334,6 +341,11 @@ public:
                 DG_NVRTC_CHECK(nvrtcGetProgramLog(program, compilation_log.data()));
                 printf("NVRTC log: %s\n", compilation_log.c_str());
             }
+        }
+
+        if (compile_result != NVRTC_SUCCESS) {
+            DG_NVRTC_CHECK(nvrtcDestroyProgram(&program));
+            DG_HOST_ASSERT(false and "NVRTC compilation failed");
         }
 
         if (ptx_path.has_value()) {
