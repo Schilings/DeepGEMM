@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Tuple
 
@@ -83,13 +84,12 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
                     num_tokens_per_rank: int,
                     compiled_dims: str = 'nk'):
     """
-    BF16 GEMM + Reduce-Scatter: Pull-based single-kernel fusion with tile-level overlap.
+    BF16 GEMM + Reduce-Scatter 统一入口。
 
-    This implementation:
-    - Uses a single kernel (no separate reduce kernel)
-    - Achieves tile-level computation-communication overlap
-    - Uses pull-based reduce (bandwidth-optimal like NCCL ring RS)
-    - Comm warps pull from peer ranks and reduce in FP32 while GEMM warps compute
+    默认实现采用 Flux 思路的 dual-kernel v3（计算/通信解耦 + tile-ready overlap）。
+    可通过环境变量 `DG_GEMM_RS_IMPL` 切换：
+      - `v3` / `flux` / `dual`（默认）
+      - `single` / `legacy`（旧单 kernel 路径）
 
     Args:
         y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
@@ -100,16 +100,27 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
         compiled_dims: JIT compilation dimension string
     """
     assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt is for SM100/B-series GPUs'
-    comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
-    _C.bf16_gemm_rs_nt(
-        y, a, b,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        num_tokens_per_rank,
-        compiled_dims,
-        comm_dtype_str,
+
+    impl = os.getenv('DG_GEMM_RS_IMPL', 'v3').strip().lower()
+    if impl in ('v3', 'flux', 'dual'):
+        return bf16_gemm_rs_nt_v3(y, a, b, sym_buffer, num_tokens_per_rank, compiled_dims)
+
+    if impl in ('single', 'legacy'):
+        comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
+        _C.bf16_gemm_rs_nt(
+            y, a, b,
+            sym_buffer.buffer,
+            sym_buffer.handle.buffer_ptrs,
+            sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
+            num_tokens_per_rank,
+            compiled_dims,
+            comm_dtype_str,
+        )
+        return
+
+    raise ValueError(
+        f"Unsupported DG_GEMM_RS_IMPL={impl!r}, expected one of: v3/flux/dual/single/legacy"
     )
 
 

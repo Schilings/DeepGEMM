@@ -118,14 +118,15 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
     // Warp layout:
     //   W0..W3: Comm (128T) — poll flags + vectorized reduce + write output
-    //   W4: TMA Load (A+B unified), W5: Reserved, W6: MMA Issue, W7: Reserved/TMEM Alloc
+    //   W4: Load A, W5: Load B, W6: MMA Issue, W7: Reserved/TMEM Alloc
     //   W8-W11: Epilogue (128T = 4 warps)
-    constexpr uint32_t kNumCommWarps = kNumCommThreads / 32;   // 4
+    constexpr uint32_t kNumCommWarps = kNumCommThreads / 32;           // 4
     constexpr uint32_t kNumNonEpiWarps = kNumNonEpilogueThreads / 32;  // 4 warps
     constexpr uint32_t kNumEpiWarps = kNumEpilogueThreads / 32;        // 4 warps
-    constexpr uint32_t kLoadWarpIdx = kNumCommWarps;         // W4: unified TMA load (A+B)
-    constexpr uint32_t kMMAWarpIdx = kNumCommWarps + 2;      // W6
-    constexpr uint32_t kReservedWarpIdx = kNumCommWarps + 3; // W7
+    constexpr uint32_t kLoadAWarpIdx = kNumCommWarps;                  // W4
+    constexpr uint32_t kLoadBWarpIdx = kNumCommWarps + 1;              // W5
+    constexpr uint32_t kMMAWarpIdx = kNumCommWarps + 2;                // W6
+    constexpr uint32_t kReservedWarpIdx = kNumCommWarps + 3;           // W7
     constexpr uint32_t kEpilogueWarpStart = kNumCommWarps + kNumNonEpiWarps;  // W8
 
     // Comm warp pipeline stages for TMA fetch
@@ -194,7 +195,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     kNumMulticast > 1 ? cute::cluster_sync() : void();
 
     // ── Prefetch TMA descriptors ──
-    if (warp_idx == kLoadWarpIdx) {
+    if ((warp_idx == kLoadAWarpIdx or warp_idx == kLoadBWarpIdx) and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
     }
@@ -237,10 +238,11 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     });
 
     // ── Initialize barriers ──
-    if (warp_idx == kMMAWarpIdx and cute::elect_one_sync()) {
+    if (warp_idx == kLoadBWarpIdx and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            full_barriers[i]->init(kNumMulticast);
+            // Two producers (LoadA + LoadB), each arrives across multicast CTAs.
+            full_barriers[i]->init(2 * kNumMulticast);
             empty_barriers[i]->init(1);
         }
         #pragma unroll
@@ -368,11 +370,12 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
             if (lane_idx == 0) {
                 for (uint32_t rank_iter = comm_warp_local_idx; rank_iter < kNumRanks; rank_iter += kNumCommWarps) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
+                    const bool is_self_rank = (src_rank == rank_idx);
                     auto* poll_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
 
                     constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
                     const auto start_clock = clock64();
-                    while (ptx::ld_acq_sys(poll_ptr) == 0u) {
+                    while ((is_self_rank ? ptx::ld_acq(poll_ptr) : ptx::ld_acq_sys(poll_ptr)) == 0u) {
                         if (clock64() - start_clock >= kTimeoutCycles) {
                             printf("GEMM-RS comm timeout: rank=%d, src=%d, tile=(%d,%d)\n",
                                    rank_idx, src_rank, my_m_block, my_n_block);
@@ -440,7 +443,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                     // Write final reduced result (32B)
                     *reinterpret_cast<uint4*>(out_ptr) = self_data0;
                     *reinterpret_cast<uint4*>(out_ptr + kVecSize) = self_data1;
-                }            } else {
+                }
+            } else {
                 // ── FP32 fallback: original FP32 accumulation ──
                 for (uint32_t vec_offset = comm_thread_local_idx; vec_offset < vecs_per_tile; vec_offset += kNumCommThreads) {
                     const uint32_t elem_offset = vec_offset * kVecSize;
@@ -492,57 +496,53 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  Warp 4 (TMA Load Warp): Load both A and B into smem
-    //  Aligned with standard GEMM: single warp issues both TMA loads
-    //  and does a single arrive_and_expect_tx per stage.
+    //  Warp 4 (Load A Warp): TMA load A only
     // ════════════════════════════════════════════════════════════════
-    else if (warp_idx == kLoadWarpIdx and cute::elect_one_sync()) {
+    else if (warp_idx == kLoadAWarpIdx and cute::elect_one_sync()) {
         uint32_t block_idx = cluster_idx, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
-            const uint32_t n_idx = n_block_idx * BLOCK_N;
             const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
 
-            // Each CTA already has its own m_block_idx (from scheduler), so:
-            // - For A: use global_m directly (each CTA loads its own 128 A rows)
-            // - For B: split across CTAs with block_rank offset (multicast ensures both have full B)
-            // When kIsMulticastOnA=false: A is NOT split, B is split (and multicast fills both)
-            // When kIsMulticastOnA=true: A is split (and multicast fills both), B is NOT split
-            uint32_t load_m_idx = global_m;
-            uint32_t load_n_idx = n_idx;
-            if constexpr (kNumMulticast > 1) {
-                // No M offset needed: each CTA's m_block_idx already differs
-                // B split: each CTA loads half of B columns
-                load_n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
-            }
-
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                // Issue TMA load A
                 tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, ab_dtype_t>(
-                    &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, load_m_idx, kNumMulticast);
+                    &tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, global_m, kNumMulticast);
 
-                // Issue TMA load B
-                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
-                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, load_n_idx, kNumMulticast);
-
-                // Single arrive with total A+B byte count (same as standard GEMM)
-                constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
-                if (is_leader_cta) {
-                    full_barriers[stage_idx]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
-                } else {
+                if (is_leader_cta)
+                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE * kNumMulticast);
+                else
                     full_barriers[stage_idx]->arrive(0u);
-                }
             }
         }
     }
 
-    // Warp 5: Reserved (no-op, matching standard GEMM's warp layout)
-    else if (warp_idx == (kNumCommWarps + 1)) {
-        // Intentionally empty — this warp slot is reserved for future use
+    // ════════════════════════════════════════════════════════════════
+    //  Warp 5 (Load B Warp): TMA load B only
+    // ════════════════════════════════════════════════════════════════
+    else if (warp_idx == kLoadBWarpIdx and cute::elect_one_sync()) {
+        uint32_t block_idx = cluster_idx, iter_idx = 0, m_block_idx, n_block_idx;
+        while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
+            uint32_t n_idx = n_block_idx * BLOCK_N;
+            if constexpr (kNumMulticast > 1)
+                n_idx += kIsMulticastOnA ? 0 : (cute::block_rank_in_cluster() * LOAD_BLOCK_N);
+
+            const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+            for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                const uint32_t k_idx = k_block_idx * BLOCK_K;
+
+                tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, ab_dtype_t>(
+                    &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, kNumMulticast);
+
+                if (is_leader_cta)
+                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE * kNumMulticast);
+                else
+                    full_barriers[stage_idx]->arrive(0u);
+            }
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -795,7 +795,7 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
     }
 
     // Deallocate tensor memory
-    if (warp_idx == kLoadWarpIdx)
+    if (warp_idx == kLoadAWarpIdx)
         Allocator().free(0, kNumTmemCols);
 
 #else
