@@ -225,13 +225,54 @@
 
 ---
 
-## 下一步计划（核心：TMA-engine overlap）
+## 2026-06-18：Iteration 7 — reduce grid 过订阅（oversubscription，大幅提速，保留）
 
-1. **TMA 流水线 reduce**：用 `cp.async.bulk`(TMA) 把远端 slot[R] 异步搬进 smem 的多级 buffer，
-   SM 仅做 FP32 加法 → 把 NVLink 搬运从 LSU 移到 TMA 引擎；先验证 SM100 远端 P2P TMA load 可行
-   （push-v3 已验证远端 TMA *store* 可用，load 大概率可行）。
+### 洞察
+
+Iter 6 说 SM-load reduce「触顶」，但其实是**每 SM 只 1 个 reduce block**（grid=`min(total_tiles, num_sms)`）。
+reduce 在 GEMM 之后跑（SM 全空），那就**过订阅**：每 SM 放多个 reduce block → 更多 warp 同时发射
+P2P load → 更多 outstanding 请求 → 更高 NVLink 有效带宽。这是 latency/concurrency-bound 的正解。
+
+### Change
+
+文件：`csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp`
+
+- reduce grid 由 `num_sms` 改为 `num_sms × reduce_grid_mult`（kernel 本就 grid-stride，正确性不变）。
+- `reduce_grid_mult` 默认 **2**（env `DG_RS_REDUCE_MULT` 可调）。扫参 {1,2,3,4}：2 全面优于 1，
+  与 4 接近且更稳（启动开销小）。
+
+### Result
+
+- 正确性：`tests/test_gemm_rs.py 2` → **6/6 PASS**。
+- 性能（2 GPU，6 iter，13 shape）：geo_mean **0.835x vs torch / 0.836x vs sep**
+  （Iter 6 的 ~0.73x → 0.835x），avg fused **906T**（814→906T）。最差 shape 0.77x（baseline 0.51x）。
+  分组：K=7168 0.85x、focus 5 shape 0.85x、M/rank≥8192 0.86x(vs sep)。
+
+### Verdict
+
+- **保留**。零风险纯 host 改动，单步 +0.10x geo / +90T。
+- 本会话累计：**0.61x → 0.835x（vs torch），660T → 906T**（Iter 5 高 MLP + Iter 7 过订阅）。
+
+---
+
+## 本会话进度小结（2026-06-18）
+
+| 阶段 | geo vs torch | geo vs sep | avg fused | 关键改动 |
+|------|------|------|------|------|
+| 起点（pull 初版） | 0.606x | 0.611x | 660T | 朴素标量 P2P reduce |
+| Iter 5 | 0.733x | 0.739x | 814T | reduce 高 MLP（预计算基址 + kUnroll 批量发射）|
+| Iter 6 | ~0.73x | ~0.73x | ~820T | kUnroll=8；确认 carveout 死胡同 |
+| Iter 7 | **0.835x** | **0.836x** | **906T** | reduce grid 过订阅 ×2 |
+
+---
+
+## 下一步计划（核心：TMA-engine overlap，冲 >1.0x）
+
+1. **TMA 流水线 reduce**：用 `cp.async.bulk`(`tma_load_1d`) 把远端 slot[R] 的**连续段**异步搬进 smem
+   多级 buffer（chunk 在 slot 内是 [token][hidden] 行连续 → 可纯 1D bulk copy，无需 2D 描述符/strided
+   gather），SM 仅做 FP32 加法 → 把 NVLink 搬运从 LSU 移到 TMA 引擎。先验证 SM100 远端 P2P TMA load。
 2. 让 reduce 与 GEMM 真正共驻 overlap（GEMM 让出少量 smem/warp 槽，reduce TMA 不抢 tensor core）。
-3. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化。
+3. 继续 `K=7168` 弱势点定向优化。
 4. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---

@@ -62,7 +62,11 @@ python benchmarks/bench_gemm_rs.py 2 5
 ## D. 当前基线摘要（pull，唯一路径）
 
 - 正确性：`test_gemm_rs.py 2` 6/6 PASS，max_diff=0.0。
-- 性能（2 GPU，3 iter，13 shape）：geo_mean ≈ **0.58x**（fused 628T vs sep 1065T）—— 待优化。
+- 性能（2 GPU，13 shape）：geo_mean **0.835x vs torch / 0.836x vs sep**，avg fused **906T**
+  （本会话从 0.606x/660T 提升）。最差 shape 0.77x。
+- 提速来源：Iter 5 reduce 高 MLP（预计算基址 + kUnroll=8 批量发射）+ Iter 7 reduce grid 过订阅 ×2
+  （`DG_RS_REDUCE_MULT`，默认 2）。Iter 6 已确认 SM carveout 是零和死胡同。
+- 下一步冲 >1.0x：TMA-engine reduce（`cp.async.bulk` 异步 fetch 远端连续段 → smem，SM 仅加法）+ 与 GEMM 共驻 overlap。
 - 历史（已删除的 push v3，仅供参考）：曾约 1.10x，但 push 非 Flux 单机路径，已移除。
 
 ---

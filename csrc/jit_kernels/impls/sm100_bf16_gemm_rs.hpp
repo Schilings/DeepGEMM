@@ -246,7 +246,14 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
 
     const int total_tiles = (runtime_m_per_rank + config.block_m - 1) / config.block_m *
                             ((n + config.block_n - 1) / config.block_n);
-    const int grid_size = std::min(total_tiles, reduce_sms > 0 ? reduce_sms : num_sms);
+    // The reduce runs after the GEMM (SMs are free), so oversubscribing SMs with multiple
+    // resident reduce blocks adds warps → more outstanding P2P loads per SM → higher effective
+    // NVLink read bandwidth (the scalar reduce is latency/concurrency-bound, not BW-bound).
+    int reduce_grid_mult = 2;  // 2 resident reduce blocks/SM ≈ best across the shape set
+    if (const char* env = std::getenv("DG_RS_REDUCE_MULT"))
+        reduce_grid_mult = std::max(1, std::atoi(env));
+    const int reduce_base = reduce_sms > 0 ? reduce_sms : num_sms * reduce_grid_mult;
+    const int grid_size = std::min(total_tiles, reduce_base);
 
     const SM100RSReduceRuntime::Args reduce_args = {
         .runtime_m_per_rank = runtime_m_per_rank,
