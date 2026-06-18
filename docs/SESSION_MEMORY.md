@@ -20,6 +20,11 @@
 - 当前口径是唯一主线：`bf16_gemm_rs_nt`。
 - shape 集合已固定为用户指定 13 个，重点 5 个 shape 单独追踪。
 - 学习方向：参考 `flux` GEMM-RS（H 卡稳定上线），在 B 卡做策略适配。
+- 主线策略：按 `SM100_2CTA_CLUSTER`，中大 shape 优先 `mc=2`（2-CTA cluster）。
+- benchmark 已升级三路基线：
+  - `torch.matmul + RS`
+  - `deep_gemm.bf16_gemm_nt + RS`
+  - `bf16_gemm_rs_nt`
 - benchmark 脚本支持：
   - `DG_BENCH_FOCUS_ONLY=1`
   - `DG_BENCH_SHAPES="M,N,K;..."`
@@ -47,10 +52,10 @@ python benchmarks/bench_gemm_rs.py 2 5
 
 ## D. 当前基线摘要
 
-- 指定 13 shape（2 GPU，3 iter）：**geo mean ≈ 1.111x（vs torch） / 1.100x（vs sep）**
-- 重点 5 shape（2 GPU，4 iter）：**geo mean ≈ 1.166x（vs torch） / 1.163x（vs sep）**
-- 当前短板：`2048x7168x2048`（约 `0.98x vs torch / 0.96x vs sep`）
-- 重点集最弱点：`4096x4096x7168`（约 `1.04x`）
+- 指定 13 shape（2 GPU，3 iter）：**geo mean ≈ 1.110x（vs torch） / 1.100x（vs sep）**
+- 重点 5 shape（2 GPU，4 iter）：**geo mean ≈ 1.174x（vs torch） / 1.161x（vs sep）**
+- 当前短板：`2048x7168x2048`（约 `0.98x vs torch / 0.98x vs sep`）
+- 重点集最弱点：`4096x4096x7168`（约 `1.05x`）
 
 ---
 

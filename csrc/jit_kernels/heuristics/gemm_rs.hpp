@@ -93,7 +93,12 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     const bool prefer_mc2_cluster = (m_per_rank >= 128 && m_blocks_even);
 
     if (prefer_mc2_cluster) {
-        block_m = 128;
+        // mc=2 主线下，小K+大N中大shape尝试更大M tile，减少cluster调度与同步次数
+        if (k <= 2048 && n >= 7168 && m_per_rank <= 1024) {
+            block_m = 256;
+        } else {
+            block_m = 128;
+        }
         num_multicast = 2;
     } else if (m_per_rank >= 128) {
         // Fallback when M-block pairing for cluster is not possible
@@ -140,7 +145,7 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
 
     // mc=2 主线下对小K+大N场景降低stage深度，减少流水线启动/同步开销。
     if (num_multicast == 2 && k <= 2048 && n >= 7168 && m_per_rank <= 2048) {
-        num_stages = std::max(2, std::min(num_stages, 6));
+        num_stages = std::max(2, std::min(num_stages, 4));
     }
 
     const int smem_size = smem_fixed + num_stages * smem_per_stage;
