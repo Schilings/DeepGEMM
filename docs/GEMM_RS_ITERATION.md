@@ -307,11 +307,51 @@ Iter 6/7 后又做了两组实验，**证明分离 reduce kernel 在本硬件结
 
 ---
 
-## 下一步计划（把 geo_mean 推过 1.0x）
+## 2026-06-18：Iteration 9 — 去掉冗余 CPU 同步（保留）
 
-1. **小 K 弱势点**：本地 reduce tail 占比大 → 现在 reduce 又快又只读本地，尝试让它与 GEMM 共驻
-   overlap（本地读不抢 NVLink，可能终于有效），或进一步精简本地 reduce。
-2. **超大 N·K**：epilogue push 体量大，优化 TMA store 调度/分摊使其更好地被 MMA 掩盖。
+### Change
+
+`csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp`：删除 step-0 的 `cudaStreamSynchronize(comm_stream)`。
+它是冗余的——step-3 已让 compute_stream 通过 `comm_done_event` 等待本轮 reduce，且 comm_stream FIFO 有序，
+下轮 GEMM 在 GPU 上天然排在本轮 reduce 之后；CPU 阻塞只会串行化 launch、拖累小 shape。
+
+### Result
+
+- 正确性：`tests/test_gemm_rs.py 2` → **6/6 PASS**。
+- 性能（2 GPU，8 iter，13 shape）：geo_mean **0.989x vs torch / 0.995x vs sep**，avg fused **1082T**
+  （Iter 8 的 0.964x/1054T → 0.989x/1082T）。
+- **分组（Megatron SP 主目标）**：
+  - **User focus 中大 5 shape：1.043x vs torch / 1.049x vs sep** ✅
+  - **M/rank≥8192：1.030x vs sep** ✅
+  - 单 shape >1.0x：8192x4096x4096 1.09x、4096x7168x4096 1.07x、8192x7168x4096 1.07x、16384x7168x4096 1.06x、
+    4096x4096x4096 1.05x 等。
+
+### Verdict
+
+- **保留**。中大 shape（主目标）已稳超 1.0x；整体 0.995x（与 separate 基本持平）。
+- 残余拖累：小 K（2048x7168x2048 0.85x、4096x7168x2048 0.91x，separate≈纯 GEMM、NCCL RS≈0，结构性难超）；
+  16384x7168x7168 0.95x（push 体量大）。
+
+---
+
+## 本会话总进度（2026-06-18）
+
+| 阶段 | vs torch | vs sep | avg fused | 关键改动 |
+|------|------|------|------|------|
+| 起点 | 0.606x | 0.611x | 660T | 朴素标量 P2P pull reduce |
+| Iter 5 | 0.733x | 0.739x | 814T | reduce 高 MLP |
+| Iter 7 | 0.835x | 0.836x | 906T | reduce grid 过订阅 ×2 |
+| Iter 8 | 0.964x | 0.973x | 1054T | **跨卡传输 fused 进 epilogue（push-scatter，与 MMA 重叠）** |
+| Iter 9 | **0.989x** | **0.995x** | **1082T** | 去冗余 CPU 同步 |
+
+**focus 中大 shape：1.049x vs sep ✅（主目标已达 >1.0x）**
+
+---
+
+## 下一步计划
+
+1. **小 K / 超大 N·K 弱势点**：缩短本地 reduce tail（已快），或优化 epilogue push 调度使其更好被 MMA 掩盖。
+2. 探索 reduce 与 GEMM tile 级 overlap 的可行路径（本地 reduce 不抢 NVLink）。
 3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---

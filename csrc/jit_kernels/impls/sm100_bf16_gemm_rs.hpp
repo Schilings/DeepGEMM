@@ -166,15 +166,18 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
     DG_HOST_ASSERT(config.block_k == 64);
     DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
 
-    // ── Step 0: synchronize the comm stream (previous RS reduce must finish) ──
-    // NOTE: we deliberately DO NOT memset the NVLink barrier region per call.
+    // ── Step 0: stream setup ──
+    // NOTE 1: we deliberately DO NOT memset the NVLink barrier region per call.
     // `comm::nvlink_barrier` is a self-resetting phase/sign protocol; the barrier region
     // is zeroed once at sym_buffer creation (`buffer.zero_()`) and the +1/-1 sign alternation
     // keeps the signal slots balanced across invocations. A per-call host memset on
     // compute_stream races with the PEER rank's in-flight barrier signal writes (the peer's
     // GEMM may signal our slot before our memset lands, wiping it → barrier deadlock).
+    // NOTE 2: no CPU-side cudaStreamSynchronize here. Step 3 makes compute_stream wait on the
+    // RS-reduce's comm_done_event, and comm_stream is FIFO-ordered, so the next call's GEMM
+    // already orders after this call's reduce on the GPU — a CPU stall would only serialize
+    // launches and hurt small shapes.
     const auto comm_stream = get_gemm_rs_pull_comm_stream();
-    DG_CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
     const auto compute_stream = at::cuda::getCurrentCUDAStream();
 
     // ── SM carveout for compute/comm overlap ──
