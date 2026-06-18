@@ -113,8 +113,11 @@ static GemmRSConfig get_gemm_rs_config(const int& m, const int& n, const int& k,
     // 对 m_per_rank=2048, n=7168, k=2048 一类 case，multicast=2 的 cluster 协作开销会放大，
     // 实测可能吞掉 fused 收益。此处优先关闭 multicast，避免 2-CTA cluster 额外同步/调度成本。
     const bool prefer_mc1_for_mid_shape = (k <= 2048 && m_per_rank <= 2048 && n >= 7168);
+    // K-heavy 中大shape（例如 4096x4096x7168）在 B 卡上有时受 2-CTA cluster 协作开销影响，
+    // 尝试关闭 multicast 观察 fused 的端到端收益是否更好。
+    const bool prefer_mc1_for_k_heavy_mid_shape = (k >= 7168 && n <= 4096 && m_per_rank <= 4096);
 
-    if (!prefer_mc1_for_mid_shape && m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
+    if (!(prefer_mc1_for_mid_shape || prefer_mc1_for_k_heavy_mid_shape) && m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
         // Enough tiles for multicast=2, block_m=128, and M-blocks are even
         block_m = 128;
         num_multicast = 2;
