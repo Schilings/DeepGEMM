@@ -23,7 +23,9 @@
   - Kernel 2 `sm100_rs_reduce.cuh`（`kPullBased=true`）：从各远端 rank pull `slot[R]` 做 FP32 reduce → output，读后远端 reset flag；
   - host `sm100_bf16_gemm_rs.hpp` 双流编排（compute_stream + comm_stream + event）。
   - 旧 push dual-kernel 仍可 `DG_GEMM_RS_IMPL=v3/push` 回退。
-- **当前状态**：已编译 + push；首轮 `test_gemm_rs.py 2` 崩在 `CUDASymmetricMemory` 析构（上游 kernel 错误的下游表现），**正在排查 root cause**，尚未跑通正确性。
+- **当前状态**：正确性达标——`test_gemm_rs.py 2` **6/6 PASS, max_diff=0.0**（已修复 nvlink_barrier 死锁：
+  移除与对端信号竞争的 per-call barrier memset）。**性能回退**：2-GPU geo_mean ≈ 0.58x（fused 628T vs sep 1065T），
+  慢于 push v3(~1.10x)；待把 pull reduce 改成 TMA 流水线 fetch。高性能回退用 `DG_GEMM_RS_IMPL=v3`。
 - shape 集合已固定为用户指定 13 个，重点 5 个 shape 单独追踪。
 - 学习方向：参考 `flux` GEMM-RS（H 卡稳定上线），在 B 卡做策略适配。
 - 主线策略：按 `SM100_2CTA_CLUSTER`，中大 shape 优先 `mc=2`（2-CTA cluster）。

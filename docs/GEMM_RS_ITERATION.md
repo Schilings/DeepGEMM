@@ -111,14 +111,26 @@
 
 ### Result
 
-- C++ 扩展 `python3 setup.py build_ext` **编译通过**（host 侧），代码已 commit & push。
-- 首轮 2-GPU 正确性测试 `tests/test_gemm_rs.py 2`：进程异常退出（崩溃栈落在
-  `CUDASymmetricMemory` 析构处，通常是上游 kernel 运行期错误/超时的下游表现），**root cause 排查中**。
+- C++ 扩展编译通过，代码已 commit & push。
+- **Bug 修复**：首轮 2-GPU 测试死锁（nvlink_barrier timeout）。根因是 host 端 per-call
+  `cudaMemsetAsync` 清零 barrier 区与对端 GEMM 的 in-flight NVLink 信号写竞争
+  （`cudaStreamSynchronize(comm_stream)` 延迟某 rank 的 memset → 把对端已送达的信号清掉 → 死锁）。
+  `comm::nvlink_barrier` 本身是 phase/sign 自复位协议，buffer 创建时已 `zero_()`，
+  故 per-call memset 既不必要又有害 → **移除 memset**。
+- **正确性**：`tests/test_gemm_rs.py 2` → **6/6 PASS，max_diff=0.0**（与参考逐元素精确一致）。
+- **性能（2 GPU，3 iter，指定 13 shape）**：geo_mean **0.584x vs torch / 0.582x vs sep**，
+  fused 平均 **628.5T** vs separate 1065.2T。**明显慢于旧 push v3（~1.10x）**。
 
 ### Verdict
 
-- **进行中**（pending）。下一步：抓取首屏真实报错（kernel assert / barrier timeout / IMA），
-  定位 pull 路径的同步或寻址问题后复测。
+- **正确性达标，性能回退（需优化）**。
+- 根因（性能）：真·Flux pull 的速度优势依赖 Flux `Sm90ReduceScatterDma` 的 **TMA 流水线 fetch**；
+  当前 RS reduce 用**朴素标量 P2P 读**（每元素串行读 num_ranks 个远端 slot），且 reduce 与 GEMM
+  双流**抢占 SM/带宽**。而 push v3 把跨卡传输放在 GEMM epilogue 的 TMA async store 中被计算掩盖、
+  reduce 只读本地，所以更快。
+- 下一步（perf）：把 pull reduce 改造为 **TMA 流水线 fetch+reduce**（对齐 Flux `Sm90ReduceScatterDma`：
+  远端 → smem 的 producer/consumer 流水），或改进 GEMM/reduce 的 SM 划分与重叠；
+  在此之前，主线高性能路径仍可用 `DG_GEMM_RS_IMPL=v3`（push）回退。
 
 ---
 

@@ -8,14 +8,15 @@
 
 ## 当前结论（本机实测）
 
-- **【架构重构，进行中】** 主线 `bf16_gemm_rs_nt` 已重构为**真·Flux pull 式 dual-kernel**
-  （GEMM 256T 无 comm warps + epilogue 纯本地 scatter write；独立 RS reduce kernel 从远端 pull）。
-  详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
-- **状态**：C++ 扩展编译通过、已 commit & push；首轮 `tests/test_gemm_rs.py 2` 进程异常退出
-  （崩溃栈落在 `CUDASymmetricMemory` 析构处，疑为上游 kernel 运行期错误/超时），**正在排查 root cause**。
-- 旧 push 式 dual-kernel 仍可通过 `DG_GEMM_RS_IMPL=v3`（或 `push`）回退使用。
-- 历史基线（push 路径）：`tests/test_gemm_rs.py 2` 6/6 通过；geo mean ≈ 1.10x。
-  pull 路径基线待跑通正确性后重测。
+- **【架构重构完成 · 正确性达标 · 性能待优化】** 主线 `bf16_gemm_rs_nt` 已重构为
+  **真·Flux pull 式 dual-kernel**（GEMM 256T 无 comm warps + epilogue 纯本地 scatter write；
+  独立 RS reduce kernel 从远端 pull）。详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
+- **正确性**：`tests/test_gemm_rs.py 2` → **6/6 PASS，max_diff=0.0**（逐元素精确匹配参考）。
+  （修复了一处 nvlink_barrier 死锁：移除了与对端信号竞争的 per-call barrier memset。）
+- **性能（2 GPU，3 iter，13 shape）**：geo_mean **0.584x vs torch / 0.582x vs sep**，
+  fused 628.5T vs sep 1065.2T —— **慢于旧 push v3（~1.10x）**。
+  根因：pull reduce 用朴素标量 P2P 读 + 与 GEMM 抢 SM；需改为 TMA 流水线 fetch（Flux `Sm90ReduceScatterDma` 风格）。
+- **高性能回退**：旧 push dual-kernel 仍可用 `DG_GEMM_RS_IMPL=v3`（或 `push`）。
 
 ---
 
