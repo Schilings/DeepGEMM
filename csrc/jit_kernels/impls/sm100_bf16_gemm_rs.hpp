@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/python.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
@@ -12,12 +13,60 @@
 #include <deep_gemm/layout/gemm_rs.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
-#include "../heuristics/gemm_rs.hpp"
+#include "../heuristics/gemm_rs_compute.hpp"
+#include "sm100_rs_reduce.hpp"  // SM100RSReduceRuntime (reuse existing definition)
 
 namespace deep_gemm {
 
 // ════════════════════════════════════════════════════════════════
-//  Single-kernel Pull-based GEMM + Reduce-Scatter (MegaMoE warp layout + Flux RS scheduling)
+//  TRUE Flux-style PULL-based GEMM + Reduce-Scatter (dual-kernel)
+//
+//    Kernel 1 (GEMM compute, 256T, no comm warps):
+//        sm100_bf16_gemm_rs_impl — epilogue scatter-writes each tile to the LOCAL
+//        scatter buffer slot[dst_rank] + sets a LOCAL per-tile ready flag. No NVLink
+//        traffic in the GEMM epilogue (this is the core Flux win over push-based v3).
+//
+//    Kernel 2 (RS reduce, 256T/CTA, pull):
+//        sm100_rs_reduce_impl<..., kPullBased=true> — for each tile of this rank's chunk,
+//        polls every src rank's REMOTE flag, accumulates every src rank's REMOTE slot[R]
+//        (via sym_buffer.map P2P), writes the final output, then resets the remote flags.
+//
+//    Stream-level overlap: GEMM compute on compute_stream, RS reduce on comm_stream,
+//    coordinated by CUDA events. Per-tile ready flags give natural tile-level overlap.
+// ════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Dedicated comm stream + events for the PULL GEMM+RS path.
+// NOTE: distinct names from the push-based v3 helpers to avoid ODR clashes within the
+// same translation unit (both headers may be included together by python_api.cpp).
+inline cudaStream_t get_gemm_rs_pull_comm_stream() {
+    static thread_local auto stream = at::cuda::getStreamFromPool(true, at::cuda::current_device());
+    return stream.stream();
+}
+
+inline cudaEvent_t get_gemm_rs_pull_launched_event() {
+    static thread_local cudaEvent_t event = []() -> cudaEvent_t {
+        cudaEvent_t evt;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&evt, cudaEventDisableTiming));
+        return evt;
+    }();
+    return event;
+}
+
+inline cudaEvent_t get_gemm_rs_pull_comm_done_event() {
+    static thread_local cudaEvent_t event = []() -> cudaEvent_t {
+        cudaEvent_t evt;
+        DG_CUDA_RUNTIME_CHECK(cudaEventCreateWithFlags(&evt, cudaEventDisableTiming));
+        return evt;
+    }();
+    return event;
+}
+
+} // anonymous namespace
+
+// ════════════════════════════════════════════════════════════════
+//  GEMM compute kernel runtime (Part 1) — 256T, no comm warps
 // ════════════════════════════════════════════════════════════════
 class SM100BF16GemmRSRuntime final : public LaunchRuntime<SM100BF16GemmRSRuntime> {
 public:
@@ -28,7 +77,7 @@ public:
         int num_ranks;
         at::ScalarType y_dtype;
         at::ScalarType comm_dtype;
-        GemmRSConfig config;
+        GemmRSComputeConfig config;
 
         layout::SymBuffer<> sym_buffer_ptrs;
         void* output;
@@ -38,12 +87,12 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        // Kernel template parameters (new order matching MegaMoE style):
+        // Kernel template parameters:
         //   BLOCK_M, BLOCK_N, BLOCK_K, kNumStages,
         //   kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
         //   kNumMulticast, kIsMulticastOnA,
         //   kSwapAB, kWithAccumulation,
-        //   kNumCommThreads, kNumNonEpilogueThreads, kNumEpilogueThreads,
+        //   kNumNonEpilogueThreads, kNumEpilogueThreads,
         //   kNumSMs, kNumRanks,
         //   cd_dtype_t, comm_dtype_t
         return fmt::format(R"(
@@ -58,7 +107,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {}, {},
-        {}, {}, {},
+        {}, {},
         {}, {},
         {},
         {}
@@ -69,7 +118,7 @@ static void __instantiate_kernel() {{
     args.config.swizzle_a_mode, args.config.swizzle_b_mode, args.config.swizzle_cd_mode,
     args.config.num_multicast, args.config.is_multicast_on_a ? "true" : "false",
     args.config.swap_ab ? "true" : "false", args.config.with_accumulation ? "true" : "false",
-    args.config.num_rs_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
+    args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.y_dtype),
     to_string(args.comm_dtype));
@@ -94,7 +143,7 @@ static void __instantiate_kernel() {{
 };
 
 // ════════════════════════════════════════════════════════════════
-//  统一入口: 启动单 kernel GEMM + Pull RS (Blackwell optimized)
+//  统一入口: TRUE Flux PULL-based GEMM + Reduce-Scatter (dual-kernel, overlapped)
 // ════════════════════════════════════════════════════════════════
 static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
                                   const torch::Tensor& a,
@@ -111,30 +160,39 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_sms = device_runtime->get_num_sms();
     const auto m = runtime_m_per_rank * num_ranks;
-    auto config = get_gemm_rs_config(m, n, k, num_sms, static_cast<int>(a.element_size()), num_ranks);
+    auto config = get_gemm_rs_compute_config(m, n, k, num_sms, static_cast<int>(a.element_size()), num_ranks);
 
     DG_HOST_ASSERT(config.block_k == 64);
+    DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
 
-    // ── 创建 TMA 描述符 ──
-    // A: token activations [M, K] → TMA 2D load, multicast to 2 CTAs
+    // ── Step 0: reset NVLink barrier state and synchronize the comm stream ──
+    // The GEMM compute kernel uses nvlink_barrier which persists state in the first
+    // kNumBarrierSignalBytes(32) of sym_buffer; zero it before each launch to avoid stale state.
+    const auto comm_stream = get_gemm_rs_pull_comm_stream();
+    DG_CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
+    const auto compute_stream = at::cuda::getCurrentCUDAStream();
+    constexpr uint64_t kBarrierRegionBytes = 32;  // kNumBarrierSignalBytes from GemmRSWorkspace
+    DG_CUDA_RUNTIME_CHECK(cudaMemsetAsync(sym_buffer.data_ptr<int8_t>(), 0,
+                                           kBarrierRegionBytes, compute_stream.stream()));
+
+    // ── Create TMA descriptors ──
+    // A: token activations [M, K] → TMA 2D load, multicast to 2 CTAs when mc=2
     const auto tensor_map_a = make_tma_2d_desc(a,
                                                k, m,
                                                config.block_k, config.load_block_m,
                                                static_cast<int>(a.stride(-2)),
                                                config.swizzle_a_mode);
-    // B: weights [N, K] → TMA 2D load, multicast to 2 CTAs
+    // B: weights [N, K] → TMA 2D load
     const auto tensor_map_b = make_tma_2d_desc(b,
                                                k, n,
                                                config.block_k, config.load_block_n,
                                                static_cast<int>(b.stride(-2)),
                                                config.swizzle_b_mode);
 
-    DG_HOST_ASSERT(comm_dtype == torch::kBFloat16 or comm_dtype == torch::kFloat);
+    // ── Step 1: launch GEMM compute kernel on compute_stream ──
+    const int total_threads = config.num_non_epilogue_threads + config.num_epilogue_threads;
 
-    // Total threads = comm + non-epilogue + epilogue
-    const int total_threads = config.num_rs_threads + config.num_non_epilogue_threads + config.num_epilogue_threads;
-
-    const SM100BF16GemmRSRuntime::Args args = {
+    const SM100BF16GemmRSRuntime::Args gemm_args = {
         .max_m_per_rank = max_m_per_rank,
         .runtime_m_per_rank = runtime_m_per_rank,
         .m = m, .n = n, .k = k,
@@ -152,9 +210,63 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
                                   config.num_multicast)
     };
 
-    const auto code = SM100BF16GemmRSRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_bf16_gemm_rs_nt", code);
-    SM100BF16GemmRSRuntime::launch(runtime, args);
+    const auto gemm_code = SM100BF16GemmRSRuntime::generate(gemm_args);
+    const auto gemm_runtime = compiler->build("sm100_bf16_gemm_rs_nt", gemm_code);
+    SM100BF16GemmRSRuntime::launch(gemm_runtime, gemm_args);
+
+    // Record event after GEMM kernel launch (compute_stream)
+    auto gemm_launched_event = get_gemm_rs_pull_launched_event();
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(gemm_launched_event, compute_stream.stream()));
+
+    // ── Step 2: launch RS reduce (pull) on comm_stream ──
+    // comm_stream waits only for GEMM kernel launch (not completion) — overlap happens
+    // naturally via per-tile flag polling.
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(comm_stream, gemm_launched_event, 0));
+
+    const int total_tiles = (runtime_m_per_rank + config.block_m - 1) / config.block_m *
+                            ((n + config.block_n - 1) / config.block_n);
+    const int grid_size = std::min(total_tiles, num_sms);
+
+    const SM100RSReduceRuntime::Args reduce_args = {
+        .runtime_m_per_rank = runtime_m_per_rank,
+        .n = n,
+        .max_m_per_rank = max_m_per_rank,
+        .num_ranks = num_ranks,
+        .y_dtype = y.scalar_type(),
+        .comm_dtype = comm_dtype,
+        .config = config,
+        .pull_based = true,
+        .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        .output = y.data_ptr(),
+        .launch_args = LaunchArgs(grid_size, 256, 0, 1)
+    };
+
+    const auto reduce_code = SM100RSReduceRuntime::generate(reduce_args);
+    const auto reduce_runtime = compiler->build("sm100_rs_reduce", reduce_code);
+
+    // Launch RS reduce on comm_stream via direct kernel launch
+    // (LaunchRuntime::launch always targets getCurrentCUDAStream, so we bypass it).
+    {
+        const auto reduce_kernel = reduce_runtime->kernel;
+        const dim3 grid_dim = {static_cast<unsigned>(grid_size), 1, 1};
+        const dim3 block_dim = {256, 1, 1};
+        auto launch_config = construct_launch_config(
+            reduce_kernel, comm_stream, 0, grid_dim, block_dim, 1, false);
+        uint32_t ru_m = static_cast<uint32_t>(runtime_m_per_rank);
+        uint32_t ru_n = static_cast<uint32_t>(n);
+        uint32_t ru_sm = static_cast<uint32_t>(max_m_per_rank);
+        auto* ru_output = reduce_args.output;
+        auto ru_sym_buffer = reduce_args.sym_buffer_ptrs;
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(reduce_kernel, launch_config,
+            ru_output, ru_sym_buffer, ru_m, ru_n, ru_sm));
+    }
+
+    // Record comm_done_event on comm_stream
+    auto comm_done_event = get_gemm_rs_pull_comm_done_event();
+    DG_CUDA_RUNTIME_CHECK(cudaEventRecord(comm_done_event, comm_stream));
+
+    // ── Step 3: compute_stream waits for RS reduce to complete ──
+    DG_CUDA_RUNTIME_CHECK(cudaStreamWaitEvent(compute_stream.stream(), comm_done_event, 0));
 }
 
 } // namespace deep_gemm

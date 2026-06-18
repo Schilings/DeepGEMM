@@ -20,21 +20,21 @@ using namespace deep_gemm::math;
 //  Independent kernel that reduces partial results from all ranks into final output.
 //  Runs on a separate CUDA stream, overlapping with the GEMM compute kernel.
 //
-//  Design:
-//    - Each CTA handles one tile of the output
-//    - Per-tile polling of ready flags (set by GEMM kernel epilogue)
-//    - FP32 accumulation for precision (BF16 partial → FP32 acc → BF16 output)
-//    - 256T/CTA for full memory bandwidth utilization
+//  Two communication models, switched at compile time via `kPullBased`:
 //
-//  Overlap mechanism:
-//    - GEMM kernel computes tiles in round-robin interleaved order
-//    - This kernel polls per-tile ready flags, processing tiles as they complete
-//    - Natural pipeline: while GEMM computes later tiles, we reduce earlier ones
+//    * kPullBased = false (PUSH, v3 legacy):
+//        GEMM epilogue pushed partials to remote rank's buffer via NVLink, and wrote the
+//        self chunk directly to `output`. Here we read the LOCAL partial slots (indexed by
+//        SOURCE rank) plus the self contribution already in `output`, accumulate, write back.
 //
-//  Precision:
-//    - Even with comm_dtype=BF16 (saving NVLink bandwidth), we accumulate in FP32
-//    - This matches NCCL's behavior and eliminates multi-rank accumulation error
-//    - With 8 ranks: BF16 __hadd2 ×7 → max_diff~32 vs FP32 acc ×7 → max_diff=0
+//    * kPullBased = true (TRUE Flux PULL):
+//        GEMM epilogue only wrote LOCAL scatter buffer slot[dst_rank] + set LOCAL flag.
+//        Here rank R, for each tile of its own chunk, polls every src rank's REMOTE flag
+//        (flag[R][m][n] mapped to src), accumulates every src rank's REMOTE slot[R] (mapped),
+//        and writes `output`. After consuming, it resets the remote flags (wait_eq_reset).
+//
+//  Precision: always FP32 accumulation regardless of comm_dtype (matches NCCL behaviour,
+//  eliminates multi-rank BF16 accumulation error).
 //
 // ============================================================================================
 
@@ -42,7 +42,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumRanks,
           typename cd_dtype_t,
           typename comm_dtype_t = cd_dtype_t,
-          uint32_t kNumThreads = 256>
+          uint32_t kNumThreads = 256,
+          bool kPullBased = false>
 __global__ void __launch_bounds__(kNumThreads, 4)
 sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
                       const layout::SymBuffer<kNumRanks> sym_buffer,
@@ -64,6 +65,9 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
     constexpr uint32_t kVecBytes = 16;
     constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);  // 8 for BF16, 4 for FP32
     const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
+    const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
+
+    constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
 
     // Process tiles assigned to this CTA
     for (uint32_t tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
@@ -72,11 +76,18 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
         const uint32_t base_row = my_m_block * BLOCK_M;
         const uint32_t base_col = my_n_block * BLOCK_N;
 
-        // Phase 1: Poll ALL ranks ready flags for this tile
+        // ── Phase 1: Poll ready flags for this tile ──
         if (tid < kNumRanks) {
             const uint32_t src_rank = tid;
-            auto* poll_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
-            constexpr int64_t kTimeoutCycles = 30ll * 2000000000ll;
+            uint32_t* poll_ptr;
+            if constexpr (kPullBased) {
+                // PULL: poll src_rank's REMOTE flag for our chunk (slot = rank_idx).
+                auto* local_flag = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
+                poll_ptr = reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag, src_rank));
+            } else {
+                // PUSH: poll LOCAL flag of src_rank slot.
+                poll_ptr = workspace.get_ready_ptr(src_rank, my_m_block, my_n_block);
+            }
             const auto start_clock = clock64();
             while (ld_acq_sys(poll_ptr) == 0u) {
                 if (clock64() - start_clock >= kTimeoutCycles) {
@@ -88,109 +99,110 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
         }
         __syncthreads();
 
-        // Phase 2: Vectorized reduce with FP32 accumulation
-        // Key insight: always accumulate in FP32 regardless of comm_dtype
-        // This matches NCCL's behavior and eliminates multi-rank BF16 accumulation error
-        if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
-            // BF16 communication + FP32 accumulation
-            // This is the recommended path: saves NVLink bandwidth while maintaining precision
-            const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
+        // ── Phase 2: Vectorized reduce with FP32 accumulation ──
+        for (uint32_t vec_offset = tid; vec_offset < vecs_per_tile; vec_offset += kNumThreads) {
+            const uint32_t elem_offset = vec_offset * kVecSize;
+            const uint32_t tile_row = elem_offset / BLOCK_N;
+            const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
+            const uint32_t global_row = base_row + tile_row;
+            const uint32_t global_col = base_col + tile_col;
 
-            for (uint32_t vec_offset = tid; vec_offset < vecs_per_tile; vec_offset += kNumThreads) {
-                const uint32_t elem_offset = vec_offset * kVecSize;
-                const uint32_t tile_row = elem_offset / BLOCK_N;
-                const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
-                const uint32_t global_row = base_row + tile_row;
-                const uint32_t global_col = base_col + tile_col;
+            if (global_row >= runtime_m_per_rank or global_col >= shape_n)
+                continue;
 
-                if (global_row >= runtime_m_per_rank or global_col >= shape_n)
-                    continue;
+            auto* out_ptr = output + global_row * shape_n + global_col;
 
-                // Load self-rank contribution from output (BF16)
-                auto* out_ptr = output + global_row * shape_n + global_col;
-                uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
+            float acc[kVecSize];
+            #pragma unroll
+            for (uint32_t i = 0; i < kVecSize; ++ i)
+                acc[i] = 0.0f;
 
-                // Initialize FP32 accumulator from self-rank BF16 data
-                float acc[kVecSize];
-                const auto* self_bf16 = reinterpret_cast<const __nv_bfloat16*>(&self_data);
-                #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++i)
-                    acc[i] = __bfloat162float(self_bf16[i]);
-
-                // Accumulate N-1 remote ranks in FP32
+            if constexpr (kPullBased) {
+                // PULL: sum every src rank's REMOTE slot[rank_idx] (self maps to local).
                 #pragma unroll 1
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++rank_iter) {
+                for (uint32_t src_rank = 0; src_rank < kNumRanks; ++ src_rank) {
+                    auto* local_partial = workspace.get_partial_ptr<comm_dtype_t>(rank_idx, global_row, global_col);
+                    const comm_dtype_t* partial_ptr = sym_buffer.map(local_partial, src_rank);
+                    uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
+                    if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
+                        const auto* bf16 = reinterpret_cast<const __nv_bfloat16*>(&data);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += __bfloat162float(bf16[i]);
+                    } else {
+                        const auto* f32 = reinterpret_cast<const float*>(&data);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += f32[i];
+                    }
+                }
+            } else {
+                // PUSH: self contribution already in `output`, remote contributions in LOCAL slots.
+                uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
+                if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
+                    const auto* self_bf16 = reinterpret_cast<const __nv_bfloat16*>(&self_data);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        acc[i] = __bfloat162float(self_bf16[i]);
+                } else {
+                    const auto* self_f32 = reinterpret_cast<const float*>(&self_data);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVecSize; ++ i)
+                        acc[i] = self_f32[i];
+                }
+                #pragma unroll 1
+                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++ rank_iter) {
                     const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
                     const comm_dtype_t* partial_ptr =
                         workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
-
-                    uint4 remote_data = *reinterpret_cast<const uint4*>(partial_ptr);
-                    const auto* remote_bf16 = reinterpret_cast<const __nv_bfloat16*>(&remote_data);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++i)
-                        acc[i] += __bfloat162float(remote_bf16[i]);
+                    uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
+                    if constexpr (cute::is_same_v<comm_dtype_t, cutlass::bfloat16_t>) {
+                        const auto* bf16 = reinterpret_cast<const __nv_bfloat16*>(&data);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += __bfloat162float(bf16[i]);
+                    } else {
+                        const auto* f32 = reinterpret_cast<const float*>(&data);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kVecSize; ++ i)
+                            acc[i] += f32[i];
+                    }
                 }
+            }
 
-                // Convert FP32 accumulator back to BF16 and write
-                uint4 result;
+            // Write final reduced result
+            uint4 result;
+            if constexpr (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>) {
                 auto* out_bf16 = reinterpret_cast<__nv_bfloat16*>(&result);
                 #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++i)
+                for (uint32_t i = 0; i < kVecSize; ++ i)
                     out_bf16[i] = __float2bfloat16(acc[i]);
-                *reinterpret_cast<uint4*>(out_ptr) = result;
-            }
-        } else {
-            // FP32 communication + FP32 accumulation
-            const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
-
-            for (uint32_t vec_offset = tid; vec_offset < vecs_per_tile; vec_offset += kNumThreads) {
-                const uint32_t elem_offset = vec_offset * kVecSize;
-                const uint32_t tile_row = elem_offset / BLOCK_N;
-                const uint32_t tile_col = elem_offset - tile_row * BLOCK_N;
-                const uint32_t global_row = base_row + tile_row;
-                const uint32_t global_col = base_col + tile_col;
-
-                if (global_row >= runtime_m_per_rank or global_col >= shape_n)
-                    continue;
-
-                auto* out_ptr = output + global_row * shape_n + global_col;
-                uint4 self_data = *reinterpret_cast<const uint4*>(out_ptr);
-
-                float acc[kVecSize];
-                const auto* self_f32 = reinterpret_cast<const float*>(&self_data);
-                #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++i)
-                    acc[i] = self_f32[i];
-
-                #pragma unroll 1
-                for (uint32_t rank_iter = 0; rank_iter < kNumRanks - 1; ++rank_iter) {
-                    const uint32_t src_rank = (rank_idx + 1 + rank_iter) % kNumRanks;
-                    const comm_dtype_t* partial_ptr =
-                        workspace.get_partial_ptr<comm_dtype_t>(src_rank, global_row, global_col);
-
-                    uint4 data = *reinterpret_cast<const uint4*>(partial_ptr);
-                    const auto* comm_data = reinterpret_cast<const comm_dtype_t*>(&data);
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kVecSize; ++i)
-                        acc[i] += static_cast<float>(comm_data[i]);
-                }
-
-                uint4 result;
+            } else {
                 auto* out_f32 = reinterpret_cast<float*>(&result);
                 #pragma unroll
-                for (uint32_t i = 0; i < kVecSize; ++i)
+                for (uint32_t i = 0; i < kVecSize; ++ i)
                     out_f32[i] = acc[i];
-                *reinterpret_cast<uint4*>(out_ptr) = result;
+            }
+            *reinterpret_cast<uint4*>(out_ptr) = result;
+        }
+
+        // ── Phase 3: Reset the flags consumed for this tile ──
+        if constexpr (kPullBased) {
+            // PULL: reset each src rank's REMOTE flag (each flag[rank_idx][m][n] is consumed
+            // only by this rank, so no cross-consumer race). Must happen after data is read.
+            __syncthreads();
+            if (tid < kNumRanks) {
+                const uint32_t src_rank = tid;
+                auto* local_flag = workspace.get_ready_ptr(rank_idx, my_m_block, my_n_block);
+                auto* remote_flag = reinterpret_cast<uint32_t*>(sym_buffer.map(local_flag, src_rank));
+                st_rel_sys(remote_flag, 0u);
             }
         }
     }
 
-    // Reset ready flags for next iteration (consumer resets after consuming)
-    // This is critical: flags must be reset AFTER reduce is done, not before.
-    // In the serial execution model, GEMM compute sets flags → sync → RS reduce reads + resets.
-    // In the overlap model, RS reduce processes tiles as their flags become ready, then resets.
-    __syncthreads();
-    {
+    // PUSH legacy: reset LOCAL flags after consuming all tiles.
+    if constexpr (not kPullBased) {
+        __syncthreads();
         const uint32_t flags_per_slot = num_m_blocks * num_n_blocks;
         const uint32_t total_flags = kNumRanks * flags_per_slot;
         for (uint32_t flag_idx = tid; flag_idx < total_flags; flag_idx += kNumThreads) {

@@ -86,10 +86,14 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
     """
     BF16 GEMM + Reduce-Scatter 统一入口。
 
-    默认实现采用 Flux 思路的 dual-kernel v3（计算/通信解耦 + tile-ready overlap）。
+    默认实现为真·Flux pull 式 dual-kernel：
+      - Kernel 1 (GEMM compute, 256T, 无 comm warps): epilogue 纯本地 scatter 写 slot[dst_rank] + 置本地 flag
+      - Kernel 2 (RS reduce, pull): 从各远端 rank 的 scatter buffer 拉取并 FP32 reduce → output
+      - compute_stream / comm_stream 流级 overlap + per-tile flag tile 级 overlap
+
     可通过环境变量 `DG_GEMM_RS_IMPL` 切换：
-      - `v3` / `flux` / `dual`（默认）
-      - `single` / `legacy`（旧单 kernel 路径）
+      - `pull` / `flux` / `dual`（默认）—— 真·Flux pull 式（计算 epilogue 不跨卡，通信集中在 reduce kernel）
+      - `v3` / `push` —— 旧的 push 式 dual-kernel（GEMM epilogue 跨 NVLink push partial）
 
     Args:
         y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
@@ -101,11 +105,12 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
     """
     assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt is for SM100/B-series GPUs'
 
-    impl = os.getenv('DG_GEMM_RS_IMPL', 'v3').strip().lower()
-    if impl in ('v3', 'flux', 'dual'):
+    impl = os.getenv('DG_GEMM_RS_IMPL', 'pull').strip().lower()
+
+    if impl in ('v3', 'push'):
         return bf16_gemm_rs_nt_v3(y, a, b, sym_buffer, num_tokens_per_rank, compiled_dims)
 
-    if impl in ('single', 'legacy'):
+    if impl in ('pull', 'flux', 'dual', 'single', 'legacy', 'default', ''):
         comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
         _C.bf16_gemm_rs_nt(
             y, a, b,
@@ -120,7 +125,7 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
         return
 
     raise ValueError(
-        f"Unsupported DG_GEMM_RS_IMPL={impl!r}, expected one of: v3/flux/dual/single/legacy"
+        f"Unsupported DG_GEMM_RS_IMPL={impl!r}, expected one of: pull/flux/dual (default) or v3/push"
     )
 
 

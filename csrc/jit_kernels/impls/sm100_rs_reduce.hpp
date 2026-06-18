@@ -30,6 +30,7 @@ public:
         at::ScalarType y_dtype;
         at::ScalarType comm_dtype;
         GemmRSComputeConfig config;
+        bool pull_based = false;
 
         layout::SymBuffer<> sym_buffer_ptrs;
         void* output;
@@ -41,7 +42,8 @@ public:
         //   BLOCK_M, BLOCK_N,
         //   kNumRanks,
         //   cd_dtype_t, comm_dtype_t,
-        //   kNumThreads=256
+        //   kNumThreads=256,
+        //   kPullBased
         return fmt::format(R"(
 #include <deep_gemm/impls/sm100_rs_reduce.cuh>
 
@@ -53,13 +55,15 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        256
+        256,
+        {}
     >);
 }};
 )", args.config.block_m, args.config.block_n,
     args.num_ranks,
     to_string(args.y_dtype),
-    to_string(args.comm_dtype));
+    to_string(args.comm_dtype),
+    args.pull_based ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
