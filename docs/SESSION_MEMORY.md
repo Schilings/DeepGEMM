@@ -62,8 +62,9 @@ python benchmarks/bench_gemm_rs.py 2 5
 ## D. 当前基线摘要（融合 GEMM-RS：epilogue push-scatter + 本地连续 reduce）
 
 - 正确性：`test_gemm_rs.py 2` 6/6 PASS，max_diff=0.0。
-- 性能（2 GPU，13 shape）：geo_mean **1.148x vs torch / 1.142x vs sep**，avg fused **1232T**
-  （本会话从 0.606x/660T 提升，已超历史 push-v3 的 1.10x）。**全部 13 shape ≥1.02x vs sep**，峰值 1.40x。
+- 性能：**跨 2/4/8 GPU 稳定 ~1.14x vs sep**（2 卡 1.142x / 4 卡 1.148x / 8 卡 1.140x；
+  focus 中大 1.14–1.20x；avg fused 1193–1232T）。正确性 6/6 PASS @ {2,4,8} 卡。已超历史 push-v3(1.10x)。
+  reduce kUnroll 随 rank 数自适应（`kNumRanks>=8?2:>=4?4:8`）防 8 卡寄存器 spilling。
 - 架构（关键）：**跨卡 NVLink 传输放进 GEMM epilogue 用 TMA async store、与 MMA 重叠**（这是单机
   >1.0x 的唯一可行路径——分离 reduce kernel 因 GEMM 独占 SM 寄存器无法共驻 overlap，实测零和）；
   **reduce 改为纯 1D 连续流式本地累加**（去 flag/poll/syncthreads，可见性靠末尾 system-scope nvlink_barrier）。

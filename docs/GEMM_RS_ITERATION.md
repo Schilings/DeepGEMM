@@ -398,10 +398,44 @@ host event 序（下轮 GEMM 等本轮 reduce）+ 起始 tag41 barrier 保证。
 
 ---
 
+## 2026-06-18：Iteration 11 — 4/8-GPU 验证 + reduce kUnroll 自适应 rank 数（保留）
+
+### 背景
+
+4/8 卡才是真实场景。首轮多卡 bench：4 卡 geo 1.140x vs sep（全 ≥1.02x）很好；
+但 **8 卡部分超大 N·K 跌到 0.93–0.98x**。根因：reduce 的寄存器缓冲 `reg[kUnroll][kNumRanks]`
+= `kUnroll×kNumRanks×4` 寄存器；kUnroll=8、kNumRanks=8 → **256 regs/线程，严重 spilling**。
+
+### Change
+
+`impls/sm100_rs_reduce.cuh`：kUnroll 随 rank 数自适应，保持 in-flight loads(≈kUnroll×kNumRanks)
+与寄存器压力恒定：`kUnroll = kNumRanks>=8 ? 2 : (kNumRanks>=4 ? 4 : 8)`。
+
+### Result（2 GPU，8 iter；4/8 GPU，8 iter）
+
+- 正确性：`test_gemm_rs.py {2,4,8}` 全 **6/6 PASS, max_diff=0.0**。
+- **跨规模 geo_mean（vs sep）高度一致**：
+
+  | GPUs | vs torch | vs sep | focus 中大 (vs sep) | avg fused | 全部 ≥1.0x? |
+  |------|------|------|------|------|------|
+  | 2 | 1.148x | **1.142x** | 1.143x | 1232T | 是（最差 1.02x）|
+  | 4 | 1.129x | **1.148x** | 1.199x | 1225T | 是（最差 1.00x）|
+  | 8 | 1.103x | **1.140x** | **1.202x** | 1193T | 基本是（仅 16384x7168x7168 0.98x）|
+
+- 8 卡修复效果：geo 1.079→**1.140x** vs sep；小 K 0.97→1.06x；focus 1.142→1.202x。
+
+### Verdict
+
+- **保留**。自适应 kUnroll 在 4/8 卡都是净赢，2 卡不变。多卡（4/8）主线稳定 **~1.14x vs sep**、
+  focus 中大 **1.20x**，已全面超越 separate 基线与历史 push-v3(1.10x)。
+- 唯一残余：8 卡 `16384x7168x7168`（M/rank=16384，N=K=7168，reduce 需读 8 个 235MB slot）0.98x vs sep。
+
+---
+
 ## 下一步计划
 
-1. 4/8-GPU 扩展验证；多 rank（kNumRanks>2）下连续 reduce 的带宽与正确性。
-2. 超大 N·K（16384x7168x7168 1.02x）：epilogue push 调度进一步被 MMA 掩盖。
+1. 8 卡超大 N·K（16384x7168x7168）：reduce 读 8 slot 体量大，探索 reduce 分块与 push 调度进一步重叠。
+2. 多 rank 下 reduce 的 HBM 带宽上限分析（8 slot 读 + 1 写 = 9× 输出流量）。
 3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---

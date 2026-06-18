@@ -50,7 +50,11 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
     // Vectorization: 128-bit = uint4
     constexpr uint32_t kVecBytes = 16;
     constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);  // 8 for BF16, 4 for FP32
-    constexpr uint32_t kUnroll = 8;                                  // vectors-in-flight per thread
+    // Vectors-in-flight per thread. The register buffer is reg[kUnroll][kNumRanks] uint4
+    // (= kUnroll*kNumRanks*4 regs), so scale kUnroll DOWN as kNumRanks grows to keep the
+    // outstanding-load count (≈ kUnroll*kNumRanks) and register pressure roughly constant —
+    // otherwise 8 ranks × kUnroll=8 would need 256 regs/thread and spill badly.
+    constexpr uint32_t kUnroll = kNumRanks >= 8 ? 2u : (kNumRanks >= 4 ? 4u : 8u);
 
     // This rank's chunk is a contiguous [runtime_m_per_rank x shape_n] region per slot.
     const uint32_t total_elems = runtime_m_per_rank * shape_n;
