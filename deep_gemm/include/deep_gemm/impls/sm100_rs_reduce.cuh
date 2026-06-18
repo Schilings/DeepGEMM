@@ -65,7 +65,7 @@ sm100_rs_reduce_impl(cd_dtype_t* __restrict__ output,
     // Vectorization: 128-bit = uint4
     constexpr uint32_t kVecBytes = 16;
     constexpr uint32_t kVecSize = kVecBytes / sizeof(comm_dtype_t);  // 8 for BF16, 4 for FP32
-    constexpr uint32_t kUnroll = 4;                                  // vectors-in-flight per thread
+    constexpr uint32_t kUnroll = 8;                                  // vectors-in-flight per thread
     const uint32_t elems_per_tile = BLOCK_M * BLOCK_N;
     const uint32_t vecs_per_tile = elems_per_tile / kVecSize;
 

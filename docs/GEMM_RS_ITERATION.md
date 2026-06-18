@@ -198,11 +198,40 @@
 
 ---
 
-## 下一步计划
+## 2026-06-18：Iteration 6 — carveout 死胡同确认 + kUnroll 调参（关键结论）
 
-1. 重新评估 **SM carveout + 调度 overlap**（reduce 已高 MLP，少 SM 即可跑满带宽）；
-2. reduce 微调：`kUnroll` 扫参、self-rank 本地快路径、cp.async 预取远端 → smem；
-3. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化；
+### Change / 实验
+
+1. **重测 SM carveout**（reduce 已高 MLP 后）：`DG_RS_REDUCE_SMS ∈ {16,32,48,64}`，3 个代表 shape。
+2. **kUnroll 扫参**：4 → 8（BLOCK 128×128 bf16 时 vecs_per_tile=2048=`kNumThreads×8`，单趟无尾部浪费）。
+
+### Result
+
+- **carveout 仍全面更差**（C=16 时 fused 是 C=0 的 ~3x）。reduce 吞吐**仍随 SM 数近似线性**
+  （即使 MLP=8），且 full-SM 下远端读仅 ~360–510 GB/s（NVLink5 峰值 ~900GB/s）。
+- **kUnroll 4→8 仅 ~1%**（如 16384x7168x7168：3175→3149us）。MLP 已到顶，保留 8（更干净）。
+- 正确性 `tests/test_gemm_rs.py 2` 6/6 PASS。
+
+### Verdict（关键结论，指导后续）
+
+- **SM-load reduce 已触及自身天花板**（既非 MLP 不足，也非带宽峰值，而是 SM 走 LSU 跨 NVLink
+  load 的有效并发上限）。
+- **SM carveout 对 SM-based reduce 是零和**：从 GEMM 切 C 个 SM → GEMM tensor 吞吐降 C/148，
+  而 reduce 延迟-bound 需要很多 SM 才能跟上；代数上「最优切分」点的 fused ≈ 当前串行值甚至更差
+  （大/小 shape 均验证）。**放弃 carveout**（`DG_RS_REDUCE_SMS` 保留但默认 0）。
+- 要突破 ~0.80x → **必须把跨卡搬运移出 SM 算力路径**，用 **TMA/copy 引擎** 把远端 partial 异步
+  fetch 进 smem（SM 只做加法），并与 GEMM **共驻同一批 SM**（不抢 tensor core）——即 Flux
+  `Sm90ReduceScatterDma` / push-v3 TMA-epilogue 的本质。这是下一个大迭代。
+
+---
+
+## 下一步计划（核心：TMA-engine overlap）
+
+1. **TMA 流水线 reduce**：用 `cp.async.bulk`(TMA) 把远端 slot[R] 异步搬进 smem 的多级 buffer，
+   SM 仅做 FP32 加法 → 把 NVLink 搬运从 LSU 移到 TMA 引擎；先验证 SM100 远端 P2P TMA load 可行
+   （push-v3 已验证远端 TMA *store* 可用，load 大概率可行）。
+2. 让 reduce 与 GEMM 真正共驻 overlap（GEMM 让出少量 smem/warp 槽，reduce TMA 不抢 tensor core）。
+3. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化。
 4. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---
