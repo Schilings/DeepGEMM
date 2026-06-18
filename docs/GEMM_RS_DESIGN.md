@@ -29,8 +29,11 @@
   - rank R 对自身 chunk 每个 tile：poll 各 src 的远端 flag → 累加各 src 的远端 `slot[R]`（FP32）→ 写 output → 远端 reset flag。
 - **JIT 运行时**：`csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp`
   - dual-kernel 编排：`compute_stream` 跑 GEMM、`comm_stream` 跑 pull reduce、CUDA event 同步实现流级 + tile 级 overlap。
-- **RS reduce 运行时**：`csrc/jit_kernels/impls/sm100_rs_reduce.hpp`（`pull_based` 开关；push v3 复用同一 runtime）。
-- **Python 接口**：`deep_gemm/gemm_rs/__init__.py`（`pull` 默认；`v3/push` 为旧 push dual-kernel 备选）。
+- **RS reduce 运行时**：`csrc/jit_kernels/impls/sm100_rs_reduce.hpp`（pull-only）。
+- **Python 接口**：`deep_gemm/gemm_rs/__init__.py`（唯一 pull 实现，无 impl 开关）。
+
+> 注：既然 Flux 单机 RS 就是 pull，旧的 push dual-kernel（`v3` / `gemm_rs_compute` /
+> `sm100_bf16_gemm_rs_compute.*`）已整体删除，主线只保留 pull。
 - **测试**：`tests/test_gemm_rs.py`、`tests/test_gemm_rs_quick.py`
 - **性能脚本**：`benchmarks/bench_gemm_rs.py`
 

@@ -134,12 +134,37 @@
 
 ---
 
+## 2026-06-18：Iteration 4 — 收敛到 pull，删除 push 路径
+
+### Change
+
+既然 Flux 单机 RS = pull（`Sm90ReduceScatterDma` 为 TMA 远端 fetch；push 仅用于跨节点 ring），
+主线收敛为唯一 pull 实现，**删除 push 路径**：
+
+- 删除 `impls/sm100_bf16_gemm_rs_compute.cuh`、`jit_kernels/impls/sm100_bf16_gemm_rs_compute.hpp`、
+  `apis/gemm_rs_compute.hpp`、孤立的 `heuristics/gemm_rs.hpp`、`*.cuh.bak`；
+- 删除 v3 test/bench：`tests/test_gemm_rs_v3.py`、`quick_bench_v3.py`、
+  `benchmarks/bench_gemm_rs_v3.py`、`benchmarks/bench_gemm_a2a_pdl.py`；
+- `sm100_rs_reduce.cuh/.hpp` 收敛为 **pull-only**（移除 `kPullBased`/`pull_based` 开关）；
+- `python_api.cpp` 移除 `gemm_rs_compute` 注册；`gemm_rs/__init__.py` 移除 `bf16_gemm_rs_nt_v3` 与
+  `DG_GEMM_RS_IMPL` 开关，`deep_gemm/__init__.py` 移除其导出。
+
+### Result
+
+- 编译通过；`tests/test_gemm_rs.py 2` → **6/6 PASS, max_diff=0.0**（清理后正确性不变）。
+
+### Verdict
+
+- **保留**。主线唯一 = 真·Flux pull。性能优化转入下一步（TMA 流水线 fetch）。
+
+---
+
 ## 下一步计划
 
-1. 排查 Iteration 3 的 2-GPU 运行期错误，跑通 `tests/test_gemm_rs.py 2`（6/6）；
-2. 跑通后用 `bench_gemm_rs.py` 复测 pull 路径，与旧 push(v3) 基线对比；
-3. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化；
-4. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
+1. **核心**：把 pull RS reduce 从朴素标量 P2P 读改造为 **TMA 流水线 fetch+reduce**
+   （远端→smem 的 producer/consumer，对齐 Flux `Sm90ReduceScatterDma`），并优化 GEMM/reduce 的 SM 划分与重叠；
+2. 继续 `K=7168` 弱势点（`4096x4096x7168`）定向优化；
+3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---
 

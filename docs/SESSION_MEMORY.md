@@ -22,10 +22,11 @@
   - Kernel 1 `sm100_bf16_gemm_rs.cuh`：256T 无 comm warps，epilogue 纯本地 scatter write `slot[dst_rank]` + 本地 flag；
   - Kernel 2 `sm100_rs_reduce.cuh`（`kPullBased=true`）：从各远端 rank pull `slot[R]` 做 FP32 reduce → output，读后远端 reset flag；
   - host `sm100_bf16_gemm_rs.hpp` 双流编排（compute_stream + comm_stream + event）。
-  - 旧 push dual-kernel 仍可 `DG_GEMM_RS_IMPL=v3/push` 回退。
+  - **push 路径已删除**：Flux 单机 RS 即 pull，故移除旧 `v3`/`gemm_rs_compute`/`sm100_bf16_gemm_rs_compute.*`
+    及其 test/bench；主线唯一 = pull，无 `DG_GEMM_RS_IMPL` 开关。
 - **当前状态**：正确性达标——`test_gemm_rs.py 2` **6/6 PASS, max_diff=0.0**（已修复 nvlink_barrier 死锁：
-  移除与对端信号竞争的 per-call barrier memset）。**性能回退**：2-GPU geo_mean ≈ 0.58x（fused 628T vs sep 1065T），
-  慢于 push v3(~1.10x)；待把 pull reduce 改成 TMA 流水线 fetch。高性能回退用 `DG_GEMM_RS_IMPL=v3`。
+  移除与对端信号竞争的 per-call barrier memset）。**性能待优化**：2-GPU geo_mean ≈ 0.58x（fused 628T vs sep 1065T）；
+  下一步把 pull reduce 改成 TMA 流水线 fetch（Flux `Sm90ReduceScatterDma` 风格）。
 - shape 集合已固定为用户指定 13 个，重点 5 个 shape 单独追踪。
 - 学习方向：参考 `flux` GEMM-RS（H 卡稳定上线），在 B 卡做策略适配。
 - 主线策略：按 `SM100_2CTA_CLUSTER`，中大 shape 优先 `mc=2`（2-CTA cluster）。
@@ -58,19 +59,17 @@ python benchmarks/bench_gemm_rs.py 2 5
 
 ---
 
-## D. 当前基线摘要
+## D. 当前基线摘要（pull，唯一路径）
 
-- **历史基线为旧 push 路径**（`DG_GEMM_RS_IMPL=v3` 可复现）：
-  - 指定 13 shape（2 GPU，3 iter）：geo mean ≈ 1.110x（vs torch） / 1.100x（vs sep）
-  - 重点 5 shape（2 GPU，4 iter）：geo mean ≈ 1.174x（vs torch） / 1.161x（vs sep）
-  - 短板：`2048x7168x2048` ≈ 0.98x；重点集最弱 `4096x4096x7168` ≈ 1.05x
-- **新 pull 路径基线：待跑通正确性后重测**（预期 GEMM 吞吐因消除 384T 寄存器 spilling 而提升）。
+- 正确性：`test_gemm_rs.py 2` 6/6 PASS，max_diff=0.0。
+- 性能（2 GPU，3 iter，13 shape）：geo_mean ≈ **0.58x**（fused 628T vs sep 1065T）—— 待优化。
+- 历史（已删除的 push v3，仅供参考）：曾约 1.10x，但 push 非 Flux 单机路径，已移除。
 
 ---
 
 ## E. 下一步最短路径
 
-1. **排查 pull 路径 2-GPU 运行期错误**（首屏真实报错：kernel assert / nvlink barrier timeout / IMA），跑通 `test_gemm_rs.py 2`。
-2. 跑通后跑 `bench_gemm_rs.py` 重测 pull 基线，与 push(v3) 对比。
-3. 继续针对 `K=7168` 场景定向优化；每次改动先跑重点 5 shape 防回退。
-4. 阶段性立即 `commit + push`，避免服务器回收导致进度丢失。
+1. **性能优化（核心）**：把 pull RS reduce 从「朴素标量 P2P 读」改造为 **TMA 流水线 fetch+reduce**
+   （远端→smem 的 producer/consumer，对齐 Flux `Sm90ReduceScatterDma`）；并优化 GEMM/reduce 的 SM 划分与重叠。
+2. 每次改动跑 `test_gemm_rs.py 2`（正确性）+ `bench_gemm_rs.py 2 3`（性能）。
+3. 阶段性立即 `commit + push`，避免服务器回收导致进度丢失。

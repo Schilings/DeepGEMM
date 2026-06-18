@@ -84,16 +84,11 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
                     num_tokens_per_rank: int,
                     compiled_dims: str = 'nk'):
     """
-    BF16 GEMM + Reduce-Scatter 统一入口。
+    BF16 GEMM + Reduce-Scatter 统一入口 —— 真·Flux pull 式 dual-kernel。
 
-    默认实现为真·Flux pull 式 dual-kernel：
       - Kernel 1 (GEMM compute, 256T, 无 comm warps): epilogue 纯本地 scatter 写 slot[dst_rank] + 置本地 flag
       - Kernel 2 (RS reduce, pull): 从各远端 rank 的 scatter buffer 拉取并 FP32 reduce → output
       - compute_stream / comm_stream 流级 overlap + per-tile flag tile 级 overlap
-
-    可通过环境变量 `DG_GEMM_RS_IMPL` 切换：
-      - `pull` / `flux` / `dual`（默认）—— 真·Flux pull 式（计算 epilogue 不跨卡，通信集中在 reduce kernel）
-      - `v3` / `push` —— 旧的 push 式 dual-kernel（GEMM epilogue 跨 NVLink push partial）
 
     Args:
         y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
@@ -105,69 +100,8 @@ def bf16_gemm_rs_nt(y: torch.Tensor,
     """
     assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt is for SM100/B-series GPUs'
 
-    impl = os.getenv('DG_GEMM_RS_IMPL', 'pull').strip().lower()
-
-    if impl in ('v3', 'push'):
-        return bf16_gemm_rs_nt_v3(y, a, b, sym_buffer, num_tokens_per_rank, compiled_dims)
-
-    if impl in ('pull', 'flux', 'dual', 'single', 'legacy', 'default', ''):
-        comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
-        _C.bf16_gemm_rs_nt(
-            y, a, b,
-            sym_buffer.buffer,
-            sym_buffer.handle.buffer_ptrs,
-            sym_buffer.group.rank(),
-            sym_buffer.num_max_tokens_per_rank,
-            num_tokens_per_rank,
-            compiled_dims,
-            comm_dtype_str,
-        )
-        return
-
-    raise ValueError(
-        f"Unsupported DG_GEMM_RS_IMPL={impl!r}, expected one of: pull/flux/dual (default) or v3/push"
-    )
-
-
-def bf16_gemm_rs_nt_v3(y: torch.Tensor,
-                        a: torch.Tensor,
-                        b: torch.Tensor,
-                        sym_buffer: GemmRSSymmBuffer,
-                        num_tokens_per_rank: int,
-                        compiled_dims: str = 'nk'):
-    """
-    BF16 GEMM + Reduce-Scatter v3: Dual-kernel architecture with stream-level overlap.
-
-    This implementation (Flux-inspired dual-kernel design):
-    - Uses two separate kernels on different CUDA streams
-    - Kernel 1 (GEMM Compute, 256T): No Comm Warps — pure GEMM + epilogue scatter write + flag signaling
-    - Kernel 2 (RS Reduce, 256T/CTA): Per-tile polling — waits for flags, then reduces partial results
-    - Natural tile-level pipeline overlap via per-tile ready flags
-
-    Stream orchestration:
-    - GEMM compute kernel runs on compute_stream
-    - RS reduce kernel runs on comm_stream
-    - RS reduce polls per-tile flags set by GEMM epilogue — natural tile-level overlap
-    - Event synchronization ensures correct ordering
-
-    Expected performance:
-    - GEMM throughput should match standard 256T GEMM (~1100 TFLOPS on B300)
-    - vs single-kernel 384T GEMM (~600 TFLOPS, register spilling bottleneck)
-    - Overlap: while GEMM computes later tiles, RS reduce reduces earlier ones
-
-    Args:
-        y: Output tensor [tokens_per_rank, N], dtype bfloat16 or float32
-        a: Input matrix [total_tokens, K], dtype bfloat16
-        b: Weight matrix [N, K] (NT layout), dtype bfloat16
-        sym_buffer: Symmetric buffer (created via get_symm_buffer_for_gemm_rs)
-        num_tokens_per_rank: Actual tokens per rank for this call
-        compiled_dims: JIT compilation dimension string
-    """
-    assert torch.cuda.get_device_capability()[0] == 10, 'bf16_gemm_rs_nt_v3 is for SM100/B-series GPUs'
     comm_dtype_str = 'fp32' if sym_buffer.use_fp32_comm else 'bf16'
-
-    # Single C++ entry point handles both kernels + stream orchestration + event sync
-    _C.bf16_gemm_rs_v3_nt(
+    _C.bf16_gemm_rs_nt(
         y, a, b,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs,

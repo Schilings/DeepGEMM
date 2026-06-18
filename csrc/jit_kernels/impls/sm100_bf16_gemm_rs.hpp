@@ -236,7 +236,6 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
         .y_dtype = y.scalar_type(),
         .comm_dtype = comm_dtype,
         .config = config,
-        .pull_based = true,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .output = y.data_ptr(),
         .launch_args = LaunchArgs(grid_size, 256, 0, 1)
