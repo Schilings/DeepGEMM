@@ -348,10 +348,60 @@ Iter 6/7 后又做了两组实验，**证明分离 reduce kernel 在本硬件结
 
 ---
 
+## 2026-06-18：Iteration 10 — 去 flag + 纯 1D 连续流式 reduce（决定性突破，保留）
+
+### 洞察
+
+reduce 在 stream 序上**总是等 GEMM 完成才跑**（host 的 `gemm_launched_event` 在 compute_stream 中
+排在 GEMM 之后 → 等于 GEMM 完成），且 GEMM 末尾的 system-scope `nvlink_barrier`(tag42, `red_add_rel_sys`
+/`ld_acq_sys`) 已保证所有 push 全局可见。所以 **per-tile flag 轮询完全冗余**。
+而每 rank 的 chunk 在 buffer 内是 `[token][hidden]` **完全连续**的。
+
+### Change
+
+- `impls/sm100_rs_reduce.cuh`：**去掉 flag/poll/reset 与全部 `__syncthreads`**，重写为
+  **纯 1D 连续流式**累加（`output[i]=Σ_s slot[s][i]`，i 遍历整个连续 chunk），kUnroll=8 高 MLP、
+  完美 coalesce → 打满本地 HBM 带宽。
+- `impls/sm100_bf16_gemm_rs.cuh`：epilogue 去掉 per-tile flag set（map+`st_rel_sys`），可见性交给末尾 barrier。
+
+正确性依据：reduce 等 GEMM 完成 + tag42 system-scope barrier 保证 push 可见；跨迭代 slot 覆盖安全由
+host event 序（下轮 GEMM 等本轮 reduce）+ 起始 tag41 barrier 保证。
+
+### Result
+
+- 正确性：`tests/test_gemm_rs.py 2` → **6/6 PASS, max_diff=0.0**（连跑 2 次稳定）。
+- 性能（2 GPU，8 iter，13 shape）：geo_mean **1.148x vs torch / 1.142x vs sep**，avg fused **1232T**
+  （Iter 9 的 0.989x/1082T → **1.148x/1232T**，单步 +0.15x）。
+- **全部 13 shape ≥ 1.02x vs sep**（最差 16384x7168x7168 1.02x）。旧最大短板小 K 反成最强：
+  **2048x7168x2048 1.31x、4096x7168x2048 1.38x**；focus 中大 5 shape **1.143x vs sep**。
+
+### Verdict
+
+- **保留**。决定性突破——整体稳超 1.0x 且超过历史 push-v3(1.10x)。
+- 根因：旧 flag 版每 tile 有 `ld_acq_sys` 轮询 + 2×`__syncthreads` + strided 寻址，对小 shape 开销占比极大；
+  连续流式全部消除。
+
+---
+
+## 本会话总进度（2026-06-18）— 0.61x → 1.14x
+
+| 阶段 | vs torch | vs sep | avg fused | 关键改动 |
+|------|------|------|------|------|
+| 起点 | 0.606x | 0.611x | 660T | 朴素标量 P2P pull reduce |
+| Iter 5 | 0.733x | 0.739x | 814T | reduce 高 MLP |
+| Iter 7 | 0.835x | 0.836x | 906T | reduce grid 过订阅 ×2 |
+| Iter 8 | 0.964x | 0.973x | 1054T | 跨卡传输 fused 进 epilogue（push-scatter，与 MMA 重叠）|
+| Iter 9 | 0.989x | 0.995x | 1082T | 去冗余 CPU 同步 |
+| **Iter 10** | **1.148x** | **1.142x** | **1232T** | **去 flag + 纯 1D 连续流式 reduce** |
+
+**全部 13 shape ≥1.02x vs sep；focus 中大 1.143x；峰值 1.40x。**
+
+---
+
 ## 下一步计划
 
-1. **小 K / 超大 N·K 弱势点**：缩短本地 reduce tail（已快），或优化 epilogue push 调度使其更好被 MMA 掩盖。
-2. 探索 reduce 与 GEMM tile 级 overlap 的可行路径（本地 reduce 不抢 NVLink）。
+1. 4/8-GPU 扩展验证；多 rank（kNumRanks>2）下连续 reduce 的带宽与正确性。
+2. 超大 N·K（16384x7168x7168 1.02x）：epilogue push 调度进一步被 MMA 掩盖。
 3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
 
 ---

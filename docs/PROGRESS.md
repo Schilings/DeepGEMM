@@ -13,16 +13,15 @@
   独立 RS reduce kernel 从远端 pull）。详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
 - **正确性**：`tests/test_gemm_rs.py 2` → **6/6 PASS，max_diff=0.0**（逐元素精确匹配参考）。
   （修复了一处 nvlink_barrier 死锁：移除了与对端信号竞争的 per-call barrier memset。）
-- **性能（2 GPU，13 shape）**：geo_mean **0.989x vs torch / 0.995x vs sep**，fused 平均 **1082T**
-  （本会话起点 0.606x / 660T）。**中大 shape（主目标）已稳超 1.0x**：
-  - **User focus 中大 5 shape：1.043x vs torch / 1.049x vs sep** ✅
-  - **M/rank≥8192：1.030x vs sep** ✅
-  - 单 shape >1.0x：8192x4096x4096 1.09x、4096x7168x4096 1.07x、8192x7168x4096 1.07x、16384x7168x4096 1.06x 等。
-  - **Iter 5**（高 MLP reduce）0.733x/814T；**Iter 6** 确认 carveout 零和死胡同；
-    **Iter 7**（reduce grid 过订阅 ×2，`DG_RS_REDUCE_MULT` 默认 2）0.835x/906T；
-    **Iter 8**（跨卡传输 fused 进 epilogue push-scatter，与 MMA 重叠 + reduce 读本地）0.964x/1054T；
-    **Iter 9**（去冗余 CPU 同步）→ **0.989x/1082T**。详见 `GEMM_RS_ITERATION.md`(Iter 5–9)。
-  - 残余拖累：小 K（2048x7168x2048 0.85x，separate≈纯 GEMM、NCCL RS≈0，结构性难超）。
+- **性能（2 GPU，13 shape）**：geo_mean **1.148x vs torch / 1.142x vs sep**，fused 平均 **1232T**
+  （本会话起点 0.606x / 660T）。**全部 13 shape ≥ 1.02x vs sep**，峰值 1.40x。
+  - **User focus 中大 5 shape：1.143x vs sep** ✅；**N=7168 9 shape：1.159x vs sep** ✅。
+  - 旧最大短板小 K 反成最强：**2048x7168x2048 1.31x、4096x7168x2048 1.38x**。
+  - 迭代路径：**Iter 5** 高 MLP reduce 0.733x；**Iter 6** carveout 零和死胡同；
+    **Iter 7** reduce grid 过订阅 ×2（`DG_RS_REDUCE_MULT` 默认 2）0.835x；
+    **Iter 8** 跨卡传输 fused 进 epilogue（push-scatter，与 MMA 重叠 + reduce 读本地）0.964x；
+    **Iter 9** 去冗余 CPU 同步 0.989x；**Iter 10** 去 flag + 纯 1D 连续流式 reduce → **1.148x/1232T**。
+    详见 `GEMM_RS_ITERATION.md`(Iter 5–10)。
 - **架构**：主线 = 真·融合 GEMM-RS——epilogue **push-scatter**（TMA 跨卡 store 与 MMA 重叠）+ 本地 reduce。
   （注：跨卡传输融进 epilogue 是单机 NVLink 上唯一能让 RS 藏进 compute、从而 >1.0x 的方式；
   与 Flux 融合 GemmRS 让 comm overlap compute 同源。）

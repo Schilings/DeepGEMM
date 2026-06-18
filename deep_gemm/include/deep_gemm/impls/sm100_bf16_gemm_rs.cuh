@@ -458,16 +458,12 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                 }
             }
 
-            // Wait all TMA stores (incl. the remote push) complete, then set the ready flag
-            // on dst_rank's buffer: flag[rank_idx][m][n] (release.sys, visible to dst's reduce).
+            // Wait all TMA stores (incl. the remote push) for this tile to complete.
+            // NOTE: no per-tile ready flag is needed — the GEMM's final system-scope
+            // nvlink_barrier guarantees all pushes are globally visible before the kernel
+            // exits, and the host orders the RS-reduce strictly after GEMM completion.
             ptx::tma_store_wait<0>();
             cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
-
-            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                auto* flag_ptr = workspace.get_ready_ptr(rank_idx, local_m_block_idx, n_block_idx);
-                auto* push_flag = sym_buffer.map(flag_ptr, dst_rank);
-                ptx::st_rel_sys(push_flag, 1u);
-            }
         }
     }
 

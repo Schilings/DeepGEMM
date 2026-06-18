@@ -59,15 +59,18 @@ python benchmarks/bench_gemm_rs.py 2 5
 
 ---
 
-## D. 当前基线摘要（pull，唯一路径）
+## D. 当前基线摘要（融合 GEMM-RS：epilogue push-scatter + 本地连续 reduce）
 
 - 正确性：`test_gemm_rs.py 2` 6/6 PASS，max_diff=0.0。
-- 性能（2 GPU，13 shape）：geo_mean **0.835x vs torch / 0.836x vs sep**，avg fused **906T**
-  （本会话从 0.606x/660T 提升）。最差 shape 0.77x。
-- 提速来源：Iter 5 reduce 高 MLP（预计算基址 + kUnroll=8 批量发射）+ Iter 7 reduce grid 过订阅 ×2
-  （`DG_RS_REDUCE_MULT`，默认 2）。Iter 6 已确认 SM carveout 是零和死胡同。
-- 下一步冲 >1.0x：TMA-engine reduce（`cp.async.bulk` 异步 fetch 远端连续段 → smem，SM 仅加法）+ 与 GEMM 共驻 overlap。
-- 历史（已删除的 push v3，仅供参考）：曾约 1.10x，但 push 非 Flux 单机路径，已移除。
+- 性能（2 GPU，13 shape）：geo_mean **1.148x vs torch / 1.142x vs sep**，avg fused **1232T**
+  （本会话从 0.606x/660T 提升，已超历史 push-v3 的 1.10x）。**全部 13 shape ≥1.02x vs sep**，峰值 1.40x。
+- 架构（关键）：**跨卡 NVLink 传输放进 GEMM epilogue 用 TMA async store、与 MMA 重叠**（这是单机
+  >1.0x 的唯一可行路径——分离 reduce kernel 因 GEMM 独占 SM 寄存器无法共驻 overlap，实测零和）；
+  **reduce 改为纯 1D 连续流式本地累加**（去 flag/poll/syncthreads，可见性靠末尾 system-scope nvlink_barrier）。
+- 提速路径：Iter5 高 MLP → Iter7 reduce grid 过订阅 ×2 → Iter8 epilogue push-scatter → Iter9 去冗余 CPU 同步
+  → **Iter10 去 flag + 连续流式 reduce（决定性）**。
+- 关键死胡同（勿重试）：SM carveout（`DG_RS_REDUCE_SMS`，零和，默认 0）；smem reserve 让 reduce 共驻（GEMM 208-reg epilogue 占满，须砍寄存器→spilling）。
+- 下一步：4/8-GPU 扩展验证；超大 N·K（16384x7168x7168 1.02x）的 push 调度优化。
 
 ---
 
