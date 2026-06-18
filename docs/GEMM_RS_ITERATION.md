@@ -432,11 +432,38 @@ host event 序（下轮 GEMM 等本轮 reduce）+ 起始 tag41 barrier 保证。
 
 ---
 
-## 下一步计划
+## 2026-06-18：Iteration 12 — 调度改为 chunk-sequential ring「self 最后」（保留）
 
-1. 8 卡超大 N·K（16384x7168x7168）：reduce 读 8 slot 体量大，探索 reduce 分块与 push 调度进一步重叠。
-2. 多 rank 下 reduce 的 HBM 带宽上限分析（8 slot 读 + 1 写 = 9× 输出流量）。
-3. 每轮迭代按本文件模板沉淀：**Change / Result / Verdict**。
+### Change
+
+`impls/sm100_bf16_gemm_rs.cuh` `get_next_block`：把 dst_rank 的遍历由「per-tile 交错」改为
+**phase 外层 / tile 内层**——先把其它 rank 的 chunk（远端 push）整段算完（ring 顺序 r→r+1,r+2,…，
+各 rank 同 phase 目标互不相同 = NVLink 负载均衡、无热点），**自己的 chunk 放最后**（epilogue 映射本地、
+末尾零跨卡通信，且远端 push 全部前置 → 更好被 MMA 掩盖、并可与上一次调用的 reduce/通信重叠）。
+
+### Result（focus 中大 5 shape，8 iter，vs sep）
+
+| GPUs | 调度前(interleaved) | 调度后(self-last ring) |
+|------|------|------|
+| 2 | ~1.14x | 1.130x（2 rank 收益最小，噪声内）|
+| 4 | 1.199x | 1.199x（持平）|
+| 8 | 1.202x | **1.233x（+0.03x）** |
+
+- 8 卡 focus 单 shape（vs sep）：4096x4096x4096 1.28x、4096x7168x4096 1.26x、8192x4096x4096 1.29x、
+  8192x7168x4096 1.21x、4096x4096x7168 1.14x；avg fused 1337T。
+- 正确性：`test_gemm_rs.py {4,8}` 6/6 PASS。
+
+### Verdict
+
+- **保留**。rank 越多收益越明显（8 卡 +0.03x，4 卡持平，2 卡噪声内），无回退。符合「self 最后 + ring 均衡」预期。
+
+---
+
+## 下一步计划（冲 >1.3x，聚焦中大 shape）
+
+1. 进一步缩小未掩盖的 reduce/push tail；探索 reduce 与下一次 GEMM 的跨调用 overlap（需 double-buffer scatter buffer）。
+2. 用 ncu/nsys profile fused kernel，定位 epilogue push 是否拖慢 GEMM、tail 占比。
+3. 每轮迭代必须记录 4/8 卡 × focus shape 的 benchmark 数据（见 RULE.md §7.1）。
 
 ---
 

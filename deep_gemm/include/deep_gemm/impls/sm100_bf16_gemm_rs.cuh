@@ -206,8 +206,15 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         phase ^= stage_idx == 0;
     };
 
-    // ── Block scheduling: round-robin interleaved over dst_ranks (self last) ──
-    // 让每个 rank 优先产出「其它 dst_rank」的 chunk，使远端 rank 的 RS reduce 尽早开始 pull。
+    // ── Block scheduling: chunk-sequential ring, SELF chunk LAST ──
+    // Phase p = rank_offset (OUTER) goes 0..kNumRanks-1; within a phase all (m,n) tiles of one
+    // chunk are produced (INNER). dst_rank = (rank_idx + p + 1) for p < R-1 (remote, ring), and
+    // = rank_idx for p == R-1 (self). Effects:
+    //   * Remote-push chunks are produced FIRST → their TMA pushes are front-loaded and overlap
+    //     with the long compute phase (and can overlap the PREVIOUS call's reduce/comm).
+    //   * At any phase all ranks target DISTINCT peers (r→r+p+1) → ring-balanced NVLink (no hotspot).
+    //   * SELF chunk is produced LAST and its epilogue store maps to LOCAL (no NVLink) → the tail
+    //     carries zero cross-card traffic.
     auto get_next_block = [&](uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t& iter_idx) {
         const uint32_t m_blocks_per_cluster = kNumMulticast;
         const uint32_t num_m_pairs_per_rank = num_m_blocks_per_rank / m_blocks_per_cluster;
@@ -217,8 +224,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         if (block_idx >= total_cluster_tiles)
             return false;
 
-        const uint32_t local_tile_idx = block_idx / kNumRanks;
-        const uint32_t rank_offset = block_idx % kNumRanks;
+        const uint32_t rank_offset = block_idx / tiles_per_rank;     // phase (OUTER): self last
+        const uint32_t local_tile_idx = block_idx - rank_offset * tiles_per_rank;  // tile (INNER)
         const uint32_t dst_rank = (rank_offset + 1 < kNumRanks) ?
             (rank_idx + rank_offset + 1) % kNumRanks : rank_idx;
 

@@ -143,6 +143,20 @@ python benchmarks/bench_gemm_rs.py 2 8
 - 必要时更新 `docs/GEMM_RS_DESIGN.md`（主线设计变化）
 - `docs/SESSION_MEMORY.md`（新会话接班信息）
 
+### 7.1 迭代必须记录 benchmark 数据（强制）
+
+每轮迭代在 `docs/GEMM_RS_ITERATION.md` 的该 Iteration 条目里，**必须记录实测 benchmark 数据**，且要覆盖：
+
+- **不同 GPU 数**：至少 4 卡与 8 卡（中大 shape 的真实场景），有条件再附 2 卡；
+- **不同 shape**：至少给出 focus 中大 shape 集合的逐 shape speedup（vs torch / vs sep），
+  以及整体 geo_mean 与分组（N=7168 / K=7168 / M/rank≥2048 等）；
+- 记录格式：表格（GPUs × shape × {vs torch, vs sep, fused TFLOPS}）或等价清单，
+  必须能与上一轮直接对比，体现是收益还是回退。
+- **出现性能回退必须回退该改动**（git）并在条目中写明回退原因。
+
+> 口径：以 4/8 卡中大 shape 的几何均值为主要决策依据（大部分真实数据是中大 shape）。
+> 极端 shape（如 M/rank=16384 且 N=K=7168）暂不作为主目标。
+
 ---
 
 ## 8. 重要提醒
