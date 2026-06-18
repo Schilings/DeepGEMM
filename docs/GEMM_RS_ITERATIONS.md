@@ -1,5 +1,8 @@
 # AKO4ALL Iteration Log — GEMM+RS Kernel Optimization
 
+> ⚠️ 历史迭代日志：包含不同机器与阶段的实验结果。
+> 当前可复现结论请优先查看 `docs/PROGRESS.md`。
+
 ## Summary
 
 | Iter | Direction | Geo Mean Speedup | Best Shape | Status |

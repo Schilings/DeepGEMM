@@ -1,5 +1,8 @@
 # Flux GEMM+RS 架构深度分析与 DeepGEMM 借鉴指南
 
+> ⚠️ 历史研究文档：用于架构参考，不代表当前代码状态。
+> 当前真实进度请以 `docs/PROGRESS.md` 为准。
+
 > 研究日期：2026-06-15
 > 目标：分析 ByteDance Flux (SM90 Hopper) GEMM+RS 架构原理，提取可借鉴到 DeepGEMM (SM100 Blackwell) 的设计思想
 

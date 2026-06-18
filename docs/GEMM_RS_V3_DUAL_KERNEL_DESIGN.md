@@ -1,5 +1,8 @@
 # GEMM+RS v3: Dual-Kernel Architecture Design
 
+> ⚠️ 历史方案文档：记录曾探索的 v3 双核路径。
+> 是否继续采用以 `docs/PROGRESS.md` 与当前实测结果为准。
+
 ## 动机
 
 当前单kernel方案 (iter23, geo_mean 1.040x) 已到微优化天花板。核心瓶颈：

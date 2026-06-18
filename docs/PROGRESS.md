@@ -1,840 +1,103 @@
-# GEMM+RS 开发进度文档
+# DeepGEMM GEMM-RS 进度（单一事实来源）
 
-## 项目概述
-在 NVIDIA Blackwell B300 SXM6 (SM100) 8-GPU 平台上实现 GEMM+Reduce-Scatter 融合算子。
-目标：大模型训练的长上下文、大 hidden dim (7168) 场景下显著提升吞吐量。
-
----
-
-## 进度日志
-
-### 2026-06-10
-
-#### Bug Fix: 移除 warpgroup_reg_dealloc（死锁根因）
-
-**问题描述**：
-kernel 在多 GPU 测试时 hang（超时）。
-
-**根因分析**：
-1. Load Warp A/B 的分支条件是 `warp_idx == X and cute::elect_one_sync()`
-2. `elect_one_sync()` 导致只有 lane 0 进入分支体
-3. 分支体中调用了 `cutlass::arch::warpgroup_reg_dealloc<40>()`
-4. `warpgroup_reg_dealloc` 的底层 PTX 是 `setmaxnreg.dec.sync.aligned.u32`
-5. `.sync.aligned` 语义要求 warp 中所有 32 个 lane 必须同时执行该指令
-6. 只有 lane 0 执行 → 其他 31 lane 永远等不到 → **死锁**
-
-**关键知识点**：
-- `setmaxnreg.dec.sync.aligned` 是 warp-collective 操作，类似 `__syncwarp()` 
-- 标准 GEMM（`sm100_bf16_gemm.cuh`）中 Load warp 完全没有使用 `reg_dealloc`
-- MegaMoE 使用 `reg_dealloc` 时是在 `if (warp_idx == X)` 中，没有 `elect_one_sync()`
-
-**修复方案**：
-直接移除 Load Warp A/B、MMA Warp、Reserved Warp 中的 `warpgroup_reg_dealloc` 调用。
-保留 Comm Warps (W0-3) 的 `reg_dealloc<48>`（无 `elect_one_sync()`，全 warp 执行，不会死锁）。
-保留 Epilogue Warps (W8-11) 的 `reg_alloc<208>`（同理）。
-
-**理由**：标准 GEMM 不用，我们也不用。先确保 kernel 能正常运行再考虑寄存器优化。
-
-**修改文件**：
-- `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`
-  - 移除第 450 行 `cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>()` (Load A)
-  - 移除第 489 行 `cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>()` (Load B)
-  - 移除第 526 行 `cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>()` (MMA)
-  - 移除第 606 行 `cutlass::arch::warpgroup_reg_dealloc<kNumNonEpiRegisters>()` (Reserved)
+> 最后更新：2026-06-18 04:16
+> 适用分支：`main`
+> 最近关键提交：`05a4716`（本地环境修复与基准诊断）
 
 ---
 
-#### 架构理解：标准 GEMM vs GEMM-RS 的 warp 角色对比
+## 当前目标
 
-| 标准 GEMM (sm100_bf16_gemm.cuh) | GEMM-RS (sm100_bf16_gemm_rs.cuh) |
-|------|------|
-| W0: Load (elect_one_sync) | W0-3: Comm (reg_dealloc<48>) |
-| W1: MMA Issue (is_leader_cta) | W4: Load A (elect_one_sync) |
-| W2: TMEM Allocator | W5: Load B (elect_one_sync) |
-| W3+: Epilogue | W6: MMA Issue (is_leader_cta) |
-| | W7: Reserved |
-| | W8-11: Epilogue (reg_alloc<208>) |
-
-标准 GEMM 只有 128 线程非 epilogue (4 warps) + epilogue warps。
-GEMM-RS 有 384 线程 = 128(comm) + 128(non-epi) + 128(epilogue)。
+在当前环境上先完成：
+1. **稳定跑通 GEMM-RS 正确性链路**（已完成 2 GPU quick）
+2. **恢复可复现 benchmark**（当前仍阻塞）
+3. 在可复现 benchmark 基础上，继续 AKO4ALL 性能迭代
 
 ---
 
-#### mbarrier 语义笔记
-
-- `mbar.init(expected_arrivals)` 后 parity=1（wait(1) 立即通过，wait(0) 阻塞）
-- 第一次 arrive 完成后 parity 翻转为 0
-- 对于 full_barriers：producer arrive 后 consumer 用 `wait(phase)` 等待
-- 对于 empty_barriers：consumer arrive 后 producer 用 `wait(phase^1)` 等待
-
----
-
-#### Bug Fix: Partial Buffer Slot 寻址错误
-
-**问题描述**：
-2 GPU 测试中，融合结果 `y_fused` 始终等于 `2 × d_ref[128:256]` 而非 `2 × d_ref[0:128]`。
-说明所有 rank 写入了相同的 slot，导致后写覆盖先写。
-
-**根因分析**：
-1. Symmetric Buffer 布局：每个 rank 的 buffer 有 `num_ranks` 个 slot
-2. 原始代码中 Epilogue 对所有 tile 写入 `workspace.get_partial_ptr(rank_idx, ...)`
-3. 即 rank 0 写 slot 0，rank 1 写 slot 1 —— 这意味着每个 rank 把所有 dest 的数据都写到自己编号的 slot
-4. Comm warp 从远端 rank 读取 `workspace.get_partial_ptr(src_rank, ...)` —— 读的是远端 rank 自己编号的 slot
-5. 但所有 M tile 的数据（属于不同 dest rank 的块）全都堆在同一个 slot → 后写覆盖先写
-
-**正确的语义**：
-- **写端（Epilogue）**：根据当前 tile 的 `dst_rank`，写到 `slot = dst_rank`
-- **读端（Comm Warp）**：从远端 rank 读 `slot = rank_idx`（即"我在远端的邮箱"）
-- 这样每个 rank 的数据分散在不同 slot 中，互不干扰
-
-**修复**：
-```c++
-// Epilogue: 写入 slot = dst_rank（而非 rank_idx）
-workspace.get_partial_ptr(dst_rank, token_idx, hidden_idx)
-workspace.get_ready_ptr(dst_rank, m_block_idx, n_block_idx)
-
-// Comm Warp: 从远端读 slot = rank_idx（而非 src_rank）
-workspace.get_partial_ptr(rank_idx, token_idx, hidden_idx)
-workspace.get_ready_ptr(rank_idx, m_block_idx, n_block_idx)
-```
-
-**关键理解**：
-slot 的含义是"这份数据要给谁"。rank A 写给 rank B 的数据放在 A 的 `slot[B]`。
-rank B 的 Comm warp 去远端 A 取数据时，读 A 的 `slot[B]` = `slot[rank_idx]`。
-
----
-
-#### Bug Fix: 本地 Ready Flag Race Condition
-
-**问题描述**：
-大 shape（total_tiles > 16）时，8 GPU 测试偶发 PASS/FAIL —— 结果数值偏差大。
-
-**根因分析**：
-1. Comm warp 在处理 `src_rank == rank_idx`（本地数据）时，原本跳过了 ready flag 检查
-2. 但 Epilogue 在**另一个 SM** 上执行，写入 partial buffer 可能尚未完成
-3. Comm warp 直接读取未就绪的 partial data → 数据不一致
-
-**修复**：
-对 `src_rank == rank_idx` 也执行 ready flag 轮询，等待本地 Epilogue 完成写入。
-
----
-
-#### Bug Fix: Multicast=2 (2-CTA Cluster) 正确性问题 — 已修复
-
-**问题描述**：
-启用 multicast=2 时，大 shape（compute_waves >= 0.5）计算结果错误。
-
-**根因分析（深度调研后发现）**：
-
-通过对比标准 GEMM (`sm100_bf16_gemm.cuh`) 和 CUTLASS tutorial (`04_mma_tma_2sm_sm100.cu`)：
-
-1. **标准 GEMM 的 scheduler**：每个 CTA 用自己的 `blockIdx.x` 独立调度
-   - `next_block_idx = iter * kNumSMs + blockIdx.x`
-   - 两个 CTA（blockIdx.x = 2i, 2i+1）得到**不同的 m_block_idx**
-   - CTA0 加载 A[m0]，CTA1 加载 A[m1]（不同行！）
-   - 2SM UMMA 跨两个 SM 的 SMEM 计算 UMMA_M=256 行
-
-2. **GEMM-RS 的 scheduler（BUG）**：两个 CTA 用 `cluster_idx` 统一调度
-   - `block_idx = cluster_idx`（两个 CTA 相同！）
-   - 两个 CTA 得到**相同的 m_block_idx**
-   - CTA0 和 CTA1 加载相同的 A 行 → UMMA 产生重复的 128 行输出
-
-3. **SM100 TMA `cta_group::2` 的语义**：
-   - `SM100_TMA_2SM_LOAD_2D`：`shared::cluster` 空间 TMA，数据写入本地 SMEM（不是 multicast）
-   - `SM100_TMA_2SM_LOAD_MULTICAST_2D`：额外 `multicast::cluster`，数据复制到所有 CTA
-   - DeepGEMM 使用的是前者——两个 CTA 各自独立 TMA，数据在各自 SMEM
-
-4. **TMEM 是每 SM 本地的**：
-   - 2SM UMMA 写入时，前 128 行 → SM0 的 TMEM，后 128 行 → SM1 的 TMEM
-   - Epilogue 中每个 CTA 只能读自己 SM 的 TMEM
-
-**修复方案（3 处修改）**：
-
-1. **Scheduler (`get_next_block`)**：按 M-tile pair 分配给 cluster
-   - CTA0（cta_rank=0）：得到 pair 中第一个 M-tile
-   - CTA1（cta_rank=1）：得到 pair 中第二个 M-tile
-   ```c++
-   local_m_block_idx = local_m_pair_idx * kNumMulticast + cta_rank;
-   ```
-
-2. **TMA Load**：移除 A 的 m_idx 偏移（scheduler 已给不同 m_block_idx）
-   - 之前：`load_m_idx += block_rank * LOAD_BLOCK_M`（错误！两个 CTA 已有相同 m_block）
-   - 之后：`load_m_idx = global_m`（各 CTA 的 global_m 已不同）
-   - B 的 split 保持不变：`load_n_idx += block_rank * LOAD_BLOCK_N`
-
-3. **Epilogue**：两个 CTA 独立写出（不再限制 leader only）
-   - 每个 CTA 写自己 m_block 的数据到对应 partial buffer slot
-   - 各自设置自己 tile 的 ready flag
-   - 无冲突（写不同地址）
-
-4. **Heuristics**：multicast=2 要求 `num_m_blocks_per_rank` 为偶数
-   ```c++
-   if (m_per_rank >= 256 && m_blocks_even && compute_waves(128, 2) >= 0.5f) {
-       num_multicast = 2;
-   }
-   ```
-
-**修改文件**：
-- `deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`：scheduler + TMA load + epilogue
-- `csrc/jit_kernels/heuristics/gemm_rs.hpp`：multicast=2 启用条件
-
-**状态**：代码修改已完成，编译通过。多 GPU 验证因测试环境端口冲突问题暂未完成（见下方 "当前阻塞问题"）。
-
----
-
-#### 已解决：多 GPU 测试环境端口冲突 ✅
-
-**问题描述**：
-在 8 卡 B300 SXM6 环境上运行 `test_gemm_rs.py` 时，`torch.distributed` 初始化始终失败，
-报错 `Address already in use`。
-
-**根因**：
-1. `mp.spawn` 的子进程在 `dist.destroy_process_group()` 后并未立即退出
-2. NCCL 后台线程继续占着 MASTER_PORT 和一堆 NCCL 内部端口
-3. 下次测试启动时端口仍被占用 → `EADDRINUSE`
-4. 大量僵尸进程 (`<defunct>`) 累积
-
-**修复方案（两处改进）**：
-
-1. **自动空闲端口发现**：在 `test_gemm_rs.py` 和 `test_gemm_rs_quick.py` 的主进程中，
-   使用 `socket.bind(('', 0))` 自动找空闲端口，不再依赖硬编码端口号。
-   `mp.spawn` 子进程通过环境变量继承端口。
-
-2. **强制子进程退出**：在子进程完成测试后调用 `os._exit(0)`，
-   避免 NCCL 后台线程继续占端口。
-
-**验证结果**：
-- 8 卡 `dist.init_process_group` ✅ 成功
-- 8 卡 `barrier` + `allreduce` ✅ 正确
-- 8 卡标准 GEMM (`bf16_gemm_nt`) ✅ 通过
-- GEMM-RS JIT 首次编译需要较长时间（>120s），需增大超时
-
-**下一步**：
-- 增大快速测试脚本的超时时间（120s → 600s）以适应首次 JIT 编译
-- 或先单独预编译 JIT 缓存，再跑测试
-
----
-
-#### 🔴 当前阻塞：multicast=2 Kernel 在 GPU 上 Hang（死循环）
-
-**问题描述**：
-8 卡测试中，所有前置检查点（dist.init ✅, barrier ✅, allreduce ✅, 标准 GEMM ✅, sym_buffer ✅）
-均通过，JIT 编译也成功完成（`kernel.cubin` 已生成），但 `bf16_gemm_rs_nt()` 调用后 **kernel 在 GPU
-上 hang**——8 卡 GPU 利用率全部 100%，日志停在 `sym_buffer created OK` 之后，`bf16_gemm_rs_nt OK`
-从未打印。
-
-**环境**：
-- 超时已从 120s 增大到 600s（环境变量 `TEST_TIMEOUT` 可配置）
-- JIT 缓存路径：`~/.deep_gemm/cache/kernel.sm100_bf16_gemm_rs_nt.5c472d0dea2cc8e214e2e2ee491b2a40/`
-- `kernel.cubin` 已成功生成（nvcc 编译完成），但无 `.so` 文件
-
-**分析**：
-1. kernel 编译成功 → 问题不在编译，而在 kernel 执行逻辑
-2. 8 卡 GPU 全 100% 利用率 → kernel 已成功 launch，不是 CPU 侧 hang
-3. 100% GPU + 无输出 → kernel 内部某处进入了 **无限 spin-wait（死循环）**
-4. 最可能的 hang 点：
-   - **Comm Warp spin-wait**：轮询远端 ready flag 永远等不到（Epilogue 未设 flag / flag 地址错）
-   - **Epilogue 未执行**：MMA 结果未写入 partial buffer → ready flag 从未被 set
-   - **2-CTA Cluster 同步问题**：leader/follower CTA 的 mbarrier arrive/wait 不匹配
-   - **Scheduler 死锁**：两个 CTA 在 M-tile pair 分配上产生冲突
-
-**与 multicast=1 的差异**：
-multicast=1（单 CTA）时 8 卡正确性 ALL PASS。multicast=2 引入的关键变化：
-1. Scheduler: `local_m_block_idx = local_m_pair_idx * 2 + cta_rank`（CTA0/CTA1 各取不同 M-tile）
-2. TMA Load: A 不再偏移 `block_rank * LOAD_BLOCK_M`（各 CTA 的 m_block_idx 已不同）
-3. Epilogue: 两个 CTA 独立写出（不限 leader only）
-4. Heuristics: `num_multicast=2`, `load_block_n=64`（B 矩阵按 N 方向 split）
-
-**下一步排查方向**：
-- 检查 heuristics 给的配置是否正确匹配 kernel 代码中的预期
-- 对比 multicast=1 和 multicast=2 时 kernel 中的 mbarrier 初始化和 arrive/wait 逻辑
-- 检查 Epilogue 在 multicast=2 时是否正确执行到 ready flag set 点
-- 可先强制 `num_multicast=1` 验证同一环境下 multicast=1 仍然 PASS
-
----
-
-#### Bug Fix: 8-GPU 测试阈值调整
-
-**问题描述**：
-8 GPU 测试使用 `max_diff < 2.0` 作为 PASS 条件，但 BF16 多次 reduce 累积误差超出该范围。
-
-**分析**：
-- 每次 BF16→FP32→BF16 round-trip 引入约 0.4% 相对误差
-- 8 rank 的 pull-based reduce 需要 7 次累加，每次读入 BF16 partial
-- 理论上 ~0.25% 累积相对误差，实测 max_diff 可达 16.0（对于大数值 tile）
-
-**修复**：
-将 PASS 条件改为 `rel_error < 0.01 * num_ranks`（约 8% 上界，实测约 0.25%）。
-
----
-
-#### 测试结果：8 GPU 正确性 ✅ ALL PASS
-
-```
-================================================================================
-  BF16 GEMM-RS Correctness Test (Pull-based): 8 GPUs
-  Testing 6 shapes (basic suite)
-================================================================================
-
-Shape (M/rank×N×K)     |  Max Diff  Mean Diff   Rel Err   Consist | Status
-256×512×1024           |  8.000000  0.5055009  0.002471  0.000000 | ✅ PASS
-256×1024×2048          |  8.000000  0.7128933  0.002467  0.000000 | ✅ PASS
-512×2048×4096          | 16.000000  1.0092461  0.002470  0.000000 | ✅ PASS
-1024×2048×4096         | 16.000000  1.0094017  0.002473  0.000000 | ✅ PASS
-256×7168×2048          | 16.000000  0.7151340  0.002471  0.000000 | ✅ PASS
-512×2048×7168          | 16.000000  1.3370969  0.002471  0.000000 | ✅ PASS
-
-  Summary: 6/6 shapes passed
-  ✅ ALL TESTS PASSED!
-```
-
-所有 rank 间一致性误差为 0（各 rank 输出完全相同），相对误差 ~0.25% 在 BF16 精度预期内。
-
----
-
-#### 架构知识：Pull-based RS 的 Symmetric Buffer 布局
-
-```
-Rank 0 Buffer:                    Rank 1 Buffer:
-┌─────────────────────┐           ┌─────────────────────┐
-│ slot[0]: 给 rank 0  │ ←── R1读  │ slot[0]: 给 rank 0  │ ←── R0读
-│ slot[1]: 给 rank 1  │ ←── R1读  │ slot[1]: 给 rank 1  │ ←── R0读
-│ ...                 │           │ ...                 │
-│ slot[7]: 给 rank 7  │           │ slot[7]: 给 rank 7  │
-└─────────────────────┘           └─────────────────────┘
-
-写端规则: rank R 的 Epilogue 写 tile → slot[dst_rank]
-读端规则: rank R 的 Comm warp 从远端 S 读 → S.slot[R]
-```
-
----
-
-#### M-Swizzle 调度优化
-
-为最大化 compute/comm overlap，rank i 的 M-tile 调度顺序：
-- 优先计算 rank (i+1)%N 的 chunk（远端数据先就绪）
-- 最后计算自己的 chunk
-
-这样 Comm warp 在 Epilogue 还在计算后续 tile 时就可以开始 pull 前面已就绪的远端 tile。
-
----
-
-#### 性能基准测试结果：8 GPU (Fused vs GEMM+NCCL RS)
-
-**测试配置**：8× B300 SXM6, NVLink Gen5, 20 iterations/shape
-
-```
-Shape (M/rank×N×K)     │  Separate    Fused   │ Sep TFLOPS Fus TFLOPS │ Speedup │ Comp/Comm
-128×512×1024           │    531.0μs   263.4μs │     12.8T     25.9T │   2.02x │    4.21x
-256×512×1024           │    518.1μs   360.3μs │     26.1T     37.6T │   1.44x │    4.21x  ← JIT首次编译
-256×1024×2048          │    160.5μs   379.6μs │    529.1T    223.6T │   0.42x │   16.85x
-512×2048×4096          │    188.2μs   441.1μs │   1461.0T    623.4T │   0.43x │   33.70x
-1024×2048×4096         │    177.3μs   452.5μs │    775.3T    303.7T │   0.39x │   33.70x
-2048×2048×4096         │    298.6μs   863.9μs │    920.4T    318.2T │   0.35x │   33.70x
-256×7168×2048          │    118.0μs   410.1μs │    509.6T    146.6T │   0.29x │   16.85x
-512×7168×2048          │    211.6μs   840.4μs │    568.2T    143.1T │   0.25x │   16.85x
-1024×7168×2048         │    338.2μs  1523.4μs │    711.2T    157.9T │   0.22x │   16.85x
-2048×7168×2048         │    636.9μs  2832.3μs │    755.3T    169.8T │   0.22x │   16.85x
-4096×7168×2048         │   1739.1μs  5303.5μs │    553.2T    181.4T │   0.33x │   16.85x
-256×2048×7168          │     93.7μs   322.0μs │    641.6T    186.7T │   0.29x │   58.98x
-512×2048×7168          │    136.7μs   381.2μs │    879.5T    315.5T │   0.36x │   58.98x
-1024×2048×7168         │    235.0μs   474.8μs │   1023.4T    506.6T │   0.49x │   58.98x
-2048×2048×7168         │    424.3μs   875.4μs │   1133.6T    549.5T │   0.48x │   58.98x
-4096×2048×7168         │    781.6μs  1679.1μs │   1231.0T    573.0T │   0.47x │   58.98x
-1024×4096×4096         │    299.9μs   880.2μs │    916.5T    312.3T │   0.34x │   33.70x
-2048×4096×4096         │    527.1μs  1665.8μs │   1043.0T    330.0T │   0.32x │   33.70x
-4096×4096×4096         │   1035.8μs  2997.7μs │   1061.5T    366.8T │   0.35x │   33.70x
-4096×7168×7168         │   2732.7μs  5740.5μs │   1232.2T    586.6T │   0.48x │   58.98x
-8192×7168×2048         │   2395.1μs 10474.9μs │    803.4T    183.7T │   0.23x │   16.85x
-8192×2048×7168         │   1541.6μs  3087.2μs │   1248.2T    623.3T │   0.50x │   58.98x
-```
-
-**汇总统计**：
-- Geometric Mean Speedup: **0.343x**
-- Best Speedup: 2.02x (128×512×1024，小 shape，通信延迟占主导)
-- Worst Speedup: 0.165x
-- Fused > Separate: 仅 1/22 shapes (最小 shape)
-
----
-
-#### 性能分析与瓶颈诊断
-
-**关键观察**：
-
-1. **GEMM 计算效率严重不足**
-   - 标准 GEMM 达到 ~1000-1250 TFLOPS（接近 B300 峰值 ~1400 TFLOPS BF16）
-   - 融合 kernel 仅 150-620 TFLOPS（峰值的 10-45%）
-   - **根因**：融合 kernel 使用了 3 个 warpgroup (384 threads)，但只有 1 个 warpgroup (W6) 做 MMA
-   - Comm warps (W0-3) + Reserved warp (W7) 消耗了大量 SM 资源但不贡献计算
-
-2. **N=7168 方向最弱 (0.22-0.33x)**
-   - N 维度大 → 更多 N tiles → Epilogue 写更多 partial data
-   - 每个 tile 的 Epilogue 写 + flag set 是串行的
-
-3. **K=7168 方向相对好 (0.36-0.50x)**
-   - K 大 → 计算时间长 → Compute/Comm overlap 效果更好
-   - Comm warps 有更多时间在 GEMM 计算期间 pull 数据
-
-4. **小 shape 反而赢 (2.02x)**
-   - 小 shape 中 NCCL 的 kernel launch overhead 和 synchronization 成本占比高
-   - 融合 kernel 消除了 kernel launch + 额外同步
-
-**性能优化方向**（下一步）：
-
-| 优先级 | 优化方向 | 预期收益 |
-|--------|----------|----------|
-| P0 | 启用 multicast=2 (2-CTA cooperative UMMA) | 计算效率翻倍 |
-| P0 | 重新审视 warp specialization 资源分配 | SM occupancy 提升 |
-| P1 | Comm warp pipeline: 多级 buffer + prefetch | 隐藏 NVLink latency |
-| P1 | 减少 Epilogue 开销（vectorized store, 合并 flag write） | 减少尾部延迟 |
-| P2 | 寄存器预算优化（给 MMA warpgroup 更多寄存器） | 提升 UMMA 效率 |
-| P2 | M-tile 调度优先级精调 | 改善 overlap ratio |
-
-**核心问题**：当前 multicast=1 意味着每个 CTA 独立工作，没有利用 Blackwell 的 2-CTA cooperative UMMA。
-这导致每个 SM 实际只用一半的 tensor core 能力。修复 multicast=2 是**最关键**的性能提升路径。
-
----
-
-## 当前状态
+## 当前真实状态（以本机实测为准）
 
 ### 已完成 ✅
 
-- [x] 核心 kernel 代码已完成 (sm100_bf16_gemm_rs.cuh)
-- [x] JIT 编译入口完成 (sm100_bf16_gemm_rs.hpp)
-- [x] 启发式配置完成 (heuristics/gemm_rs.hpp)
-- [x] Python API 完成 (deep_gemm/gemm_rs/__init__.py)
-- [x] 多卡正确性测试脚本完成 (tests/test_gemm_rs.py)
-- [x] 多卡性能测试脚本完成 (benchmarks/bench_gemm_rs.py)
-- [x] 修复 reg_dealloc 死锁 bug（根因：`setmaxnreg.dec.sync.aligned` 在 `elect_one_sync()` 分支内死锁）
-- [x] 修复 partial buffer slot 寻址 bug（根因：写端用 `rank_idx` 而非 `dst_rank` 作 slot 索引）
-- [x] 修复本地 ready flag race condition（根因：本地 `src_rank==rank_idx` 跳过了 ready flag 检查）
-- [x] 修复测试阈值（BF16 精度，改用相对误差 `< 0.01 * num_ranks`）
-- [x] **2 GPU 正确性测试通过** ✅（multicast=1）
-- [x] **8 GPU 正确性测试通过** ✅（multicast=1，6/6 shapes ALL PASS）
-- [x] **8 GPU 性能基准测试完成**（multicast=1，geo_mean=0.34x，瓶颈明确）
-- [x] **深入理解 2-CTA Cluster 计算流程**（docs/SM100_2CTA_CLUSTER.md）
-- [x] **修复 multicast=2 (2-CTA cluster) 代码**
-  - 根因：scheduler 用 `cluster_idx`（两个 CTA 相同）而非独立 `block_idx`
-  - 修复：scheduler 中 `local_m_block_idx = local_m_pair_idx * kNumMulticast + cta_rank`
-  - TMA Load：移除 A 的冗余 m_idx 偏移（scheduler 已给不同 m_block_idx）
-  - Epilogue：两个 CTA 独立写出自己的 tile
-  - Heuristics：multicast=2 要求 `num_m_blocks_per_rank` 为偶数
+- `deep_gemm._C` 可编译并可导入。
+- 在无 `nvcc` 环境下，`DG_JIT_USE_NVRTC=1` 路径已可用。
+- `2 GPU quick` 正确性测试通过：
+  - 命令：`DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM python tests/test_gemm_rs_quick.py 2`
+  - 结果：`bf16_gemm_nt` 与 `bf16_gemm_rs_nt` 均 PASS。
+- 已完成并推送的关键修复：
+  - NVRTC include 路径补齐（`cutlass`/`cccl`）
+  - NVRTC 编译失败 fail-fast（输出明确错误）
+  - PTXAS 参数拼接修复（避免 `Unknown option`）
+  - `sm100_bf16_gemm*.cuh` 补充 `cuda_device_runtime_api.h`
+  - 多进程默认设备绑定修复（`dist.py`）
+  - benchmark 诊断开关与 shape 限制能力补充
 
-### 待完成 🔲
+### 阻塞中 🔴
 
-- [x] **修复 multicast=2 kernel hang** ✅ 已修复！
-  - **根因**：`nvlink_barrier` 内的 `grid_sync` 使用 `cluster_sync()` 作为 sync_scope
-  - 在 persistent kernel（grid=148=所有 SMs）+ cluster_dim=2 模式下，
-    `cluster_sync()` 在 `grid_sync` 内部被连续调用导致某些 clusters 的 implicit
-    cluster barrier 进入死锁状态（所有 148 blocks 无法同时完成 cluster_sync）
-  - **修复**：将 `nvlink_barrier` 的 sync_scope 从 `cluster_sync()` 改为 `__syncthreads()`
-  - `__syncthreads()` 足够保证 grid_sync atomic 操作的正确性（block-local 同步）
-  - 修复还包含：JIT 编译器 `-gencode arch=compute_100f,code=sm_100f`（CUDA 13 兼容）
-  - 验证：8 GPU 正确性 6/6 ALL PASS，性能 benchmark 21 shapes 全部完成
-- [x] multicast=2 性能 benchmark ✅ 完成（见下方结果）
-- [x] 性能优化迭代（AKO4ALL，6 iterations）
-  - iter 1: 分布式 polling (+1.4%)
-  - iter 3: 并行 TMA store (+7.2%)
-  - iter 4: kNumTMAStoreStages 2→3 (+7.7%)
-  - iter 6: 移除未使用 Comm smem → +1 pipeline stage (+16.5%, first >1x!)
-- [ ] 继续优化迭代（目标 geo_mean > 0.6x）
-
-### 关键性能指标（当前最佳 iter 18, TMA Async Store）
-
-| 指标 | 值 | 备注 |
-|------|-----|------|
-| 8 GPU 正确性 | 6/6 ALL PASS | Max diff = 0.0 |
-| Geo Mean Speedup vs NCCL | **1.004x** | baseline 0.357x → **BREAKS 1.0x!** |
-| K=4096 shapes | **1.07-1.11x** | Fused wins! |
-| K=7168 + small N | **1.02-1.04x** | Fused wins |
-| K=7168 + large N | **0.94-0.98x** | Near parity |
-| K=2048 | **0.84-0.95x** | TMA async 大幅改善 (was 0.78x) |
-| Shapes where Fused wins | **13/21** (62%) | |
-| 瓶颈分析 | Fused GEMM 比标准慢 46.6% | 384T launch_bounds → 168 regs/thread → register spilling |
-
-### 已验证：目标场景下融合 kernel 优于分离方案
-
-| Shape (M/rank×N×K) | Speedup | 场景 |
-|---------------------|---------|------|
-| 4096×7168×4096 | 1.12x | 标准训练 batch |
-| 8192×4096×4096 | 1.12x | 长上下文 |
-| 8192×7168×4096 | 1.10x | 大 hidden + 长上下文 |
-| 16384×4096×4096 | 1.10x | 超长上下文 |
-| 2048×7168×4096 | 1.09x | MoE routing |
-| 4096×4096×7168 | 1.02x | 大 K 投影 |
-| 1024×4096×7168 | 1.03x | 中等 batch |
-
-### 仍需优化的场景
-
-- K=2048 (comm-bound, 0.77-0.79x): 计算太少，overlap 不完全
-- 16384×7168×7168 (0.91x): 大 shape 但接近 parity
-| 融合 kernel TFLOPS | 150-620 | B300 峰值 ~1400 |
-| 标准 GEMM TFLOPS | 1000-1250 | 接近峰值 |
-| 最佳场景 | 2.02x (128×512×1024) | 小 shape 通信延迟占主导 |
-| 核心瓶颈 | MMA 利用率低 | 3 warpgroup 仅 1 个做 MMA |
-
-### 预期 multicast=2 改进
-
-启用 2-CTA cooperative UMMA 后预期：
-1. **GEMM 计算效率翻倍**：256×128 UMMA 比 128×128 指令吞吐更高
-2. **B 矩阵带宽减半**：两个 CTA 共享 B 数据（TMA cluster shared memory）
-3. **整体 speedup 预计从 0.34x → 0.6-0.8x**（中大 shape）
-4. 小 shape 可能从 2.0x → 3-4x（通信开销进一步被掩盖）
+- `benchmarks/bench_gemm_rs.py` 在本机 2 GPU 上仍出现：
+  - `torch.AcceleratorError: CUDA error: unspecified launch failure`
+  - 错误触发位置经常表现为 `dist.barrier()` / `symmetric_memory` 析构阶段
+- 该问题**不等于 quick correctness 失败**；当前更像是 benchmark 生命周期/异步错误曝光点问题。
 
 ---
 
-## A2A+GEMM (Ulysses SP: All2All + Wo GEMM)
+## 本轮（2026-06-18）关键提交记录
 
-### 设计思想
+### 1) `9ef2a29`
+`fix(jit): make nvrtc path work on sm10.3 and fail-fast on compile errors`
 
-详见 `docs/A2A_GEMM_DESIGN.md`。
+### 2) `05a4716`
+`wip(runtime): preserve nvrtc/bench diagnostics and dist fixes`
 
-5 类 warp 架构：
-- Push Warps (W0-W3): ring-push 到远端
-- Load A Warp (W4): poll flag + TMA load A
-- Load B Warp (W5): 无脑 TMA load B
-- MMA Warp (W6): UMMA
-- Epilogue (W8-W11): TMA 2D store
-
-计算顺序：`i, (i-1+n)%n, ..., (i+1)%n`（self 先算）
-通信顺序：`(i+1), (i+2), ..., (i+n-1), self`（remote 先 push）
-
-### 当前状态
-
-- 8 GPU 正确性：6/6 ALL PASS（max_diff = 0.0，精确匹配）
-- Geo Mean：0.772x
-- Fused TFLOPS：650-855T vs Sep 930-1160T
-- 瓶颈：384T launch_bounds 导致 GEMM 吞吐量降低 25-30%
-
-### 文件列表
-
-| 文件 | 作用 |
-|------|------|
-| `deep_gemm/include/deep_gemm/impls/sm100_bf16_a2a_gemm.cuh` | Kernel |
-| `deep_gemm/include/deep_gemm/layout/bf16_a2a_gemm.cuh` | Workspace 布局 |
-| `csrc/jit_kernels/impls/sm100_bf16_a2a_gemm.hpp` | JIT runtime |
-| `csrc/apis/a2a_gemm.hpp` | C++ API |
-| `deep_gemm/a2a_gemm/__init__.py` | Python API |
-| `tests/test_a2a_gemm.py` | 正确性测试 |
-| `benchmarks/bench_a2a_gemm.py` | 性能 benchmark |
+包含文件：
+- `csrc/jit/compiler.hpp`
+- `csrc/jit/device_runtime.hpp`
+- `deep_gemm/utils/dist.py`
+- `benchmarks/bench_gemm_rs.py`
 
 ---
 
-## AG GEMM（新迭代，Flux 风格重构）
+## 当前推荐运行方式（本机）
 
-- 迭代记录：`docs/AG_GEMM_ITERATION.md`
-- 启动时间：2026-06-12
-- 当前方向：把 `sm100_bf16_ag_gemm.cuh` 从 **in-kernel NVLink ring-push** 改成 **host-side comm stream + compute-only GEMM kernel**
-- 当前阶段：Phase 2 — **comm-compute overlap 已启用**
+### 环境准备
 
-### Phase 1 骨架（已完成）
-
-  - BF16 AG workspace 改成 `slot + chunk` ready-flag 语义，并修复了对称内存布局/分配不一致问题
-  - BF16 AG GEMM kernel 去掉 AG warps，改成只等待 chunk-ready 再 TMA load A
-  - JIT runtime 接入 `cudaMemcpyAsync(cudaMemcpyDefault) + cudaMemsetAsync` 的 host-side 通信编排，并补上 `input_ready_event` / `local_ready_event` / `comm_done_event`
-  - `tests/test_ag_gemm.py` 正确性测试，2/4/8 GPU basic suite 均 `5/5 PASS`
-  - `benchmarks/bench_ag_gemm.py` 性能测试
-
-### Phase 2 — Overlap 启用（2026-06-12）→ 已完成 ✅
-
-**问题**：旧代码在 $launch kernel$ 前 `cudaStreamWaitEvent(comm_done_event)` 等待全部通信完成，kernel 内 `ready_chunk_rows = runtime_m_per_rank` + `num_ready_chunks = 1` 使得所有 tile 都 poll chunk 0 — 实际无 overlap。
-
-**修复**（仅 host 端 13 行代码删除）：
-- 删除 `cudaStreamWaitEvent(comm_done_event, 0)` — kernel 不再等全部 AG 完成
-- 删除 `ready_chunk_rows` / `num_ready_chunks` 的覆盖 — 使用 launch_bf16_ag_gemm_comm 计算的真实 chunk 值
-- kernel 已有 `ptx::ld_acq_sys` per-chunk polling — **无需改动**
-
-**Overlap 机制**：
-```
-Copy Stream:           copy local → copy remote rank 1 → copy remote rank 2 → ...  
-                       flag[0]=1      flag[1]=1              flag[2]=1
-Compute Stream:        wait(local_ready) → launch kernel
-                       kernel: poll flag → TMA load → UMMA → poll flag → ...
-```
-local_ready_event 在本地 copy 完成后就绪，kernel 随即启动。remote chunk 仍在后台 CE DMA 搬运，kernel 按需 poll barrier。
-
-**测试结果**：
-- 正确性：2/4/8 GPU, basic + extended 全量 shapes ✓ ALL PASS
-- Benchmark (4 GPU, large training shapes):
-
-| Shape (M/rank×N×K) | Separate | Fused | Overlap Speedup |
-|---------------------|----------|-------|-----------------|
-| 10240×7168×4096 | 2152.3μs | 2163.2μs | 0.99x |
-| 20480×7168×4096 | 4243.9μs | 4564.5μs | 0.93x |
-| 20480×7168×7168 | 7665.9μs | 8593.9μs | 0.89x |
-
-Geo Mean Speedup: 0.920x (vs 旧 non-overlap 0.930x — 大 shape 下 comm <2% 总时间，barrier polling 微量开销)
-
-**分析**：大 shape 下通信占比极低（<2%），overlap 收益被 barrier polling 开销抵消。但架构正确 — kernel 在所有 shape 下均不等 AG 完成即启动。中等 shape（M_per_rank=2K~4K, K=4096+）预期 overlap 收益更明显。
-
-- 下一步：中等 shape benchmark、chunk 数量自适应、评估是否需要区分 shape 选择 sync/overlap 模式
-
-### Phase 3 — Multicast=2 启用（2026-06-13）
-
-**问题**：AG GEMM fused kernel 写死 `num_multicast=1`，而 baseline `bf16_gemm_nt` 使用 `num_multicast=2`（2-CTA cooperative UMMA），导致 GEMM 吞吐量系统性低于 baseline。
-
-**根因**：`tmem_empty_barriers[i]->init(kNumUMMAStoreThreads)` 缺少 `kNumMulticast` 因子。
-- 在 2-CTA cluster 模式下，两个 CTA 的 epilogue warps 都会 arrive 这个 barrier
-- init count 必须是 `kNumMulticast * kNumUMMAStoreThreads` (=256) 而非 `kNumUMMAStoreThreads` (=128)
-- barrier 永远等不够 arrive → tmem_empty_barriers wait 永不返回 → 死循环
-
-**修复**：
-```c++
-// Before (bug):
-tmem_empty_barriers[i]->init(kNumUMMAStoreThreads);
-// After (fix):
-tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
+```bash
+cd /root/.local/codebuddy/DeepGEMM
+git submodule update --init --recursive
+python3 setup.py build_ext --inplace --force
 ```
 
-**Heuristics 修改**：
-```c++
-// Before:
-constexpr int num_multicast = 1;
-constexpr int load_block_n = block_n;
-// After:
-constexpr int num_multicast = 2;
-constexpr int load_block_n = block_n / num_multicast;  // 128/2=64
+### 最小可用验证
+
+```bash
+DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
+python tests/test_gemm_rs_quick.py 2
 ```
 
-**正确性**：2/4/8 GPU ALL PASS (max_diff=0.0，精确匹配)
+### benchmark（当前会失败，保留用于复现）
 
-**性能对比（4 GPU）**：
+```bash
+DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
+python benchmarks/bench_gemm_rs.py 2 5
+```
 
-| Shape (M/rank×N×K) | mc1 Speedup | mc2 Speedup | 变化 |
-|---------------------|-------------|-------------|------|
-| 4096×4096×4096 | 1.23x | **1.38x** | +12% |
-| 4096×7168×4096 | 0.98x | **1.12x** | +14% |
-| 4096×7168×7168 | 0.95x | **1.05x** | +11% |
-| 6144×4096×4096 | 1.28x | **1.45x** | +13% |
-| 6144×7168×4096 | 1.02x | **1.13x** | +11% |
-| 8192×4096×4096 | 1.27x | **1.44x** | +13% |
-| 8192×7168×4096 | 0.99x | **1.15x** | +16% |
-| 10240×7168×4096 | 0.96x | **1.20x** | +25% |
-| 20480×7168×7168 | 0.87x | **0.98x** | +13% |
-
-**Geo Mean**: mc1 0.976x → mc2 **1.114x** (+14.1%)
-**Fused wins**: mc1 4/17 → mc2 **14/17**
-
-**性能对比（8 GPU）**：
-
-| 指标 | mc1 | mc2 | 提升 |
-|------|-----|-----|------|
-| Geo Mean | 0.982x | **1.135x** | +15.6% |
-| Fused wins | 3/17 | **17/17** | 🎯 |
-| N=4096 shapes | 1.29-1.33x | **1.46-1.52x** | GEMM 吞吐大幅提升 |
-| N=7168,K=4096 | 0.89-0.97x | **1.05-1.19x** | 从负翻正 |
-| N=7168,K=7168 | 0.86-0.97x | **1.02-1.08x** | 全面翻正 |
-| Fused TFLOPS (8192×4096×4096) | 1076T | **1314T** | +22% vs baseline 858T |
-
-**关键洞察**：multicast=2 通过 2-CTA cooperative UMMA 使 GEMM 计算吞吐量从 ~1000T 提升到 ~1200-1300T，
-接近标准 GEMM 的水平。中大 shape (M≥8K) 下 fused 全部超越 separate，因为 AG+GEMM 融合省掉了
-all_gather 的额外 kernel launch + 同步开销。
-
-### 详细性能数据（8 GPU, 20 iters, 两轮验证）
-
-| Shape (M/rank×N×K) | R1 Speedup | R2 Speedup | 均值 | Fused TFLOPS | Sep TFLOPS | 分类 |
-|---------------------|-----------|-----------|------|-------------|-----------|------|
-| **N=4096, K=4096 (强收益)** | | | | | | |
-| 4096×4096×4096 | 1.46x | 1.43x | **1.45x** | 1244T | 862T | 🟢 |
-| 6144×4096×4096 | 1.50x | 1.45x | **1.48x** | 1283T | 869T | 🟢 |
-| 8192×4096×4096 | 1.41x | 1.41x | **1.41x** | 1230T | 873T | 🟢 |
-| **N=7168, K=4096 (中等收益)** | | | | | | |
-| 4096×7168×4096 | 1.16x | 1.16x | **1.16x** | 1271T | 1098T | 🟢 |
-| 6144×7168×4096 | 1.09x | 1.07x | **1.08x** | 1186T | 1098T | 🟡 |
-| 8192×7168×4096 | 1.04x | 1.04x | **1.04x** | 1144T | 1099T | 🟡 |
-| 10240×7168×4096 | 1.02x | 1.07x | **1.05x** | 1113T | 1066T | 🟡 |
-| 12288×7168×4096 | 1.06x | 1.06x | **1.06x** | 1131T | 1069T | 🟡 |
-| 16384×7168×4096 | 1.06x | 1.06x | **1.06x** | 1125T | 1057T | 🟡 |
-| 20480×7168×4096 | 1.06x | 1.06x | **1.06x** | 1114T | 1052T | 🟡 |
-| **N=7168, K=7168 (几乎打平)** | | | | | | |
-| 4096×7168×7168 | 1.01x | 1.02x | **1.02x** | 1090T | 1074T | 🔴 |
-| 6144×7168×7168 | 1.02x | 1.03x | **1.03x** | 1081T | 1053T | 🔴 |
-| 8192×7168×7168 | 1.01x | 1.03x | **1.02x** | 1053T | 1031T | 🔴 |
-| 10240×7168×7168 | 1.04x | 1.01x | **1.03x** | 1047T | 1019T | 🔴 |
-| 12288×7168×7168 | 1.02x | 1.00x | **1.01x** | 1029T | 1019T | 🔴 |
-| 16384×7168×7168 | 1.02x | 1.02x | **1.02x** | 1009T | 990T | 🔴 |
-| 20480×7168×7168 | 1.04x | 1.03x | **1.04x** | 1000T | 967T | 🔴 |
-
-**稳定性**：两轮 geo_mean 1.109x vs 1.105x，波动 <0.4%。单个 shape 最大偏差 3%。
-
-**收益规律**：
-- 🟢 **N=4096**: baseline GEMM 吞吐低（~870T, UMMA_N=4096 效率低），AG 占 25-30% → 融合省掉 all_gather 同步，收益大
-- 🟡 **N=7168,K=4096**: AG 占 10-15%，M_per_rank 越小收益越高
-- 🔴 **K=7168**: GEMM 计算占 95%+，AG 几乎可忽略 → barrier polling 成为纯开销，收益 ~1-4%
-
-### AKO4ALL 迭代结果（8 轮，已收敛）
-
-| Iter | 方向 | Geo Mean | 状态 |
-|------|------|----------|------|
-| 1 | PDL 默认开启 | 1.133x | ✅ 保留 |
-| 2 | Pipeline stages 7→8 | 1.116x | ❌ 回退 |
-| 3 | `__nanosleep` polling backoff | 1.126x | ❌ 回退 |
-| 4 | `__launch_bounds__(256,2)` | 1.131x | ❌ 回退 |
-| 5 | kNumReadyChunksPerSlot 4→8 | 死锁 | ❌ 回退 |
-| 6 | Interleave chunk copies | 1.122x | ❌ 回退 |
-| 7 | TMA store stages 2→3 | 死锁 | ❌ 回退 |
-| 8 | Batch remote copies | 1.132x | ❌ 回退 |
-
-**结论**：mc2 + split-warp 架构已达参数调优天花板。K=7168 瓶颈是结构性的（AG 通信占比太低），需要架构级变化才能突破。
+可用诊断开关：
+- `DG_BENCH_MAX_SHAPES=1`：仅跑前 1 个 shape
+- `DG_BENCH_SINGLE_SHAPE=256,512,1024`：只跑指定 shape
+- `DG_BENCH_SYNC_EACH_ITER=1`：逐迭代同步便于定位异步错误
 
 ---
 
-## 参考资料
+## 下一步执行清单（接班即做）
 
-1. **ByteDance Flux** (flux/ 目录): Pull-based RS with per-tile flags, Comm warp specialization
-2. **DeepSeek MegaMoE**: warp specialization + reg budget + NVLink symmetric memory
-3. **CUTLASS SM100**: UMMA 2-CTA cooperative, TMA multicast, mbarrier pipeline
-4. **NVIDIA PTX ISA**: `setmaxnreg.dec.sync.aligned` 语义，system-scope memory ordering
-5. **DeepGEMM 标准 GEMM** (sm100_bf16_gemm.cuh): 参考实现（简单但正确）
-
----
-
-## 开发环境
-
-- 平台: 8× NVIDIA B300 SXM6 (SM100, 80GB HBM3e)
-- NVLink: NVLink Gen5 (900 GB/s bidirectional per GPU pair)
-- CUDA: 12.x + sm_100 target
-- PyTorch: with CUDA support
-- CUTLASS: 3.x (third-party/cutlass)
+1. 在 benchmark 每阶段后显式 `torch.cuda.synchronize()` 并打印 shape 级里程碑，定位**首个失败点**。
+2. 将 `sym_buffer.destroy()/barrier` 的调用顺序与异常兜底再收敛为单一路径，避免析构期放大错误。
+3. 在 `DG_BENCH_SINGLE_SHAPE=256,512,1024` 下先跑通 2 GPU 5 iters，拿第一版稳定基线。
+4. 基线稳定后再扩 shape 集，最后恢复 AKO4ALL 迭代。
 
 ---
 
-### 2026-06-13
+## 重要说明
 
-#### GEMM+RS 性能优化迭代（AKO4ALL 第二阶段）
-
-从 baseline geo_mean 1.003x (8 GPU) 开始，探索 comm section 优化。
-
-| Iter | 方向 | 8 GPU Geo Mean | 2 GPU Geo Mean | 状态 |
-|------|------|---------------|---------------|------|
-| baseline | 原始 FP32 reduce | 1.013x (12/21) | 1.091x (20/21) | ✅ 起点 |
-| 19 | 32T comm (W0 only, 288T total) | SIGABRT | — | ❌ warp映射/launch_bounds不兼容 |
-| 19b | Per-warp独立tile (384T, 32T reduce) | 0.948x (7/21) | — | ❌ 带宽利用率骤降 |
-| **20** | **BF16 __hadd2 vectorized reduce** | **1.025x (14/21)** | **1.097x (19/21)** | ✅ **已提交** |
-| 21 | hadd2 + L2 prefetch + reg dealloc 48→40 | 1.084x (2G) | — | ❌ reg减少导致退化 |
-| 21b | hadd2 + L2 prefetch only | 1.009x (12/21) | — | ❌ prefetch反而有害 |
-
-**iter20 详情**：用 BF16 __hadd2 替代 FP32 累加，4×hadd2 vs 8×float add per 16B vector。
-减少算术量和寄存器压力。8 GPU 提升 1.2%，14/21 shapes 赢。
-
-**失败分析**：
-- iter19b (32T reduce): memory bandwidth 是 reduce 瓶颈，128T→32T 导致带宽利用率从 ~100% 降至 ~25%
-- iter21 (prefetch): L2 prefetch 指令开销 + 可能 evict 有用数据，负优化
-- iter21 (reg dealloc 48→40): 编译器可能需要 48 regs 支持 prefetch + hadd2，40 不够导致 spill
-
-**剩余优化空间分析**：
-- NamedBarrier::sync(128,2) 开销：~20-40 cycles，相比 reduce 的 μs 级耗时占比很小
-- Polling 延迟：硬件延迟（NVLink + flag visibility），软件无法消除
-- K=2048 shapes 必输：compute/comm ratio 太低（16.85x），结构性问题
-- K=7168 N=7168 shapes 输：融合 kernel 的 push-based RS 效率不如 NCCL RS（专用协议）
-
-### iter23-25 迭代结果（续）
-
-| Iter | 方向 | 8 GPU Geo Mean | 8 GPU Win | 状态 |
-|------|------|---------------|-----------|------|
-| **23** | **BF16 hadd2 + 32B wide vec** | **1.040x** | **15/21** | ✅ **当前最佳** |
-| 24b | L1::no_allocate polling | 1.036x | 13/21 | ❌ bypass cache增加延迟 |
-| 25 | 64T comm + 192T epi (6 warps) | 1.042x | 14/21 | ❌ NamedBarrier(192)开销抵消收益 |
-
-**iter25 分析**：192T Epilogue 的理论优势（更多并行 TMA store）被 NamedBarrier::sync(192,0) 的更大开销抵消。每个 n-slice iteration 需要同步 192T（vs 128T），且 192T 中只有 128T 实际做 TMEM→smem 工作。
-
-**当前最优配置 (iter23)**:
-- 384T = 128T comm(4 warps, 48 regs dealloc) + 128T non-epi(4 warps) + 128T epi(4 warps, 208 regs alloc)
-- Comm reduce: BF16 __hadd2, 32B wide vector (16 BF16 per iteration)
-- 8 GPU: geo_mean 1.040x, 15/21 shapes winning
-- 2 GPU: geo_mean 1.093x, 20/21 shapes winning
-
-**优化空间评估**：
-- 微优化（polling/cache/prefetch）：已探索殆尽，进一步收益 <0.5%
-- 结构性优化（线程数/寄存器分配）：iter25 证明 192T epi 无效
-- 架构级优化（两kernel方案/通信协议）：需要大规模重构
-- K=2048 shapes 必输（compute/comm ratio 太低），这是 MoE 场景固有限制
-- K=7168 N=7168 shapes (0.98-1.01x)：GEMM 吞吐略低于标准128T kernel，需架构级变化才能突破
-
-### 2026-06-15
-
-#### V3 Dual-Kernel GEMM+RS 开发与验证
-
-**架构设计（Flux-inspired dual-kernel）**：
-- Kernel 1 (GEMM Compute, 256T): No Comm Warps — 纯 GEMM + epilogue scatter write + per-tile flag signaling
-- Kernel 2 (RS Reduce, 256T/CTA): Per-tile polling of ready flags + BF16 __hadd2 vectorized reduce
-- Stream-level overlap: GEMM compute on compute_stream, RS reduce on comm_stream
-- Event synchronization: gemm_launched_event → comm_stream waits → RS reduce runs → comm_done_event → compute_stream waits
-
-**正确性验证**：
-- 2 GPU: 6/6 ALL PASSED (max_diff=0.0000)
-- 8 GPU: 6/6 ALL PASSED (max_diff=16/32, BF16 累加误差正常)
-
-**关键 Bug — NVLink Barrier Timeout**：
-- V3 dual-kernel 在连续调用（warmup + timed iterations）时出现 NVLink barrier timeout
-- 单次调用（正确性测试）正常，多次调用失败
-- 错误特征： — 只有部分 rank 发送了信号
-- 可能根因：
-  1. comm_stream (static thread_local) 和 compute_stream 的异步竞争
-  2. NVLink barrier signal_ptr 在多轮调用间状态不一致
-  3. GEMM compute kernel 的 nvlink_barrier 在 persistent kernel 模式下的 grid_sync 问题
-- 待修复
-
-**修改文件**：
-- : V3 双kernel入口 + stream/event 管理
-- : GEMM compute-only kernel (256T)
-- : RS reduce kernel (256T/CTA)
-- : 添加 bf16_gemm_rs_nt_v3 Python API
-- : 注册 bf16_gemm_rs_v3_nt C++ API
-- : V3 正确性测试
-- : V3 性能 benchmark
-
-### 2026-06-15: A2A PDL 方案验证与 Benchmark
-
-#### V3 Barrier Reset Fix 验证结果
-- cudaMemsetAsync(sym_buffer, 0, 32) 修复：**正确性通过** (8 GPU, 6/6 ALL PASSED, max_diff=0.0000)
-- 但 benchmark 场景连续调用仍然 timeout (counter=37/38, signal=4/7, target=8)
-- 根因：memset 在 compute_stream 上执行，但 RS kernel 在 comm_stream 上运行，流间同步不够保证 barrier 状态一致性
-
-#### GEMM + A2A + PDL 方案 (零通信 ReduceScatter)
-
-**关键洞察**：MoE ReduceScatter 中，所有 rank 有相同的 A (AllGathered) 和 B (expert weight)
-→ ReduceScatter(C) = sum across ranks(C) → scatter = num_ranks × C[my_rows]
-→ 只需 GEMM(my_A, B, y) → y *= num_ranks，**完全无需通信！**
-
-**正确性验证**：8 GPU, 6/6 ALL PASSED, max_diff=0.0000
-
-**性能 Benchmark (8×B300 SXM6, 20 shapes, 20 iters)**：
-
-| Shape (M/rank×N×K) | Separate (us) | A2A PDL (us) | Speedup |
-|---|---|---|---|
-| 1024×4096×7168 | 419.0 | 48.3 | 8.68x |
-| 1024×7168×4096 | 475.8 | 47.8 | 9.95x |
-| 2048×4096×7168 | 767.3 | 82.8 | 9.27x |
-| 2048×7168×4096 | 914.9 | 83.1 | 11.01x |
-| 2048×7168×2048 | 664.0 | 55.2 | 12.03x |
-| 4096×7168×2048 | 1261.6 | 90.1 | 14.00x |
-| 4096×2048×7168 | 779.2 | 89.3 | 8.73x |
-| 4096×4096×4096 | 1043.3 | 96.1 | 10.86x |
-| 4096×7168×4096 | 1821.3 | 156.9 | 11.61x |
-| 4096×4096×7168 | 1529.8 | 176.5 | 8.67x |
-| 8192×7168×2048 | 2482.6 | 192.8 | 12.88x |
-| 8192×2048×7168 | 1566.3 | 164.5 | 9.52x |
-| 8192×4096×4096 | 2151.1 | 198.1 | 10.86x |
-| 8192×7168×4096 | 3635.4 | 351.7 | 10.34x |
-| 16384×7168×2048 | 4900.7 | 363.6 | 13.48x |
-| 16384×2048×7168 | 3223.5 | 364.9 | 8.83x |
-| 16384×4096×4096 | 4296.2 | 389.4 | 11.03x |
-| 16384×7168×4096 | 7401.9 | 678.7 | 10.91x |
-| 8192×7168×7168 | 5678.9 | 615.0 | 9.23x |
-| 16384×7168×7168 | 12270.3 | 1190.8 | 10.30x |
-
-**汇总**：
-- **几何平均加速比: 10.500x** (vs Separate GEMM+NCCL RS)
-- Average TFLOPS: Separate=1048.2 | A2A PDL=10886.7
-- 加速范围: 8.67x ~ 14.00x
-- GEMM 计算量减少 8x (只算 M/8 行)，加上零通信开销
-- 最佳 shape: 4096×7168×2048 (14.00x)
-
-**新增文件**：
-- : Separate vs A2A PDL benchmark
-- : 三方 benchmark (Separate vs V3 vs A2A PDL)
-
-**下一步**：
-- A2A PDL 已为最优方案，无需继续修 V3 barrier bug
-- V3 dual-kernel 方案保留作为备选（单次调用正确性通过）
+- 历史文档中存在“已超过 1.0x / 全量 shape 已稳定”等旧结论，与本机当前状态不一致。
+- **后续以本文件 + 最新 commit 为准**，其余文档视作历史参考。
