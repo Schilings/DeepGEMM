@@ -14,6 +14,8 @@
    - P1：`benchmarks/` 可复现基线
    - P2：性能迭代（含 AKO4ALL）
 5. 关键结论必须沉淀到 `docs/PROGRESS.md`。
+6. **优化目标紧贴 Megatron SP**：优先围绕中大 shape（重点 `M/rank>=1024` 且 `N/K` 为 `4096/7168` 组合）做主线迭代。
+7. **学习方向明确**：以 `flux` 的 GEMM-RS（H 卡稳定上线）作为方法学参考；本仓库在 B 卡上做等价策略适配与验证，不做生硬照搬。
 
 ---
 
@@ -25,7 +27,7 @@
 
 ---
 
-## 3. 主线知识必读与吸收（新增，必须执行）
+## 3. 主线知识必读与吸收（必须执行）
 
 ### 3.1 必读文档（会话开局强制）
 
@@ -62,6 +64,7 @@
   - `separate = bf16_gemm_nt + reduce_scatter_tensor`
   - `main fused = bf16_gemm_rs_nt`
 - 迭代时必须先保证 correctness 不退化，再比较 fused vs separate 的增益。
+- Megatron SP 导向下优先看中大 shape 分组（`N=7168` / `K=7168` / `M/rank>=2048`）的几何均值和短板 shape。
 
 ---
 
@@ -120,14 +123,14 @@ python3 setup.py build_ext --inplace --force
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
 python tests/test_gemm_rs.py 2
 
-# 主线benchmark（小样本）
-DG_BENCH_MAX_SHAPES=3 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 2 3
+# Megatron SP中大shape基线（主线推荐）
+DG_BENCH_MAX_SHAPES=10 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
+python benchmarks/bench_gemm_rs.py 2 5
 
 # 指定单shape诊断
-DG_BENCH_SINGLE_SHAPE=256,512,1024 DG_BENCH_SYNC_EACH_ITER=1 \
+DG_BENCH_SINGLE_SHAPE=2048,7168,2048 DG_BENCH_SYNC_EACH_ITER=1 \
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 2 5
+python benchmarks/bench_gemm_rs.py 2 8
 ```
 
 ---
@@ -148,3 +151,4 @@ python benchmarks/bench_gemm_rs.py 2 5
 - 不在主文档中并行维护“多版本命名叙事”，避免新会话误解。
 - 若出现阻塞，优先构造最小可复现案例，再做结构性调整。
 - 涉及 SM100 cluster / multicast / scheduler 改动时，必须回看 `docs/SM100_2CTA_CLUSTER.md` 再下改动。
+- 涉及 Megatron SP 主线优化策略时，优先对齐 `flux` GEMM-RS 的稳定实践，再做 B 卡可行性映射验证。
