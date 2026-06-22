@@ -15,37 +15,43 @@
 
 ---
 
-## 2. 主线实现（真·Flux pull 式 dual-kernel）
+## 2. 主线实现（融合 GEMM-RS：epilogue push-scatter + flagless 本地 reduce，dual-kernel）
 
-自 2026-06-18 起，主线由「单 kernel push + in-kernel reduce」重构为
-**真·Flux pull 式双 kernel**（对齐 Flux 的 `Sm90AuxStoreReduceScatter` + `Sm90ReduceScatterDma`）：
+> 本节为当前 `main` 的有效实现。早期曾尝试「pull + per-tile flag + 本地 scatter」结构，已被下述
+> push-scatter + flagless 流式 reduce 取代（演进过程见 `GEMM_RS_ITERATION.md` Iter 8/10/14）。
 
-- **算子入口**：`deep_gemm.bf16_gemm_rs_nt`（默认 `DG_GEMM_RS_IMPL=pull`）
-- **Kernel 1（GEMM compute）**：`deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`
+- **算子入口**：`deep_gemm.bf16_gemm_rs_nt`（唯一实现，无 impl 开关）。
+- **Kernel 1（GEMM + push-scatter）**：`deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm_rs.cuh`
   - 256T(8 warps)，无 comm warps（消除旧 384T 的寄存器 spilling）；
-  - epilogue 纯本地 scatter write：tile 按 `dst_rank` 写本地 `slot[dst_rank]` + 置本地 ready flag；
-  - **GEMM epilogue 不跨 NVLink**（核心收益）。
-- **Kernel 2（RS reduce, pull）**：`deep_gemm/include/deep_gemm/impls/sm100_rs_reduce.cuh`（`kPullBased=true`）
-  - rank R 对自身 chunk 每个 tile：poll 各 src 的远端 flag → 累加各 src 的远端 `slot[R]`（FP32）→ 写 output → 远端 reset flag。
+  - epilogue **push-scatter（核心收益）**：每个 tile 按 `dst_rank`，用**整块 2D TMA store**
+    （`SM90_TMA_STORE_2D`，复用标准 `epilogue::sm100_store_cd`）**跨 NVLink 直推**到 `dst_rank` 的
+    symmetric scatter slot[my_rank]；self（dst==my_rank）即本地 store。跨卡 store 由 TMA 引擎异步发起，
+    **与后续 tile 的 MMA 重叠**——这是单机 NVLink 上让 RS 藏进 compute、从而 >1.0x 的关键。
+  - **flagless**：不再用 per-tile ready flag；所有 push 的全局可见性由 kernel 末尾的
+    **system-scope `nvlink_barrier`**（release/acquire）保证。
+- **Kernel 2（RS reduce, flagless 本地累加）**：`deep_gemm/include/deep_gemm/impls/sm100_rs_reduce.cuh`
+  - push 完成后，rank R 的本地 buffer 已聚齐 R 份各 src 推来的 partial（slot[0..R-1] 各 `[m_per_rank x N]`）；
+  - reduce = **纯 1D 连续流式**遍历 `m_per_rank*N`，对各 src slot 做 FP32 累加 → output；
+    无 flag/poll/`__syncthreads`；`kUnroll` 随 rank 数自适应（`kNumRanks>=8?2:>=4?4:8`）防 8 卡 spilling。
 - **JIT 运行时**：`csrc/jit_kernels/impls/sm100_bf16_gemm_rs.hpp`
-  - dual-kernel 编排：`compute_stream` 跑 GEMM、`comm_stream` 跑 pull reduce、CUDA event 同步实现流级 + tile 级 overlap。
-- **RS reduce 运行时**：`csrc/jit_kernels/impls/sm100_rs_reduce.hpp`（pull-only）。
-- **Python 接口**：`deep_gemm/gemm_rs/__init__.py`（唯一 pull 实现，无 impl 开关）。
+  - dual-kernel 编排：`compute_stream` 跑 GEMM、`comm_stream` 跑 reduce、CUDA event 同步实现流级排序；
+  - host 为每个 dst_rank 建一个 scatter slot 的 `CUtensorMap`（`make_tma_2d_desc_raw`，self=本地 base、
+    peer=P2P-mapped base），打包成 `GemmRSScatterMaps` 传入 GEMM kernel 供 2D TMA push。
+- **RS reduce 运行时**：`csrc/jit_kernels/impls/sm100_rs_reduce.hpp`。
+- **Python 接口**：`deep_gemm/gemm_rs/__init__.py`。
+- **测试**：`tests/test_gemm_rs.py`、`tests/test_gemm_rs_quick.py`；**性能脚本**：`benchmarks/bench_gemm_rs.py`。
 
-> 注：既然 Flux 单机 RS 就是 pull，旧的 push dual-kernel（`v3` / `gemm_rs_compute` /
-> `sm100_bf16_gemm_rs_compute.*`）已整体删除，主线只保留 pull。
-- **测试**：`tests/test_gemm_rs.py`、`tests/test_gemm_rs_quick.py`
-- **性能脚本**：`benchmarks/bench_gemm_rs.py`
+### 数据契约
 
-### 数据 / flag 契约
+- 每 rank 计算完整 partial `[total_m=num_ranks*m_per_rank, N]`，按 M 切成 num_ranks 个 chunk（chunk-for-d 属于 dst_rank d）。
+- GEMM(r) epilogue 把 chunk-for-d **TMA-store 推到** dst_rank d 的 buffer `slot[r]`（跨卡 P2P，self 为本地）。
+- Reduce(R) 读本地已聚齐的 `slot[0..R-1]`（各 src 推来的、目标为 R 的 partial）求和 → output。
+- 跨迭代正确性：GEMM 起始 `nvlink_barrier` + host event 门控，保证「上一轮所有 reduce 完成 → 本轮 push 开始」，
+  GEMM 末尾 system-scope `nvlink_barrier` 保证「本轮所有 push 全局可见 → reduce 读取」。
 
-- 每 rank 计算完整 partial `[total_m=num_ranks*m_per_rank, N]`，按 M 切成 num_ranks 个 chunk。
-- GEMM(r) 把 chunk-for-d 写本地 `slot[d]` 并置本地 `flag[d][m][n]`；
-- Reduce(R) 读各 src 的远端 `slot[R]`（`sym_buffer.map`，self 映射回本地）求和 → output。
-- 跨迭代正确性：GEMM 起始 `nvlink_barrier` + host event 门控，保证「上一轮所有 reduce(含远端 reset) 完成 → 本轮 set」。
-
-> 通信通道选型：单机 NVLink 下采用 **P2P 直读 `sym_buffer.map`**（pull）而非 host CE DMA，
-> 以获得 tile 级细粒度 overlap，并把跨卡通信全部移出 GEMM epilogue 关键路径。
+> 通信通道选型：单机 NVLink 下把跨卡传输**融进 GEMM epilogue 用 TMA async store**（push），
+> 与 MMA 重叠；reduce 退化为纯本地累加。这与 Flux「让 comm overlap compute」同源，但因 SM100 上
+> GEMM 独占 SM 寄存器、分离 reduce kernel 无法共驻 overlap，故选择 push 进 epilogue 而非 pull。
 
 ---
 

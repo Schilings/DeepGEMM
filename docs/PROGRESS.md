@@ -1,117 +1,47 @@
-# DeepGEMM GEMM-RS 进度（唯一主线）
+# 算子开发进度总览（索引）
 
-> 最后更新：2026-06-18 07:18
-> 分支：`main`
-> 口径：仅保留当前上线主线 `bf16_gemm_rs_nt`
-
----
-
-## 当前结论（本机实测）
-
-- **【架构重构完成 · 正确性达标 · 性能待优化】** 主线 `bf16_gemm_rs_nt` 已重构为
-  **真·Flux pull 式 dual-kernel**（GEMM 256T 无 comm warps + epilogue 纯本地 scatter write；
-  独立 RS reduce kernel 从远端 pull）。详见 `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md`(Iteration 3)。
-- **正确性**：`tests/test_gemm_rs.py 2` → **6/6 PASS，max_diff=0.0**（逐元素精确匹配参考）。
-  （修复了一处 nvlink_barrier 死锁：移除了与对端信号竞争的 per-call barrier memset。）
-- **性能：跨 2/4/8 GPU 稳定 ~1.14x vs sep**（本会话起点 0.606x / 660T；正确性 6/6 PASS @ {2,4,8} 卡）：
-
-  | GPUs | vs torch | vs sep | focus 中大 (vs sep) | avg fused |
-  |------|------|------|------|------|
-  | 2 | 1.148x | **1.142x** | 1.143x | 1232T |
-  | 4 | 1.129x | **1.148x** | 1.199x | 1225T |
-  | 8 | 1.103x | **1.140x** | **1.202x** | 1193T |
-
-  - 2 卡全部 13 shape ≥1.02x vs sep（峰值 1.40x）；4 卡全部 ≥1.00x；8 卡仅 16384x7168x7168 0.98x。
-  - 旧最大短板小 K 反成最强（2 卡 2048x7168x2048 1.31x、4096x7168x2048 1.38x）。
-  - 迭代路径：**Iter 5** 高 MLP reduce 0.733x；**Iter 6** carveout 零和死胡同；
-    **Iter 7** reduce grid 过订阅 ×2（`DG_RS_REDUCE_MULT` 默认 2）0.835x；
-    **Iter 8** 跨卡传输 fused 进 epilogue（push-scatter，与 MMA 重叠 + reduce 读本地）0.964x；
-    **Iter 9** 去冗余 CPU 同步 0.989x；**Iter 10** 去 flag + 纯 1D 连续流式 reduce → **1.148x/1232T**。
-    详见 `GEMM_RS_ITERATION.md`(Iter 5–10)。
-- **架构**：主线 = 真·融合 GEMM-RS——epilogue **push-scatter**（TMA 跨卡 store 与 MMA 重叠）+ 本地 reduce。
-  （注：跨卡传输融进 epilogue 是单机 NVLink 上唯一能让 RS 藏进 compute、从而 >1.0x 的方式；
-  与 Flux 融合 GemmRS 让 comm overlap compute 同源。）
-- 下一步：把 geo_mean 推过 1.0x —— 小 K（本地 reduce tail 占比大）+ 超大 N·K（push 体量大）定向优化。
+> 最后更新：2026-06-22
+> 用途：**新会话据此挑选/确认目标算子**，再读该算子的 `*_DESIGN` / `*_ITERATION` 文档接班继续开发。
+> 规则见 `docs/RULE.md`；接班流程见 `docs/SESSION_MEMORY.md`。
 
 ---
 
-## 已验证通过 ✅
+## 各算子状态一览
 
-### 多卡正确性
+| 算子 | 入口符号 | 当前最佳（focus 中大 / geo vs sep） | 正确性 | 分支 / tag | 详细文档 |
+|------|---------|------|------|------|------|
+| **GEMM-RS** | `bf16_gemm_rs_nt` | 8卡 focus **1.22~1.23x** / geo **1.14x** | 6/6 PASS @ {2,4,8} | `main`（2D TMA push）；1D 版存档 tag `gemm-rs-1d-stable` | `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md` / `FLUX_GEMM_RS_STUDY.md` |
+| **A2A-GEMM** | `bf16_a2a_gemm_nt` | geo **~1.34x**（iter3 后保留）| PASS | `main` | `A2A_GEMM_DESIGN.md` / `A2A_GEMM_ITERATION.md` |
+| **AG-GEMM** | `bf16_ag_gemm_nt` | geo **~1.13x**（8 卡）| PASS | `main`（仅 PDL 默认开启被保留）| `AG_GEMM_ITERATION.md` / `AG_GEMM_FLUX_REFERENCE.md` |
 
-- `DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM python tests/test_gemm_rs.py 2`
-  - 结果：**6/6 PASS**
-
-### 主线 benchmark（指定 13 shape）
-
-运行（最新回归）：
-
-- `MASTER_PORT=29685 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM python benchmarks/bench_gemm_rs.py 2 3`
-
-结果摘要：
-
-- **geo mean speedup = 1.102x**
-- **Best = 1.20x**
-- **Worst = 0.97x**（`2048x7168x2048`）
-- 平均 TFLOPS：fused **1176.1T** vs separate **1062.6T**
-- `User focus medium/large`（5 shape）子集：**1.158x**
-
-### 重点 5 shape 复测（定向目标）
-
-运行（最新复测）：
-
-- `MASTER_PORT=29729 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM python benchmarks/bench_gemm_rs.py 2 4`
-
-结果摘要：
-
-- **geo mean speedup vs torch-native = 1.174x**
-- **geo mean speedup vs deepgemm-separate = 1.161x**
-- **Best vs torch-native = 1.24x**
-- **Worst vs torch-native = 1.05x**（`4096x4096x7168`）
-- 平均 TFLOPS：fused **1304.6T** vs separate **1126.1T** vs torch-native **1115.1T**
+> 每个算子的「最新当前状态 / 接班信息」见对应 `*_ITERATION.md` 顶部「当前状态」节，
+> 本表只做一行总览，避免与各算子文档重复维护细节。
 
 ---
 
-## 本轮调优动作（已生效）
+## benchmark 统一口径（所有通信类融合算子通用）
 
-- 在 `csrc/jit_kernels/heuristics/gemm_rs.hpp` 新增 K-heavy 中大 shape 的 multicast 选择分支：
-  - `k>=7168 && n<=4096 && m_per_rank<=4096` 时倾向 `multicast=1`
-- 单点验证 `4096x4096x7168`：速度从约 `1.04x` 提升到约 `1.06x`（8 iter 复测）。
-
----
-
-## 当前代码状态
-
-- `benchmarks/bench_gemm_rs.py` 已固定为用户指定 shape 口径。
-- 新增支持：
-  - `DG_BENCH_FOCUS_ONLY=1`（只跑重点 5 shape）
-  - `DG_BENCH_SHAPES="M,N,K;..."`（显式 shape 列表）
+- `separate` 基线 = 标准 GEMM + 对应通信原语（如 RS：`bf16_gemm_nt + reduce_scatter_tensor`）。
+- `fused` = 该算子的融合入口（如 `bf16_gemm_rs_nt`）。
+- 迭代时必须先保证 correctness 不退化，再比较 `fused` vs `separate` 的增益。
+- Megatron SP 导向：优先看中大 shape 分组（`N=7168` / `K=7168` / `M/rank>=2048`）的几何均值与短板 shape。
+- benchmark 脚本通用开关：
+  - `DG_BENCH_FOCUS_ONLY=1`（只跑重点中大 shape 子集）
+  - `DG_BENCH_SHAPES="M,N,K;..."` / `DG_BENCH_SINGLE_SHAPE=M,N,K`（显式 shape）
+  - `DG_JIT_USE_NVRTC=1`（无 nvcc 时）
 
 ---
 
-## 推荐运行命令（接班即用）
+## 接班即用命令（以 GEMM-RS 为例，其它算子替换脚本名）
 
 ```bash
 cd /root/.local/codebuddy/DeepGEMM
+git pull
 python3 setup.py build_ext --inplace --force
 
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
 python tests/test_gemm_rs.py 2
 
-MASTER_PORT=29728 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 2 3
-
-MASTER_PORT=29729 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 2 4
+DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
+python benchmarks/bench_gemm_rs.py 8 8
 ```
-
----
-
-## 下一步（正在执行）
-
-1. **排查 pull 路径首轮 2-GPU 运行期错误**：抓首屏真实报错（kernel assert / nvlink barrier timeout / IMA），
-   定位 pull 同步或寻址问题，跑通 `tests/test_gemm_rs.py 2`（目标 6/6）。
-2. 跑通后用 `bench_gemm_rs.py` 重测 pull 基线，与旧 push(v3) 对比；验证 GEMM 吞吐是否因消除
-   寄存器 spilling 而显著提升。
-3. 继续压低 `K=7168` 弱势点（重点 `4096x4096x7168`）。
-4. 每轮收益落盘并立即 `commit + push`（防止实例中断丢进度）。

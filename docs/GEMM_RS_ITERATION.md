@@ -12,14 +12,24 @@
 
 ---
 
-## 当前基线（承接 `PROGRESS.md`）
+## 当前状态（接班 · 本节为 GEMM-RS 权威当前态）
 
-- 主线：`bf16_gemm_rs_nt`
-- 正确性：`tests/test_gemm_rs.py 2` 通过（6/6）
-- 最近基线（13 shape）：geo mean 约 `1.10x`（fused vs separate）
-- 最近重点 5 shape：geo mean 约 `1.17x`（vs torch-native）
+- 入口：`bf16_gemm_rs_nt`；正确性 `tests/test_gemm_rs.py {2,4,8}` 全 **6/6 PASS, max_diff=0.0**。
+- **性能（本机实测，vs sep）**：8 卡 focus 中大 **1.22~1.23x** / 全 13-shape geo **1.14x**；4 卡 focus **1.19x**。
+- **main 当前实现 = 整块 2D TMA store push**（Iteration 14，`4d6ad76`）：epilogue 复用标准
+  `epilogue::sm100_store_cd`（swizzled STSM + `SM90_TMA_STORE_2D`）直推各 dst_rank 的 scatter slot；
+  代码更干净、性能与旧 1D 版等价（NVLink 带宽-bound）。
+- **旧 1D 版（逐行 `tma_store_1d`，1.22x 已验证）以 tag `gemm-rs-1d-stable` 存档**（= `2f9ee36`，
+  代码同 `3efe39d`）。需对比/回溯 1D 行为时 `git checkout gemm-rs-1d-stable`。
+- 架构：真·Flux pull 式 dual-kernel —— GEMM epilogue **push-scatter**（跨卡 TMA store 与 MMA 重叠）
+  + 独立 **本地 1D 连续流式 reduce** kernel。详见 `GEMM_RS_DESIGN.md`。
+- **已确认的瓶颈结构（数据驱动，见 Iter 13/14）**：push 开销（gemm+push − 纯GEMM ≈ 129~253us）与
+  reduce tail（49~164us）**都是带宽-bound、已接近物理极限**（push=NVLink egress；reduce=(R+1)× HBM 流量）。
+  故 PDL / stream / grid / mult / `__ldg` / 1D→2D TMA 等「调度/粒度」优化**全部中性**。
+- **唯一剩余有效方向**：reduce-scatter **算法级降通信量**（树形/分层 RS，把 push 的 (R-1)× 与
+  reduce 的 (R+1)× 同时降下来）—— 独立大工程，有 latency 风险，未启动。
 
-> 说明：详细命令与最新统一口径以 `docs/PROGRESS.md` 为准；本文件只记录“迭代动作与结论”。
+> 详细命令与跨算子总览见 `docs/PROGRESS.md`；本文件记录「迭代动作与结论」。
 
 ---
 
