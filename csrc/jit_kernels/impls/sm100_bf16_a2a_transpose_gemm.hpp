@@ -109,10 +109,16 @@ static void sm100_bf16_a2a_transpose_gemm(const torch::Tensor& d,
     const int k = hidden;
     DG_HOST_ASSERT(local_seq % 128 == 0);  // BLOCK_M == comm kTileM == 128
 
-    // SM carveout: reserve comm SMs (default 16, tunable via DG_A2AT_COMM_SMS).
-    int comm_sms = 16;
+    // SM carveout: reserve comm SMs (default 24 — best average on the fair serial-full baseline;
+    // flux tunes this in [16,20,24]). Tunable via DG_A2AT_COMM_SMS.
+    int comm_sms = 24;
     if (const char* env = std::getenv("DG_A2AT_COMM_SMS")) comm_sms = std::max(1, std::atoi(env));
     comm_sms = std::min(comm_sms, total_sms / 2);
+    // Comm block threads: at a small comm-SM carveout, the per-SM NVLink bandwidth is dominated by
+    // the number of in-flight P2P stores, so 1024 threads/CTA is ~3x faster than 256 (it takes
+    // thousands of outstanding uint4 stores to hide NVLink latency). Tunable via DG_A2AT_COMM_THREADS.
+    int comm_threads = 1024;
+    if (const char* env = std::getenv("DG_A2AT_COMM_THREADS")) comm_threads = std::max(32, std::atoi(env));
 
     auto config = get_ag_gemm_config(m, n, k, total_sms, static_cast<int>(b.element_size()));
     DG_HOST_ASSERT(config.block_k == 64 and config.block_m == 128);
@@ -141,13 +147,13 @@ static void sm100_bf16_a2a_transpose_gemm(const torch::Tensor& d,
             .tile_m = static_cast<int>(config.block_m),
             .set_barrier = true,
             .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
-            .launch_args = LaunchArgs(comm_sms, 256)
+            .launch_args = LaunchArgs(comm_sms, comm_threads)
         };
         const auto comm_code = SM100A2ATransposeCommRuntime::generate(comm_args);
         const auto comm_runtime = compiler->build("sm100_a2a_transpose_comm", comm_code);
         const auto comm_kernel = comm_runtime->kernel;
         const dim3 grid_dim = {static_cast<unsigned>(comm_sms), 1, 1};
-        const dim3 block_dim = {256, 1, 1};
+        const dim3 block_dim = {static_cast<unsigned>(comm_threads), 1, 1};
         auto cfg = construct_launch_config(comm_kernel, comm_stream, 0, grid_dim, block_dim, 1, false);
         auto sb = comm_args.sym_buffer_ptrs;
         DG_CUDA_UNIFIED_CHECK(launch_kernel(comm_kernel, cfg, sb,

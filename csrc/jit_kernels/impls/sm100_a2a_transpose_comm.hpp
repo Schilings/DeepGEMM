@@ -62,7 +62,15 @@ static void sm100_a2a_transpose_comm(const torch::Tensor& sym_buffer,
                                      const int& tile_m = 128,
                                      const bool& set_barrier = false) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
-    const auto num_sms = device_runtime->get_num_sms();
+    // Standalone comm always uses ALL SMs (this is the realistic non-overlap deployment, and the
+    // fair "separate" baseline in the bench). The fused path does its own SM carveout instead.
+    int num_sms = device_runtime->get_num_sms();
+    if (const char* env = std::getenv("DG_A2AT_COMM_ONLY_SMS"))   // sweep-only override
+        num_sms = std::min(num_sms, std::max(1, std::atoi(env)));
+    // 1024 threads/CTA best saturates per-SM NVLink bandwidth (hides P2P store latency).
+    int threads = 1024;
+    if (const char* env = std::getenv("DG_A2AT_COMM_THREADS"))
+        threads = std::max(32, std::atoi(env));
 
     const SM100A2ATransposeCommRuntime::Args args = {
         .num_ranks = num_ranks,
@@ -70,7 +78,7 @@ static void sm100_a2a_transpose_comm(const torch::Tensor& sym_buffer,
         .tile_m = tile_m,
         .set_barrier = set_barrier,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
-        .launch_args = LaunchArgs(num_sms, 256)
+        .launch_args = LaunchArgs(num_sms, threads)
     };
 
     const auto code = SM100A2ATransposeCommRuntime::generate(args);

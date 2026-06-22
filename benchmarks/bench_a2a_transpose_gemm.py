@@ -54,7 +54,9 @@ def run_benchmark(rank, num_gpus, num_iters, port):
 
     if rank == 0:
         print(f"\n{'='*96}\n  A2A-transpose + Wo GEMM bench: {num_gpus} GPUs, {num_iters} iters\n{'='*96}")
-        print(f"{'(bs,nh,seq,hd,N)':<24} | {'comm(us)':>9} {'gemm(us)':>9} {'sum(us)':>9} {'fused(us)':>10} | {'speedup':>8}")
+        # comm/gemm are measured at FULL SMs (the realistic non-overlap deployment); serial = their
+        # sum = the fair baseline. fused uses the SM carveout (DG_A2AT_COMM_SMS) + 1024-thread comm.
+        print(f"{'(bs,nh,seq,hd,N)':<24} | {'comm(us)':>9} {'gemm(us)':>9} {'serial':>9} {'fused(us)':>10} | {'fus/ser':>8}")
 
     def time_call(fn, resets):
         for _ in range(3):

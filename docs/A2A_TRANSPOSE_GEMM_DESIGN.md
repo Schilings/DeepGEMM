@@ -13,28 +13,45 @@
   `comm → SP-group barrier → 标准 bf16_gemm_nt`（无 overlap）。
   **正确性 `tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS**（vs all_gather 重建的非循环
   ground-truth，rel~1e-6；torch 候选 rel=0）。入口：`deep_gemm.bf16_a2a_transpose_gemm_nt(d, Wo, sym)`。
-- **M1（overlap，已实现 + 已评测，结论：单节点不划算）**：
+- **M1（overlap，已实现 + 已评测 + 已对齐 flux 调优）**：
   - 实现：comm 改 tile 粒度 + per-M-tile barrier（计数到 world_size，置 1）；融合 GEMM 消费者
-    （`impls/sm100_bf16_a2a_transpose_gemm.cuh`）Load-A warp 按 `barrier[m_block]==1` 等待后再 load；
+    （`impls/sm100_bf16_a2a_transpose_gemm.cuh`）Load-A warp 等 `barrier[m_block]==1` 后再 load；
     host（`csrc/sm100_bf16_a2a_transpose_gemm.hpp`）comm 走 comm_stream + GEMM 走 compute_stream，
-    **SM carveout**（`DG_A2AT_COMM_SMS`，默认 16）防 GEMM 饿死 comm 死锁。
+    **SM carveout**（`DG_A2AT_COMM_SMS`，默认 24）防 GEMM 饿死 comm 死锁。
   - **正确性**：`tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS（融合路径）。
-  - **性能（8 卡，bench_a2a_transpose_gemm，vs comm-only+gemm-only 理想和，均不含跨卡同步）**：
 
-    | shape (bs,nh,seq,hd,N) | comm us | gemm us | sum us | fused us | speedup |
+  - ⚠️ **首版评测曾误判为「0.4~0.5x，单节点零和墙」——那是两个实现 bug 造成的假象，已修正：**
+    1. **comm block 只有 256 线程**：低 SM carveout 下，单 SM 的 NVLink 带宽由「在途 P2P store 数」决定，
+       256 线程远喂不满（要数千个 uint4 在途才能隐藏 NVLink 延迟）。实测大 shape `comm@16SM`：
+       **256 线程=491us，512=267us，1024=152us（3.2×）**。→ comm 线程数提到 **1024**（host 默认 + env）。
+    2. **GEMM 自旋用 `ld.acquire.sys` 死循环**：所有 GEMM CTA（comm_sms=16 时达 116 个）每轮都发
+       system-scope acquire load，**轰炸内存 fabric、反过来饿死 comm 的 P2P store**。→ 改为
+       **relaxed.sys 轮询 + `__nanosleep` 指数退避 + 命中后单次 `fence.acquire.sys`**（`ptx/ld_st.cuh`）。
+    - 两项修复后大 shape `(8,56,4096,128,7168)` fused **731→450us（1.6×）**，多数 shape 从 0.4~0.5x 升到 ~1.0x。
+
+  - **comm 带宽 vs SM 饱和曲线（8 卡，大 shape，1024 线程）**：comm 要 ~64 SM 才接近打满 NVLink；
+    `8SM=447us / 16=152 / 32~130 / 64=125 / 132=116`（≈440GB/s 上限）。
+
+  - **性能（8 卡，公平基线 = comm@全SM + gemm@全SM 串行；fused = 1024线程 + relaxed自旋 + comm_sms=24）**：
+
+    | shape (bs,nh,seq,hd,N) | comm us | gemm us | serial us | fused us | fused/serial |
     |------|------|------|------|------|------|
-    | (1,32,2048,128,4096) | 24 | 28 | 53 | 53 | 1.00x |
-    | (1,56,2048,128,7168) | 30 | 45 | 75 | 91 | 0.82x |
-    | (8,32,2048,128,4096) | 49 | 61 | 110 | 238 | 0.46x |
-    | (4,32,8192,128,4096) | 75 | 99 | 174 | 437 | 0.40x |
-    | (8,56,4096,128,7168) | 123 | 250 | 372 | 726 | 0.51x |
+    | (1,32,2048,128,4096) | 20 | 30 | 50 | 49 | 1.01x |
+    | (1,56,2048,128,7168) | 22 | 45 | 67 | 72 | 0.93x |
+    | (8,32,2048,128,4096) | 40 | 64 | 103 | 113 | 0.92x |
+    | (4,32,8192,128,4096) | 70 | 100 | 170 | 173 | 0.98x |
+    | (1,32,16384,128,4096) | 39 | 62 | 101 | 114 | 0.89x |
+    | (8,56,4096,128,7168) | 112 | 251 | 363 | 452 | 0.80x |
 
-  - **Verdict：M1 融合 overlap 单节点不划算（中性偏负，大 shape 更差）**。根因与 GEMM-RS 同源：
-    **comm 是 NVLink/HBM 带宽-bound、需要占满 SM**；SM carveout 只给 comm 16 SM 会让 comm 慢约
-    `total_sms/comm_sms`≈9×（comm-only 用全 SM 才 122us，16 SM 下约 1100us），远超 GEMM 时间 →
-    **藏不住**；不 carveout 又会让持久 GEMM 自旋占满 SM 饿死 comm（死锁）。即「两个都要满 SM 的核」在单
-    节点上 overlap 是零和。**结论：单节点用 M0（comm→GEMM 串行，各自占满 SM）即最优**；M1 的价值在
-    多节点/comm 可被算力远大的 GEMM 掩盖的场景。
+  - **修正后的 Verdict（诚实）**：**不是零和墙、也不是 0.4x 灾难——是「~parity」**。对齐 flux 调优后，
+    融合 overlap 机制确实生效（comm 被实质藏住），但在**本单节点**上 fused 仍 **0.8~1.0x（偶尔持平）、
+    尚未稳定超过串行**。物理本质：comm 要带宽=要 SM，从 GEMM 抠走 ~24 SM 的代价 ≈ 它藏住的 comm，
+    所以单节点接近持平。**结论：单节点 M0（串行、两段各占满 SM）仍是最快、最稳的选择；M1 现在是一个
+    正确且经过 flux 式调优的 overlap 实现，真正的净收益要在 comm«gemm（大算力）或多节点场景体现。**
+
+- **试过但回退的（记录避免重复踩坑）**：comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux
+  `get_tile_info`，意在让所有 rank 的 tile 渐进 ready）—— 只救活了最差的小 shape（0.54→0.95x），却让
+  中等 shape 回退（0.95→0.73、0.89→0.61），整体 wash 且引入回退，故**保留 dst-major**。
 - **M2（可选，未做）**：仅在 comm « gemm 的大算力 shape 或多节点场景下重启 overlap 调优；否则保持 M0。
 
 ---

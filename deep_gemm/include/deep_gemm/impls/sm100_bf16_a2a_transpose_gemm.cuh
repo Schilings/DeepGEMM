@@ -160,7 +160,19 @@ sm100_bf16_a2a_transpose_gemm_impl(void* d,
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
             const uint32_t global_m = m_block_idx * BLOCK_M;
             // barrier idx == m_block_idx (BLOCK_M == comm kTileM, local_seq % BLOCK_M == 0).
-            while (ptx::ld_acq_sys(reinterpret_cast<uint32_t*>(const_cast<int32_t*>(barrier_ptr) + m_block_idx)) != 1u);
+            // Spin on a RELAXED sys-load with exponential backoff (not ld.acquire.sys every iter):
+            // hammering acquire.sys from all GEMM CTAs floods the fabric and starves the peer P2P
+            // stores of the concurrent comm. Issue a single acquire fence once the flag flips so the
+            // pushed A data is guaranteed visible before the TMA load.
+            {
+                auto* bflag = reinterpret_cast<uint32_t*>(const_cast<int32_t*>(barrier_ptr) + m_block_idx);
+                uint32_t backoff = 32u;
+                while (ptx::ld_relaxed_sys(bflag) != 1u) {
+                    __nanosleep(backoff);
+                    backoff = backoff < 256u ? backoff << 1 : 256u;
+                }
+                ptx::fence_acquire_sys();
+            }
             const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
