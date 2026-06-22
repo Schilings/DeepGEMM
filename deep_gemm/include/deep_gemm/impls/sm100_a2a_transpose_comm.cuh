@@ -62,10 +62,20 @@ __global__ void sm100_a2a_transpose_comm_impl(
     }
 
     for (uint32_t work = blockIdx.x; work < total_work; work += gridDim.x) {
-        // dst-major (dst outer, tile inner). NOTE: tile-major was measured (better progressive
-        // readiness for the slowest rank) but it only helps the comm-heavy big shape (~+5%) while
-        // regressing the rest, so dst-major wins on average (0.92x vs 0.84x of serial-full).
-        const uint32_t dst_rank = work / tiles_per_dst;
+        // dst order = step, OPTIONALLY rotated per rank: dst_rank = (rank + step) % R.
+        //
+        // Rotation (ring/shifted all-to-all): without it every rank pushes to dst 0 first, then 1,
+        // ... so all ranks hammer the SAME destination at once -> only that GPU's NVLink ingress is
+        // used (~1/R of the switch bisection). Rotating by rank makes each step a permutation (rank
+        // r -> dst r+s), so all R ingress links are busy -> ~+12% comm bandwidth (measured).
+        //
+        // BUT rotation conflicts with fused overlap: it spreads each rank's INCOMING contributions
+        // across all steps (peer p reaches "push to me" only at step (my_rank-p)%R), so my tiles
+        // finish only near the end of comm -> the consumer GEMM can't overlap. So we rotate ONLY for
+        // the standalone/M0 comm (bandwidth-bound, no consumer); the fused path (kSetBarrier) keeps
+        // the un-rotated order so each rank's tiles complete in one early window for overlap.
+        const uint32_t step = work / tiles_per_dst;
+        const uint32_t dst_rank = kSetBarrier ? step : ((rank + step) % kNumRanks);
         const uint32_t tile = work % tiles_per_dst;
         const uint32_t b = tile / tiles_per_seq;
         const uint32_t t = tile % tiles_per_seq;

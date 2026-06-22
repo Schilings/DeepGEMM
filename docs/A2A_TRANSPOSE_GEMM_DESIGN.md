@@ -56,8 +56,16 @@
 - **硬件**：B300 SXM6，**148 SM**，287GB，8 卡全 NVSwitch（NV18，NVLink5 ≈ 900 GB/s/方向/卡）。
 - **SM 利用**：comm 与 GEMM 都已用满可用 SM（fused 用全部 148：comm carveout 24 + GEMM 124）。**不存在
   空闲 SM**，瓶颈不在「SM 没用上」。
-- **NVLink 利用（关键）**：comm 大 shape egress = 51.4MB/rank，`comm@全SM=112us` → **≈459 GB/s，仅约
-  NVLink5 峰值的 50%**。验证这是**散射+转置 P2P 写的访问模式天花板，不是 MLP/线程不足**：
+- **通信旋转（ring/shifted all-to-all，已采用）**：原 dst-major 无旋转时**所有 rank 同时先打 dst0、再 dst1…**
+  → 任意时刻只有一个 GPU 的 NVLink ingress 在收（~1/R bisection）= 热点。改为**按 rank 旋转
+  `dst=(rank+step)%R`**（每个 step 是一个 permutation，rank r→dst r+s）后所有 ingress 链路同时忙，
+  **comm 大 shape 112→94us（≈459→545 GB/s，+16%），M0/serial 363→343us**。
+  - ⚠️ **旋转与 fused overlap 冲突**：旋转把「推给我的」贡献分散到所有 step（peer p 在 step=(my_rank−p)%R
+    才推我）→ 我的 tile 整段 comm 末尾才补齐 → GEMM 无法 overlap（fused 451→533）。**带宽最优（打散）与
+    overlap 最优（早集中到齐）天然冲突**。故**只在 M0/standalone comm 旋转（带宽优先、无消费者），
+    fused（`kSetBarrier`）保持不旋转**（早集中到齐、利于 overlap）。
+- **NVLink 利用（关键）**：comm 大 shape egress = 51.4MB/rank，旋转后 `comm@全SM=94us → ≈545 GB/s`
+  （未旋转 459=50%峰值）。剩余差距是**散射+转置 P2P 写的访问模式天花板，不是 MLP/线程不足**：
   - 全 SM 下 comm 线程 256/512/1024 时间几乎不变（122/111/111us）→ 已饱和该模式下的写带宽。
   - 手动 4× unroll（load/store 解耦提 MLP）对带宽**中性**。
   - 对照：copy-engine **连续** P2P 单链路能到 **~667 GB/s** → 差距来自「每行仅 local_hidden≈1792B 连续、
@@ -74,6 +82,9 @@
     最慢 rank，dst-major 下高 rank 的 tile 全在 comm 末尾才 ready → GEMM 几乎不 overlap（先空转再算）；
     tile-major 修了这点但牺牲了其它 shape 的 comm 局部性。
   - comm copy 循环 **4× unroll**（提 MLP）：带宽中性，回退保持简洁。
+  - **pull 模式 comm**（远端读代替远端写：每 rank 读所有 peer 的 input 填自己的 gathered，barrier 退化为
+    纯本地 gpu-scope，无跨卡原子）：本想远端读更易打满 NVLink，但**实测 B300 上 pull 全面慢于 push**
+    （大 shape 114→152us、(1,56,2048) 22→43us），即 remote write > remote read，故回退。
 - **M2（可选，未做）**：仅在 comm « gemm 的大算力 shape 或多节点场景下重启 overlap 调优；否则保持 M0。
 
 ---
