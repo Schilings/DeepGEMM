@@ -184,6 +184,23 @@ flux 报告 `comm_time = fused_total − gemm_only`（暴露通信，overlap 越
   BHSD 算子之于 torch-SDPA），**不是**相对公平 baseline 的加速；FA 的 BSHD layout 对「我们 vs torch」
   的比值**中性**（两个世界都 ~1.6-2.4x）。要再提 NVLink 带宽得改写侧（gathered/GEMM layout 协同），属独立工程。
 
+### varlen / THD（FA varlen 模式）：uniform 整体切即可，无需 dyn-seq comm kernel（已验证）
+
+> FA varlen 用 **THD = `[total_tokens, nheads, head_dim]`**（packed，无 padding，`cu_seqlens` 分隔序列）。
+
+- **关键结论（实测验证）**：Ulysses SP + THD **可以把整个 packed `total_tokens` 在 rank 间均匀切分**
+  （rank r 拿 `[r*T_local:(r+1)*T_local]`），**不需要按每条序列切**。理由：attention 阶段每个 rank 通过
+  pre-attn A2A **gather 回的是完整 packed 序列**；uniform 切时按 rank 顺序拼接 = 恢复原始 packed 顺序，
+  `cu_seqlens` 原样有效、varlen attention 正确。**`cu_seqlens` 只在 attention kernel 内部用，我们的 comm
+  完全不碰它**。
+- 因此 **post-attn A2A-transpose 退化成一个均匀切**，正好是我们**现有 `seq_major` kernel** 直接覆盖：
+  把 THD 当作 **bs=1, seq=total_tokens** 喂入（heads 是内层连续块，THD == bs=1 的 BSHD）。**无需新写
+  cu_seqlens 驱动的 dyn-seq 变体**（与 flux 必须额外做 `post_attn_all2all_dyn_seq_kernel` 不同——因为我们
+  采用 uniform 切，省掉了 packed token→dst 的变长查表）。
+- **验证**：`tests/test_ulysses_varlen_thd.py`（4 条变长序列 packed，T=2048，sp=8，uniform 切，
+  `flash_attn_varlen_func` 做 attention）end-to-end 对单进程参考 **PASS（rel≈2.9e-3）**。
+- **唯一约束**：padded `total_tokens % sp == 0`（packed 总长补齐到 sp 的倍数；padding token 输出丢弃）。
+
 - **试过但回退的（记录避免重复踩坑）**：
   - comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux `get_tile_info`）：让所有 rank 的 tile
     渐进 ready，**只救活 comm-heavy 大 shape（fused 452→407us，0.80→0.85x）**，却让中等 shape 回退
