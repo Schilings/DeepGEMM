@@ -6,7 +6,6 @@
 #include <cutlass/arch/reg_reconfig.h>
 #include <cuda_device_runtime_api.h>
 
-#include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/sm100_utils.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
@@ -19,11 +18,22 @@
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/epilogue/sm100_store_cd.cuh>
+#include <deep_gemm/epilogue/transform.cuh>
 
 namespace deep_gemm {
 
 using namespace deep_gemm::sm100;
 using namespace deep_gemm::math;
+
+// Per-destination-rank TMA descriptors for the fused RS scatter store. maps[d] describes
+// dst_rank d's scatter buffer slot[my_rank] as a 2D [runtime_m_per_rank x hidden] tensor with
+// the CD swizzle, so the epilogue can issue an efficient bulk 2D TMA store (SM90_TMA_STORE_2D)
+// directly to a peer's HBM over NVLink — replacing the old per-row 1D tma_store_1d push.
+// Fixed max of 8 ranks (single-node NVLink domain). Layout-compatible with the host struct.
+struct GemmRSScatterMaps {
+    cute::TmaDescriptor maps[8];
+};
 
 // ============================================================================================
 //  sm100_bf16_gemm_rs_impl — TRUE Flux-style PULL-based GEMM (Reduce-Scatter, Part 1)
@@ -79,7 +89,8 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
                         cd_dtype_t* __restrict__ output,
                         const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_b) {
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                        const __grid_constant__ GemmRSScatterMaps scatter_maps) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 2, cute::TMEM::Allocator2Sm, cute::TMEM::Allocator1Sm>;
@@ -369,12 +380,6 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
         cutlass::arch::warpgroup_reg_alloc<kNumEpiRegisters>();
 
         const auto epilogue_warp_idx = warp_idx - kEpilogueWarpStart;
-        const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
-
-        constexpr uint32_t kElemsPerStore = 16 / sizeof(comm_dtype_t);
-        constexpr uint32_t kRowBytesPerNSlice = STORE_BLOCK_N * sizeof(comm_dtype_t);
-        constexpr uint32_t kStoresPerRow = STORE_BLOCK_N / kElemsPerStore;
-        constexpr uint32_t kNumNSlices = BLOCK_N / STORE_BLOCK_N;
 
         uint32_t tma_stage_idx = 0;
 
@@ -387,91 +392,30 @@ sm100_bf16_gemm_rs_impl(const uint32_t shape_m_per_rank,
 
             const uint32_t dst_rank = m_block_idx / num_m_blocks_per_rank;
             const uint32_t local_m_block_idx = m_block_idx - dst_rank * num_m_blocks_per_rank;
-            const uint32_t local_m = local_m_block_idx * BLOCK_M;
+            const uint32_t base_m_idx = local_m_block_idx * BLOCK_M;   // row within dst_rank's slot
+            const uint32_t base_n_idx = n_block_idx * BLOCK_N;
 
-            // TMEM → smem → LOCAL scatter buffer slot[dst_rank]
-            #pragma unroll
-            for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                #pragma unroll
-                for (uint32_t s = 0; s < kNumNSlices; ++ s) {
-                    auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
-
-                    ptx::tma_store_wait<kNumTMAStoreStages - 1>();
-                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
-
-                    // Phase 1: TMEM → registers → smem
-                    if (epilogue_thread_idx < STORE_BLOCK_M) {
-                        auto* row_ptr = smem_base_ptr + epilogue_thread_idx * kRowBytesPerNSlice;
-
-                        #pragma unroll
-                        for (uint32_t st = 0; st < kStoresPerRow; ++ st) {
-                            uint32_t tmem_col = accum_stage_idx * UMMA_N +
-                                                s * STORE_BLOCK_N + st * kElemsPerStore;
-
-                            if constexpr (cute::is_same_v<comm_dtype_t, float>) {
-                                uint32_t f0, f1, f2, f3;
-                                cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_col, f0, f1, f2, f3);
-                                cutlass::arch::fence_view_async_tmem_load();
-                                ptx::st_shared(row_ptr + st * 16, f0, f1, f2, f3);
-                            } else {
-                                uint32_t f0, f1, f2, f3, f4, f5, f6, f7;
-                                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_col, f0, f1, f2, f3, f4, f5, f6, f7);
-                                cutlass::arch::fence_view_async_tmem_load();
-                                ptx::st_shared(row_ptr + st * 16,
-                                    math::cast_into_bf16_and_pack(f0, f1),
-                                    math::cast_into_bf16_and_pack(f2, f3),
-                                    math::cast_into_bf16_and_pack(f4, f5),
-                                    math::cast_into_bf16_and_pack(f6, f7));
-                            }
-                        }
-                    }
-
-                    // Release TMEM stage
-                    if (w == kNumMWaves - 1 and s == kNumNSlices - 1) {
-                        ptx::tcgen05_before_thread_sync();
-                        tmem_empty_barriers[accum_stage_idx]->arrive(0u);
-                    }
-
-                    // Phase 2: smem → LOCAL scatter buffer via TMA async store (non-blocking)
-                    cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
-
-                    {
-                        uint32_t base_row = local_m + w * STORE_BLOCK_M;  // local within rank's chunk
-                        uint32_t base_col = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
-
-                        cute::tma_store_fence();
-
-                        for (uint32_t row = epilogue_thread_idx; row < STORE_BLOCK_M; row += kNumUMMAStoreThreads) {
-                            const uint32_t global_row = base_row + row;  // local within chunk
-                            if (global_row >= runtime_m_per_rank) break;
-
-                            auto* smem_row = smem_base_ptr + row * kRowBytesPerNSlice;
-
-                            // PUSH (overlap with MMA): TMA async-store my partial for chunk dst_rank
-                            // into dst_rank's buffer slot[rank_idx]. The cross-card NVLink transfer
-                            // is issued by the TMA engine here and overlaps with subsequent tiles'
-                            // MMA — this is what lets the fused path beat the separate baseline.
-                            // For self (dst_rank == rank_idx) the map returns a local pointer.
-                            auto* slot_ptr = workspace.get_partial_ptr<comm_dtype_t>(
-                                rank_idx, global_row, base_col);
-                            auto* push_ptr = sym_buffer.map(slot_ptr, dst_rank);
-                            ptx::tma_store_1d(reinterpret_cast<void*>(push_ptr), smem_row, kRowBytesPerNSlice);
-                        }
-
-                        cute::tma_store_arrive();
-                    }
-
-                    tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
-                }
-            }
-
-            // Wait all TMA stores (incl. the remote push) for this tile to complete.
-            // NOTE: no per-tile ready flag is needed — the GEMM's final system-scope
-            // nvlink_barrier guarantees all pushes are globally visible before the kernel
-            // exits, and the host orders the RS-reduce strictly after GEMM completion.
-            ptx::tma_store_wait<0>();
-            cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+            // Bulk 2D TMA store of the whole tile straight into dst_rank's scatter slot[my_rank]
+            // (remote P2P over NVLink when dst_rank != my_rank, local HBM for self). This reuses
+            // the standard swizzled STSM + SM90_TMA_STORE_2D epilogue — far more efficient than the
+            // previous per-row 1D tma_store_1d push (128B transfers), and the async store overlaps
+            // with subsequent tiles' MMA. OOB rows (runtime_m_per_rank not a multiple of BLOCK_M)
+            // are dropped by the TMA descriptor bounds.
+            epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                GemmType::Normal, false,
+                comm_dtype_t, epilogue::transform::EpilogueIdentity>
+            (smem_cd, tma_stage_idx, accum_stage_idx * UMMA_N,
+             base_m_idx, base_n_idx, 0,
+             epilogue_warp_idx, lane_idx,
+             tmem_empty_barriers[accum_stage_idx],
+             scatter_maps.maps[dst_rank]);
         }
+
+        // Drain all scatter stores once before the final cross-rank barrier so every push is
+        // globally visible to peers' RS reduce.
+        ptx::tma_store_wait<0>();
+        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
     }
 
     // ── Final synchronization ──

@@ -501,12 +501,44 @@ host event 序（下轮 GEMM 等本轮 reduce）+ 起始 tag41 barrier 保证。
 
 ---
 
-## 下一步计划（冲 >1.3x，聚焦中大 shape）
+## 2026-06-22：Iteration 14 — epilogue push 改整块 2D TMA store（分支 `gemm-rs-2d-tma-push`，中性，保留作干净实现）
 
-1. **[最高价值] epilogue push 改 2D TMA store**：host 为 R 个目标 rank 的 scatter slot 建 `CUtensorMap`，
-   kernel epilogue 用整块 2D TMA store 替代逐行 1D，消除小传输低效 → 缩小 push 开销。
-2. 次选：reduce 算法级降流量（树形/分层）。
-3. 每轮迭代必须记录 4/8 卡 × focus shape 的 benchmark 数据（见 RULE.md §7.1）。
+> 在独立分支开发（main 保留 1.22x 干净版）。
+
+### Change
+
+- `impls/sm100_bf16_gemm_rs.cuh`：epilogue 的**逐行 `tma_store_1d` push** 替换为**复用标准
+  `epilogue::sm100_store_cd`** 的整块 2D TMA store（swizzled STSM + `SM90_TMA_STORE_2D`），
+  目标为每个 dst_rank 的 scatter slot[my_rank]（远端 dst 即 P2P TMA store）。新增 kernel 参数
+  `GemmRSScatterMaps`（R 个 `CUtensorMap`，每个描述一个目标 rank 的 slot 为 2D `[runtime_m x n]`）。
+- `csrc/.../sm100_bf16_gemm_rs.hpp`：新增 `make_tma_2d_desc_raw`（裸指针建 CD 描述符），为
+  `num_ranks` 个目标 rank 各建一个 slot 描述符（self=本地 base，peer=P2P-mapped base）传入 kernel。
+
+### Result（正确性 6/6 PASS @ 2/4/8 卡，max_diff=0.0）
+
+| GPUs | vs torch | vs sep (focus 中大) | main baseline (vs sep) |
+|------|------|------|------|
+| 4 focus | 1.174x | **1.192x** | 1.199x |
+| 8 focus | 1.201x | **1.231x** | 1.224x |
+| 8 全 13-shape | 1.110x | **1.148x** | 1.140x |
+
+单 shape：8192x4096x4096 @8卡 **1.30x**。全部在噪声内（±0.01~0.02）。
+
+### Verdict
+
+- **中性**（既不显著优也不劣，代码更干净——复用标准 epilogue）。**未达 >1.3x**。
+- **关键结论**：push 开销（gemm+push − 纯GEMM ≈ 129us）是 **NVLink 带宽-bound，不是传输粒度问题**。
+  逐行 1D 与整块 2D store 都打满 NVLink egress，故 2D 化无提速。129us 暴露是远端 push 的 NVLink
+  传输 tail（数据必须跨卡），本架构内基本不可压缩。
+- 处置：保留在分支 `gemm-rs-2d-tma-push`（更干净的实现，8卡不劣）；main 维持 1.22x 不变。
+  要真正冲 >1.3x 只剩**算法级降通信量**（树形/分层 RS，把 push 的 (R-1)×、reduce 的 (R+1)× 降下来）。
+
+---
+
+## 下一步计划
+
+1. （唯一剩余有效方向）reduce-scatter **算法级降通信量**：树形/分层，把跨卡 push 量与本地 reduce 流量同时降低。
+2. 每轮迭代必须记录 4/8 卡 × focus shape 的 benchmark 数据（见 RULE.md §7.1）。
 
 ---
 

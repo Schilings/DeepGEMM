@@ -19,6 +19,36 @@
 
 namespace deep_gemm {
 
+// Host-side mirror of the kernel's GemmRSScatterMaps (layout-compatible: CUtensorMap[8]).
+// maps[d] describes dst_rank d's scatter buffer slot[my_rank] as a 2D tensor for the bulk
+// 2D TMA store in the GEMM epilogue. Passed by value to the kernel.
+struct GemmRSScatterMaps {
+    CUtensorMap maps[8];
+};
+
+// Raw-pointer variant of make_tma_2d_desc (the stock one needs a torch::Tensor). Builds a 2D
+// CD-style TMA descriptor over an arbitrary device base pointer (here: a peer rank's symmetric
+// scatter slot), so the epilogue can 2D-TMA-store directly into peer HBM over NVLink.
+static CUtensorMap make_tma_2d_desc_raw(void* gmem_ptr, const at::ScalarType& dtype, const int& elem_size,
+                                        int gmem_inner_dim, int gmem_outer_dim,
+                                        int smem_inner_dim, int smem_outer_dim,
+                                        const int& gmem_outer_stride,
+                                        const int& swizzle_mode, const int& swizzle_base = 0) {
+    if (swizzle_mode != 0)
+        smem_inner_dim = swizzle_mode / elem_size;
+    CUtensorMap tensor_map;
+    const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim), static_cast<cuuint64_t>(gmem_outer_dim)};
+    const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(smem_outer_dim)};
+    const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride * elem_size), };
+    const cuuint32_t elem_strides[2] = {1, 1};
+    DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
+        &tensor_map, aten_dtype_to_tensor_map_dtype(dtype, false, true),
+        2, gmem_ptr, gmem_dims, gmem_strides, smem_dims, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return tensor_map;
+}
+
 // ════════════════════════════════════════════════════════════════
 //  TRUE Flux-style PULL-based GEMM + Reduce-Scatter (dual-kernel)
 //
@@ -84,6 +114,7 @@ public:
         void* output;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
+        GemmRSScatterMaps scatter_maps;
         LaunchArgs launch_args;
     };
 
@@ -139,7 +170,8 @@ static void __instantiate_kernel() {{
             output,
             args.sym_buffer_ptrs,
             args.tensor_map_a,
-            args.tensor_map_b));
+            args.tensor_map_b,
+            args.scatter_maps));
     }
 };
 
@@ -213,6 +245,25 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
                                                static_cast<int>(b.stride(-2)),
                                                config.swizzle_b_mode);
 
+    // Scatter-slot TMA descriptors (one per dst_rank) for the epilogue's bulk 2D TMA push.
+    // maps[d] targets dst_rank d's symmetric scatter buffer slot[rank_idx], viewed as a 2D
+    // [runtime_m_per_rank x n] tensor (row stride n) with the CD swizzle. For d == rank_idx the
+    // base is this rank's own buffer (local store); otherwise it is a peer's P2P-mapped buffer.
+    const int comm_elem_size = (comm_dtype == torch::kFloat) ? 4 : 2;
+    const int64_t slot_stride_bytes = static_cast<int64_t>(max_m_per_rank) * n * comm_elem_size;
+    const int64_t slot_offset = static_cast<int64_t>(layout::GemmRSWorkspace::kNumBarrierSignalBytes)
+                                + static_cast<int64_t>(rank_idx) * slot_stride_bytes;
+    GemmRSScatterMaps scatter_maps{};
+    for (int d = 0; d < num_ranks; ++ d) {
+        auto* slot_ptr = reinterpret_cast<char*>(static_cast<uintptr_t>(sym_buffer_ptrs[d])) + slot_offset;
+        scatter_maps.maps[d] = make_tma_2d_desc_raw(
+            reinterpret_cast<void*>(slot_ptr), comm_dtype, comm_elem_size,
+            n, runtime_m_per_rank,
+            config.swizzle_cd_mode / comm_elem_size, config.block_m,
+            n,
+            config.swizzle_cd_mode);
+    }
+
     // ── Step 1: launch GEMM compute kernel on compute_stream ──
     const int total_threads = config.num_non_epilogue_threads + config.num_epilogue_threads;
 
@@ -228,6 +279,7 @@ static void sm100_bf16_gemm_rs_nt(const torch::Tensor& y,
         .output = y.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
+        .scatter_maps = scatter_maps,
         .launch_args = LaunchArgs(gemm_sms,
                                   total_threads,
                                   config.smem_size,
