@@ -158,6 +158,45 @@ def run_benchmark(rank, num_gpus, num_iters, port):
         sym.destroy()
         dist.barrier()
 
+    # ===== THD / varlen (FlashAttention varlen mode) =====
+    # Packed total_tokens, uniformly split across ranks (bs=1, seq=total_tokens). Our seq_major op
+    # handles THD directly: uniform split makes the post-attn A2A a plain split, so NO cu_seqlens is
+    # needed in the comm (cu_seqlens only matters inside attention). See tests/test_ulysses_varlen_thd.py.
+    THD_SHAPES = [   # (total_tokens, nheads, head_dim, N)
+        (4096, 32, 128, 4096),
+        (8192, 32, 128, 4096),
+        (16384, 56, 128, 7168),
+    ]
+    if rank == 0:
+        print(f"\n  --- THD / varlen (bs=1, seq=total_tokens, seq_major=True; uniform packed-token split) ---")
+        print(f"  {'(T,nh,hd,N)':<24} | {'comm(us)':>9} {'gemm(us)':>9} {'M0(us)':>9} | {'comm GB/s':>10}")
+    for (T, nheads, head_dim, N) in THD_SHAPES:
+        if nheads % sp or T % sp or (T // sp) % 128:
+            if rank == 0:
+                print(f"  (T={T},{nheads},{head_dim},{N}) SKIP")
+            dist.barrier(); continue
+        local_T = T // sp
+        hidden = nheads * head_dim
+        g = torch.Generator(device=device).manual_seed(7)
+        Wo = torch.randn((N, hidden), dtype=torch.bfloat16, device=device, generator=g)
+        sym = get_symm_buffer_for_a2a_transpose_gemm(group, 1, nheads, T, head_dim)
+        # THD attention output bytes: [1, T, local_nh, hd] (THD == bs=1 BSHD)
+        x_thd = torch.randn((1, T, nheads // sp, head_dim), dtype=torch.bfloat16, device=device)
+        sym.x.view(-1).copy_(x_thd.reshape(-1))
+        d = torch.zeros((local_T, N), dtype=torch.bfloat16, device=device)
+        rank_i = group.rank(); ptrs = sym.handle.buffer_ptrs
+        t_comm = time_call(lambda: _C.bf16_a2a_transpose_comm(
+            sym.buffer, ptrs, rank_i, 1, nheads, T, head_dim, True), resets=[])   # seq_major=True (THD)
+        t_gemm = time_call(lambda: deep_gemm.bf16_gemm_nt(sym.gathered, Wo, d), resets=[])
+        if rank == 0:
+            # egress per rank = (sp-1)/sp of this rank's input (the peers' share goes over NVLink)
+            egress_GB = (sp - 1) / sp * (nheads // sp) * T * head_dim * 2 / 1e9
+            bw = egress_GB / (t_comm * 1e-6) if t_comm > 0 else 0.0
+            print(f"  (T={T},{nheads},{head_dim},{N})".ljust(24) +
+                  f" | {t_comm:>9.1f} {t_gemm:>9.1f} {t_comm + t_gemm:>9.1f} | {bw:>10.0f}")
+        sym.destroy()
+        dist.barrier()
+
     dist.destroy_process_group()
     os._exit(0)
 
