@@ -49,9 +49,31 @@
     所以单节点接近持平。**结论：单节点 M0（串行、两段各占满 SM）仍是最快、最稳的选择；M1 现在是一个
     正确且经过 flux 式调优的 overlap 实现，真正的净收益要在 comm«gemm（大算力）或多节点场景体现。**
 
-- **试过但回退的（记录避免重复踩坑）**：comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux
-  `get_tile_info`，意在让所有 rank 的 tile 渐进 ready）—— 只救活了最差的小 shape（0.54→0.95x），却让
-  中等 shape 回退（0.95→0.73、0.89→0.61），整体 wash 且引入回退，故**保留 dst-major**。
+### 资源利用率分析（B300 SXM6，本机）
+
+> 针对「B 卡 SM 更多、NVLink 更快，是不是资源没吃满」做的核查。
+
+- **硬件**：B300 SXM6，**148 SM**，287GB，8 卡全 NVSwitch（NV18，NVLink5 ≈ 900 GB/s/方向/卡）。
+- **SM 利用**：comm 与 GEMM 都已用满可用 SM（fused 用全部 148：comm carveout 24 + GEMM 124）。**不存在
+  空闲 SM**，瓶颈不在「SM 没用上」。
+- **NVLink 利用（关键）**：comm 大 shape egress = 51.4MB/rank，`comm@全SM=112us` → **≈459 GB/s，仅约
+  NVLink5 峰值的 50%**。验证这是**散射+转置 P2P 写的访问模式天花板，不是 MLP/线程不足**：
+  - 全 SM 下 comm 线程 256/512/1024 时间几乎不变（122/111/111us）→ 已饱和该模式下的写带宽。
+  - 手动 4× unroll（load/store 解耦提 MLP）对带宽**中性**。
+  - 对照：copy-engine **连续** P2P 单链路能到 **~667 GB/s** → 差距来自「每行仅 local_hidden≈1792B 连续、
+    跨行 stride=hidden」的散射写 + all-to-all，而非硬件没力气。
+- **能不能更快**：理论上 pull（远端读）或把转置折进 GEMM 的 TMA A-load（让网络传输变连续）可能逼近峰值，
+  但前者需重写 comm、后者 TMA 无法任意 gather，均为独立大工程，**未做**。
+- **结论**：单节点的限制是 **comm 的 NVLink 写带宽（且 comm 带宽=SM 数）**，不是闲置算力。因此 fused
+  在单节点 ≈ parity 是该模式 + 单节点拓扑的固有结果，B300 更多 SM 改变不了「comm 抠走的 SM ≈ 它藏住的量」。
+
+- **试过但回退的（记录避免重复踩坑）**：
+  - comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux `get_tile_info`）：让所有 rank 的 tile
+    渐进 ready，**只救活 comm-heavy 大 shape（fused 452→407us，0.80→0.85x）**，却让中等 shape 回退
+    （4,32,8192：0.98→0.72x），**平均 0.84x < dst-major 0.92x**，故**保留 dst-major**。根因：bench 同步取
+    最慢 rank，dst-major 下高 rank 的 tile 全在 comm 末尾才 ready → GEMM 几乎不 overlap（先空转再算）；
+    tile-major 修了这点但牺牲了其它 shape 的 comm 局部性。
+  - comm copy 循环 **4× unroll**（提 MLP）：带宽中性，回退保持简洁。
 - **M2（可选，未做）**：仅在 comm « gemm 的大算力 shape 或多节点场景下重启 overlap 调优；否则保持 M0。
 
 ---

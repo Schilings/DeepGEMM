@@ -62,6 +62,9 @@ __global__ void sm100_a2a_transpose_comm_impl(
     }
 
     for (uint32_t work = blockIdx.x; work < total_work; work += gridDim.x) {
+        // dst-major (dst outer, tile inner). NOTE: tile-major was measured (better progressive
+        // readiness for the slowest rank) but it only helps the comm-heavy big shape (~+5%) while
+        // regressing the rest, so dst-major wins on average (0.92x vs 0.84x of serial-full).
         const uint32_t dst_rank = work / tiles_per_dst;
         const uint32_t tile = work % tiles_per_dst;
         const uint32_t b = tile / tiles_per_seq;
