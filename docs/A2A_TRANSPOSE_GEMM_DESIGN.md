@@ -13,9 +13,29 @@
   `comm → SP-group barrier → 标准 bf16_gemm_nt`（无 overlap）。
   **正确性 `tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS**（vs all_gather 重建的非循环
   ground-truth，rel~1e-6；torch 候选 rel=0）。入口：`deep_gemm.bf16_a2a_transpose_gemm_nt(d, Wo, sym)`。
-- **M1（overlap，进行中）**：per-M-tile barrier（comm 计数到 world_size）+ GEMM 消费者按 tile-ready
-  消费（替换 M0 的 barrier+标准 GEMM）；bench vs separate。
-- **M2（调优）**：comm SM 数 / TILE_M / raster / mc=2。
+- **M1（overlap，已实现 + 已评测，结论：单节点不划算）**：
+  - 实现：comm 改 tile 粒度 + per-M-tile barrier（计数到 world_size，置 1）；融合 GEMM 消费者
+    （`impls/sm100_bf16_a2a_transpose_gemm.cuh`）Load-A warp 按 `barrier[m_block]==1` 等待后再 load；
+    host（`csrc/sm100_bf16_a2a_transpose_gemm.hpp`）comm 走 comm_stream + GEMM 走 compute_stream，
+    **SM carveout**（`DG_A2AT_COMM_SMS`，默认 16）防 GEMM 饿死 comm 死锁。
+  - **正确性**：`tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS（融合路径）。
+  - **性能（8 卡，bench_a2a_transpose_gemm，vs comm-only+gemm-only 理想和，均不含跨卡同步）**：
+
+    | shape (bs,nh,seq,hd,N) | comm us | gemm us | sum us | fused us | speedup |
+    |------|------|------|------|------|------|
+    | (1,32,2048,128,4096) | 24 | 28 | 53 | 53 | 1.00x |
+    | (1,56,2048,128,7168) | 30 | 45 | 75 | 91 | 0.82x |
+    | (8,32,2048,128,4096) | 49 | 61 | 110 | 238 | 0.46x |
+    | (4,32,8192,128,4096) | 75 | 99 | 174 | 437 | 0.40x |
+    | (8,56,4096,128,7168) | 123 | 250 | 372 | 726 | 0.51x |
+
+  - **Verdict：M1 融合 overlap 单节点不划算（中性偏负，大 shape 更差）**。根因与 GEMM-RS 同源：
+    **comm 是 NVLink/HBM 带宽-bound、需要占满 SM**；SM carveout 只给 comm 16 SM 会让 comm 慢约
+    `total_sms/comm_sms`≈9×（comm-only 用全 SM 才 122us，16 SM 下约 1100us），远超 GEMM 时间 →
+    **藏不住**；不 carveout 又会让持久 GEMM 自旋占满 SM 饿死 comm（死锁）。即「两个都要满 SM 的核」在单
+    节点上 overlap 是零和。**结论：单节点用 M0（comm→GEMM 串行，各自占满 SM）即最优**；M1 的价值在
+    多节点/comm 可被算力远大的 GEMM 掩盖的场景。
+- **M2（可选，未做）**：仅在 comm « gemm 的大算力 shape 或多节点场景下重启 overlap 调优；否则保持 M0。
 
 ---
 

@@ -55,6 +55,17 @@ class BF16A2ATransposeGemmSymmBuffer:
         torch.cuda.synchronize()
         self.x, self.gathered = slice_buffers(self.buffer)
 
+    def _barrier_bytes(self) -> int:
+        tiles_per_seq = (self.local_seq + 127) // 128
+        num_m_tiles = self.bs * tiles_per_seq
+        nbytes = (num_m_tiles + 1) * 4
+        return (nbytes + 127) // 128 * 128
+
+    def reset_barriers(self):
+        """Zero the per-M-tile barrier region (offset 0). Caller must SP-group-sync around this
+        so all ranks reset before any peer's comm writes (fused path reuse across calls)."""
+        self.buffer[:self._barrier_bytes()].zero_()
+
     def destroy(self):
         self.handle = None
         self.buffer = None
