@@ -5,7 +5,12 @@
 > `src/a2a_transpose_gemm`，在 SM100（B 卡）上落地。
 > 背景与「为什么旧实现不对」见 `A2A_GEMM_ITERATION.md` 顶部「当前状态」。
 
-## 实现进度（分支 `a2a-transpose-gemm`）
+## 实现进度（已并入 `main`，merge `5516d8d`）
+
+> **现状一句话**：算子已正确实现并合入 main。默认入口 `bf16_a2a_transpose_gemm_nt` = **M0（串行，单节点最优，
+> 比 torch 基线快 1.6~2.4×）**；`_fused` = M1 overlap（opt-in，单节点 ~parity）；`seq_major=True` 用于接
+> FlashAttention 原生 BSHD/THD（layout 匹配，非加速），且 **uniform 切下直接覆盖 varlen/THD，comm 无需 cu_seqlens**。
+> 三个测试：`test_a2a_transpose_gemm`（三路正确性）/`test_ulysses_attn_flow`（完整 attn 流程）/`test_ulysses_varlen_thd`（FA varlen）。
 
 - **M0（正确性，已完成）**：转置 scatter comm kernel（`impls/sm100_a2a_transpose_comm.cuh`，uint4 P2P，
   写 dst 的 hidden 列偏移 `rank*local_hidden`）+ 新 layout（`layout/bf16_a2a_transpose_gemm.cuh`：
