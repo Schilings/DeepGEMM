@@ -79,7 +79,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1); //  BLOCK_M
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast); // BLOCK_N/2
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
+    // STORE_BLOCK_N: kSwizzleCDMode=128 是 TMA swizzle stripe 字节宽, ÷sizeof 转元素数 → BF16:64, FP32:32
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
+    // epilogue 线程数 = STORE_BLOCK_M, 每个线程负责 M 维的一个 element 行
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M, "Only support tensor memory layout A/D");
@@ -125,6 +127,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     }
 
     // D/A/B shared memory
+    // SMEM 布局: [smem_cd(num_store_stages) | smem_a(num_stages) | smem_b(num_stages) | sfa(num_stages) | sfb(num_stages) | barriers | tmem_ptr]
     auto smem_cd = PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE); 
     });
@@ -145,17 +148,21 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     });
 
     // Fill barriers
+    // 将数据区之后的 smem 原始字节 reinterpret_cast 为 Barrier* 数组
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer +
         SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
         kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
+    // ── TMA ↔ MMA 流水线 barrier ──
     auto full_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto empty_barriers             = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
+    // with_sf_full_barriers: TMA load (包含 A/B/SFA/SFB) 完成信号, 32 线程 arrive → init(kNumMulticast*32)
     auto with_sf_full_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
+    // ── TMEM 流水线 barrier ──
     auto tmem_full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
     auto tmem_empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
 
-    // Fill the tensor memory pointer
+    // TMEM 地址存放在 shared memory 中，紧接在所有 barrier 之后
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
@@ -271,9 +278,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             }
         }
     } else if (warp_idx == 1 and is_leader_cta) {
-        // MMA issue warp
-        // NOTES: only the leader CTA will do this
-        // Make instruction descriptor
+        // MMA issue warp — only the leader CTA will do this
+        // 创建 UMMA block-scaled 指令描述符 (FP8×FP8→FP32, 带 UE8M0 scale factor)
         // TODO: refactor `UMMA_M` calculation
         constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
         constexpr uint32_t UMMA_N = BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
@@ -283,6 +289,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         auto sf_desc = make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
+        // SM100 UMMA SmemDescriptor: 地址/偏移以 16 字节为单位, 每个 lane 管一个 stage
         auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
         auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
@@ -298,6 +305,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             // Wait tensor memory empty barrier arrival
+            // barrier.wait 之后发射 UMMA 前需要 tcgen05 fence, 确保上一轮 TMEM 写入可见
             auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
             tmem_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
@@ -325,11 +333,11 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait TMA and SF-transpose arrival
                 with_sf_full_barriers[stage_idx]->wait(phase);
-                tcgen05_after_thread_sync();
+                tcgen05_after_thread_sync(); // barrier.wait 之后 UMMA 前需要 fence
 
-                // Do SF copy at certain stages
-                // NOTES: CUTLASS UTCCP's interface does not have `elect_one_sync`, we must do it by ourselves
-                // TODO: process shared memory descriptor by addition
+                // UTCCP: 将 UE8M0 scale factor 从 smem 拷贝到 TMEM 的 SF 区
+                // SM100 block-scaled UMMA 要求 SF 在 TMEM 的指定列
+                // kGranKA=32: 每 1 次 K 做 UTCCP; kGranKA=128: 每 4 次 K 做一次
                 using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
                     cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
                 const uint32_t sfa_stage_in_group_idx = k_block_idx % kNumSFAStagesPerLoad;
@@ -353,21 +361,28 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 __syncwarp();
 
                 // Issue UMMA in the leader CTA
+                // mma_t: FP8×FP8 block-scaled, 根据 kNumMulticast 选单 SM 或 2-CTA cluster
                 using mma_t = cute::conditional_t<kNumMulticast == 1, SM100_MMA_MXF8F6F4_SS, SM100_MMA_MXF8F6F4_2x1SM_SS>;
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
                 if (cute::elect_one_sync()) {
                     #pragma unroll
+                    // 内层 K 循环: 每 UMMA_K=32 个 K 元素发一条 UMMA, BLOCK_K=128 时循环 4 次
                     for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
                         const uint32_t sfa_id = (kGranKA == 32 ? k : sfa_stage_in_group_idx);
                         const uint32_t sfb_id = (kGranKB == 32 ? k : sfb_stage_in_group_idx);
+                        // 将编译期 instr_desc + 运行时 SF ID → 64 位立即数
                         const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sfa_id, sfb_id);
 
                         b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, k * UMMA_K);
                         #pragma unroll
+                        // M 维 wave 循环: FP8 A 矩阵在 M 维可拆为多个 wave, 每个 wave 做一次 fma
                         for (uint32_t w = 0; w < kNumMWaves; ++ w) {
                             DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
                             a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, w * WAVE_BLOCK_M * BLOCK_K, k * UMMA_K);
+                            // fma: D += A × B
+                            //   参数3 = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N: TMEM 列偏移
+                            //   参数4 = k_block_idx>0 or k>0: 首 K-block 第一步清零, 后续累加
                             mma_t::fma(a_desc, b_desc,
                                        accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
                                        k_block_idx > 0 or k > 0,
@@ -391,7 +406,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             tmem_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
         }
     } else if (warp_idx == 2) {
-        // UTCCP transposer
+        // UTCCP transpose warp: 将 TMA 加载的 SFA/SFB (row-major) 转置为 UTCCP 需要的 col-major 布局
+        // 每 128 个 uint32 为一个 unit, 32 lane 做 XOR shuffle 转置
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             uint32_t values[4];
@@ -431,7 +447,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             }
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
-        // Epilogue warp groups
+        // Epilogue warp groups — STSM (TMEM→SMEM) → TMA store (SMEM→global D)
+        // 128 线程 (4 warp), warp 间按 SMEM swizzle 分区, 互不重叠
         const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
@@ -495,15 +512,18 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         auto col = kHasShortcut ? (i) : (bank_group_index % 8);
                         col ^= row % (kSwizzleCDMode / 16);
 
-                        // Source and destination memory address
+                        // TMEM 地址: 基址 + M wave 偏移 + N store 偏移 + element 偏移
+                        // FP8 版 TMEM accumulator 有 kNumMWaves × BLOCK_N 列 (多 wave 时)
                         uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N +               // Accumulator offset
                                              w * BLOCK_N +                                          // Wave offset
                                              s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // In-block offset
+                        // SMEM 地址: warp 偏移 + swizzle 后的 (row, col), 消 bank conflict
                         auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +        // Base pointer
                                         epilogue_warp_idx * 32 * kSwizzleCDMode +                   // Warp offset
                                         row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // In-atom offset
 
-                        // Load from tensor memory, store into shared memory
+                        // STSM: TMEM→寄存器→SMEM, SM100 tcgen05 TMEM load 指令
+                        // FP32: SM100_TMEM_LOAD_32dp32b4x (4 float/thread), BF16: 32dp32b8x (8 float→pack 4 uint32)
                         uint32_t values[kNumElemsPerBankGroup];
                         if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                             // For FP32 output, read and store
@@ -527,14 +547,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         }
                     }
 
-                    // Notify tensor memory empty (only at the leader CTA) arrival ASAP
-                    // NOTES: only the last stage needs to do this
+                    // 通知 TMEM 已空: 整个 tile 的最后一个 atom 时才 arrive, 允许 UMMA 重用该 TMEM 区
                     if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
                         tcgen05_before_thread_sync();
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                     }
 
-                    // Synchronize all threads and issue TMA
+                    // TMA store: SMEM → Global D (异步 DMA, 发起后立即返回)
+                    // warp 0 中单线程发射, kWithAccumulation 时用 REDUCE_ADD
                     cute::tma_store_fence();
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
                     if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
