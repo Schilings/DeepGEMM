@@ -81,16 +81,30 @@ def bf16_a2a_transpose(sym_buffer: BF16A2ATransposeGemmSymmBuffer) -> torch.Tens
     return sym_buffer.gathered
 
 
+def bf16_a2a_transpose_gemm_nt_m0(d: torch.Tensor,
+                                  b: torch.Tensor,
+                                  sym_buffer: BF16A2ATransposeGemmSymmBuffer):
+    """M0 fallback: A2A-transpose comm + SP-group barrier + standard Wo GEMM (no overlap)."""
+    import deep_gemm
+    a = bf16_a2a_transpose(sym_buffer)            # [bs*local_seq, hidden]
+    deep_gemm.bf16_gemm_nt(a, b, d)
+
+
 def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
                                b: torch.Tensor,
                                sym_buffer: BF16A2ATransposeGemmSymmBuffer):
-    """M0: A2A-transpose comm + standard Wo GEMM (no overlap).
+    """M1 (fused): transpose-scatter comm overlapped with the Wo GEMM via per-M-tile barrier.
 
     Args:
       d: output [bs*local_seq, N], bf16.
       b: Wo weight [N, hidden], bf16 (NT layout).
       sym_buffer: with this rank's attention output already in sym_buffer.x.
+
+    NOTE: the per-M-tile barriers must be 0 on entry. They are zeroed at buffer creation; for
+    repeated calls on the same buffer, reset via sym_buffer.reset_barriers() with an SP-group
+    sync in between (see M2).
     """
-    import deep_gemm
-    a = bf16_a2a_transpose(sym_buffer)            # [bs*local_seq, hidden]
-    deep_gemm.bf16_gemm_nt(a, b, d)
+    _C.bf16_a2a_transpose_gemm_nt(
+        d, sym_buffer.gathered, b, sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(), sym_buffer.bs, sym_buffer.nheads,
+        sym_buffer.seq, sym_buffer.head_dim)

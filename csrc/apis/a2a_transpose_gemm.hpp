@@ -8,6 +8,7 @@
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm100_a2a_transpose_comm.hpp"
+#include "../jit_kernels/impls/sm100_bf16_a2a_transpose_gemm.hpp"
 #endif
 
 #include <deep_gemm/layout/bf16_a2a_transpose_gemm.cuh>
@@ -67,6 +68,38 @@ static void bf16_a2a_transpose_comm(const torch::Tensor& sym_buffer,
 #endif
 }
 
+// Fused (M1): transpose-scatter comm overlapped with the Wo GEMM (per-M-tile barrier).
+static void bf16_a2a_transpose_gemm_nt(const torch::Tensor& d,
+                                       const torch::Tensor& gathered,
+                                       const torch::Tensor& b,
+                                       const torch::Tensor& sym_buffer,
+                                       const std::vector<int64_t>& sym_buffer_ptrs,
+                                       const int& rank_idx,
+                                       const int& bs,
+                                       const int& nheads,
+                                       const int& seq,
+                                       const int& head_dim,
+                                       const std::string& compiled_dims) {
+#if DG_TENSORMAP_COMPATIBLE
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+    const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(num_ranks > 1 and rank_idx >= 0 and rank_idx < num_ranks);
+    DG_HOST_ASSERT(nheads % num_ranks == 0 and seq % num_ranks == 0 and head_dim % 8 == 0);
+    const auto major_b = get_major_type_ab(b);
+    DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    const auto [n, k] = get_shape<2>(b);
+    DG_HOST_ASSERT(k == nheads * head_dim);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(n % 128 == 0 and k % 64 == 0);
+    sm100_bf16_a2a_transpose_gemm(d, gathered, b, sym_buffer, sym_buffer_ptrs, rank_idx,
+                                  bs, nheads, seq, head_dim, n, compiled_dims);
+#else
+    DG_HOST_UNREACHABLE("BF16 A2A-transpose GEMM requires TensorMap support");
+#endif
+}
+
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_symm_buffer_size_for_bf16_a2a_transpose_gemm",
@@ -75,6 +108,11 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("sym_buffer"), pybind11::arg("sym_buffer_ptrs"),
           pybind11::arg("rank_idx"), pybind11::arg("bs"), pybind11::arg("nheads"),
           pybind11::arg("seq"), pybind11::arg("head_dim"));
+    m.def("bf16_a2a_transpose_gemm_nt", &bf16_a2a_transpose_gemm_nt,
+          pybind11::arg("d"), pybind11::arg("gathered"), pybind11::arg("b"),
+          pybind11::arg("sym_buffer"), pybind11::arg("sym_buffer_ptrs"),
+          pybind11::arg("rank_idx"), pybind11::arg("bs"), pybind11::arg("nheads"),
+          pybind11::arg("seq"), pybind11::arg("head_dim"), pybind11::arg("compiled_dims") = "nk");
 #endif
 }
 
