@@ -476,3 +476,50 @@ nanosleep(params.sleep_ns);  // first wave: ~100us
 3. **Phase 3**: 修改 JIT runtime + host-side comm 编排
 4. **Phase 4**: 正确性测试 + 性能 benchmark
 5. **Phase 5**: 根据结果决定是否升级到 Flux-style TMA RS DMA
+
+---
+
+## 9. 基线口径核对 + GEMM-RS vs A2A-transpose 的本质对照（2026-06-22，8× B300 实测）
+
+> 背景：在排查 A2A-transpose-GEMM 时发现 flux 那个算子的「加速」大头来自**弱基线**
+> （torch `.permute().contiguous()`×2 + NCCL all_to_all，含两趟冗余转置），其 overlap 本身
+> 单节点 ~parity。于是回头核对 **GEMM-RS 的基线是否也弱、以及我们 GEMM-RS 的 overlap 是否真净正**。
+
+### 9.1 基线口径：我们与 flux 一致，且我们更严
+
+- flux GEMM-RS 的 `perf_torch`（`test/python/gemm_rs/test_gemm_rs.py`）= `torch.matmul(input, weight.t())`
+  + `torch.distributed.reduce_scatter_tensor(...)`，**串行**计时（gemm_time + comm_time）。
+- 我们 `benchmarks/bench_gemm_rs.py` 的 `run_torch_native` = `torch.matmul` + `dist.reduce_scatter_tensor`
+  → **与 flux `perf_torch` 完全一致**。我们额外还有更强的 `run_separate`（**同一个** DeepGEMM
+  `bf16_gemm_nt` + NCCL RS，串行），用于隔离 overlap 本身的贡献。
+- 关键：GEMM-RS 的 torch 基线**不含冗余转置**（不像 a2a-transpose 那个），就是大家真实会写的
+  cublas+NCCL 路径，**不是放水的弱基线**。
+
+### 9.2 实测（8× B300，bench_gemm_rs.py 13 shapes，iters=20）
+
+| 口径 | geo-mean | best | worst |
+|------|------|------|------|
+| fused vs **Torch**（=flux 基线 cublas+NCCL）| **1.087x** | 1.28x | 0.87x |
+| fused vs **Separate**（强基线：同款 DeepGEMM GEMM + NCCL）| **1.128x** | 1.29x | 0.95x |
+
+- **`vs Separate` 这一列是 apples-to-apples 的 overlap 净增量**（fused 与 Separate 用同一个 GEMM
+  kernel，差别只在 overlap）→ **+12.8% geo-mean，13 个 shape 仅 1 个 0.95x、其余全 ≥1.0x**。
+- `vs Torch` 略低（1.087x），是因为个别大 K=7168 shape 上 cublas 的 GEMM 比我们 DeepGEMM 的快，
+  让 torch 总时间偏低——那是 **GEMM kernel 质量**问题，不是 overlap 问题。
+
+### 9.3 与 A2A-transpose-GEMM 的本质对照（结论）
+
+| | A2A-transpose-GEMM | **GEMM-RS** |
+|---|---|---|
+| vs flux 弱/同基线 | ~1.0x（赢主要靠单趟 comm kernel）| **1.087x** |
+| **vs 强基线（同款 GEMM + NCCL，隔离 overlap）** | **~parity / 净负**（hidden% 为负）| **1.128x（净正）** |
+| overlap 是否真划算（单节点）| 否 | **是** |
+
+**物理根因（为什么 GEMM-RS 能、a2a 不能）**：
+- **GEMM-RS**：reduce-scatter 消费的是 GEMM 的**输出** tile（算一块、收一块），天然生产者/消费者
+  尾部流水；RS 不必从 GEMM 抢走「会致命」的那么多 SM → **overlap 净正（+12.8%）**。
+- **A2A-transpose**：transpose-scatter 在 GEMM **之前**、产出 GEMM 的**输入**，是纯 NVLink-write
+  带宽-bound 且要抢 SM（comm 带宽=SM 数），抠走的 SM 代价 ≈ 它藏住的 comm → **~parity**。
+
+→ 两个算子结论不同是**有物理依据的，不是基线口径作祟**。GEMM-RS 的 overlap 在 B300 单节点上是
+  实打实的净收益（连最严的强基线都赢 1.13x）；A2A-transpose 的最优单节点路径则是 M0（串行）。
