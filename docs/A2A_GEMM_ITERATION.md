@@ -1,5 +1,50 @@
 # A2A GEMM (All2All + GEMM) Iteration Log
 
+## 当前状态（接班 · 2026-06-22 复核，重要）
+
+> **结论：当前 `bf16_a2a_gemm_nt` 实现的是「token(M 维) all-to-all + GEMM」，并非 Ulysses SP
+> post-attn 的语义。要做 Ulysses post-attn 必须按 flux `a2a_transpose_gemm` 思想重写（见下）。**
+
+### 本机复核（8 卡，main `636882b`）
+
+- **正确性 `tests/test_a2a_gemm.py 8`：3/6 PASS，3/6 FAIL**（`256×2048×2048`、`512×4096×7168`、
+  `1024×2048×7168`，rel_err≈**0.125=1/8**，疑似系统性丢失 ~1/num_ranks 的贡献 / 边界 tile 寻址 bug）。
+  与历史记录的「全 PASS」**不一致 → 存在回退/隐藏 bug**，待定位。
+- **bench `bench_a2a_gemm.py 8 10`：geo 1.176x**（14/14 >1.0x），与 iter3 记录的 **1.344x 不一致**
+  （记录值可能为不同 shape 集/卡数，且 test 本身校验的是“错误语义”，参考价值有限）。
+
+### 语义错位（核心问题）
+
+| | 我们的 `bf16_a2a_gemm_nt` | Ulysses post-attn（flux `a2a_transpose`）|
+|---|---|---|
+| 通信轴 | **M（token/行）**：`x[j]` 整块 `[M_per_rank,K]` 发给 rank j | **K（hidden）+ seq↔head 转置**：rank r 写 dst 的 hidden 列偏移 `r*local_hidden` |
+| 接收/拼接 | 各 src 的 slot 沿 **M 拼接** → `[num_ranks*M_per_rank, K]` | 各 src 的 hidden 切片沿 **K 拼接** → 每 token 行的完整 K |
+| 输出 M | `num_ranks*M_per_rank`（本 rank 算所有 rank 的 token）| `local_seq`（本 rank 只算自己 seq 分片，但 hidden 全）|
+| GEMM tile 依赖 | 一个 M-tile 只需**单个** src rank 的 slot（K 已完整）| 一个 M-tile 需**所有** rank 的 K 切片到齐（barrier 计数到 world_size）|
+| layout 变换 | 无转置 | `[bs, local_nheads, seq, hd] → [bs, local_seq, nheads, hd]` 转置 |
+
+- 证据：我们的 test 参考 = `dist.all_to_all(行块)` → `cat(dim=0)` → `@ b.t()`（token-A2A）；
+  flux `push_tile_to_dst` 写 `output[(rank*local_nheads+nh)*head_dim+hd]`（按 rank 填 hidden 列偏移）。
+- 影响：我们「self chunk 先算 + ring 顺序」的调度对 token-A2A 成立，但对 Ulysses 不成立
+  （所有 rank 共同贡献同一批输出行的 K）。
+
+### Ulysses post-attn 正确数据流（flux 思想，重写目标）
+
+1. **A2A-transpose**：每 rank 输入 `[bs, local_nheads, seq, head_dim]`（本 rank 的 head 子集、全 seq），
+   把 dst 的 seq 分片推到 dst，落在 dst 输出的 hidden 列段 `[rank*local_hidden : (rank+1)*local_hidden]`，
+   得到 `[bs, local_seq, nheads, head_dim]`（本 rank 的 seq 分片、全 hidden）。
+2. **GEMM (Wo)**：对本 rank 的 `local_seq` 行做 `[local_seq, hidden] @ [N, hidden]^T`，
+   **每个 M-tile 等所有 rank 的 hidden 切片到齐**（per-M-tile barrier 计数到 world_size）后做完整-K GEMM；
+   overlap 来自不同 M-tile 先后 ready 的流水。
+
+### 待办（与用户确认后执行，建议独立分支）
+
+- A) 先定位并修复当前 token-A2A 的 3/6 正确性 FAIL（或直接在重写中废弃旧语义）。
+- B) 按上面数据流重写为 Ulysses post-attn A2A-transpose + Wo GEMM（comm 写 hidden 列偏移 + 转置；
+  GEMM 等 full-K per M-tile），test 参考改为 flux 等价的 transpose 语义。
+
+---
+
 ## Baseline (commit 8814016)
 
 **Geo Mean: 1.239x** | Config: mc2, 256T, launch_bounds(256,1), kNumReadyChunksPerSlot=4, rank-order chunk copies

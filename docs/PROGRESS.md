@@ -11,7 +11,7 @@
 | 算子 | 入口符号 | 当前最佳（focus 中大 / geo vs sep） | 正确性 | 分支 / tag | 详细文档 |
 |------|---------|------|------|------|------|
 | **GEMM-RS** | `bf16_gemm_rs_nt` | 8卡 focus **1.22~1.23x** / geo **1.14x** | 6/6 PASS @ {2,4,8} | `main`（2D TMA push）；1D 版存档 tag `gemm-rs-1d-stable` | `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md` / `FLUX_GEMM_RS_STUDY.md` |
-| **A2A-GEMM** | `bf16_a2a_gemm_nt` | geo **~1.34x**（iter3 后保留）| PASS | `main` | `A2A_GEMM_DESIGN.md` / `A2A_GEMM_ITERATION.md` |
+| **A2A-GEMM** | `bf16_a2a_gemm_nt` | bench geo **1.176x**（8卡10it）| ⚠️ **3/6 FAIL** + **语义错位**：实现的是 token(M)-A2A，非 Ulysses post-attn（需按 flux 重写）| `main` | `A2A_GEMM_ITERATION.md`（顶部「当前状态」）/ `A2A_GEMM_DESIGN.md` |
 | **AG-GEMM** | `bf16_ag_gemm_nt` | geo **~1.13x**（8 卡）| PASS | `main`（仅 PDL 默认开启被保留）| `AG_GEMM_ITERATION.md` / `AG_GEMM_FLUX_REFERENCE.md` |
 
 > 每个算子的「最新当前状态 / 接班信息」见对应 `*_ITERATION.md` 顶部「当前状态」节，
