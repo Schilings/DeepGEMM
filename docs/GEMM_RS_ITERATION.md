@@ -459,10 +459,53 @@ host event 序（下轮 GEMM 等本轮 reduce）+ 起始 tag41 barrier 保证。
 
 ---
 
+## 2026-06-22：Iteration 13 — 冲 >1.3x 的诊断（多条路径实测，全部回退；定位真正瓶颈）
+
+本轮目标是把 8 卡 focus 从 1.22x 推到 >1.3x。系统性实测了多条路径，**全部中性或回退、已回退**，
+但精确定位了瓶颈结构（数据驱动），为后续指明唯一有效方向。
+
+### 各路径实测（8 卡 focus，baseline 3efe39d = 1.224x vs sep；正确性均 6/6 PASS）
+
+| 路径 | 结果 | 结论 |
+|------|------|------|
+| reduce 合并到 compute_stream（去 comm_stream/event）| ~1.22x（中性）| tail 不是 event/跨 stream 开销 |
+| reduce grid 解除 total_tiles 上限 + mult 扫参（2/3/4/5/6）| 全在 1.22~1.23x（噪声）| reduce 不是 occupancy/grid 限制 |
+| **PDL**（gemm trigger + reduce grid-sync，单 stream）| **1.200x（回退）**| GEMM 占满 SM 时 reduce 无法共驻，PDL 预调度机制净负 |
+| reduce slot 读用 `__ldg`（只读缓存）| 1.217x（中性）| 不是缓存绕过问题 |
+| epilogue per-tile `tma_store_wait<0>` 放松为 `<stages-1>` + 末尾排空 | 1.212x（中性）| push 暴露不是 per-tile 排空导致 |
+| 跨调用 overlap（reduce[i] ‖ gemm[i+1]）| 未实现 | **破坏 API 契约**（输出对 compute_stream 不 ready）；Megatron SP 输出有依赖链不可跨调用 overlap，纯属虚高 benchmark，放弃 |
+
+### 关键诊断（实测，数据驱动）
+
+用 event 实测 reduce kernel 真实耗时 + 纯 GEMM 对比，得到 8 卡 focus 的精确分解：
+
+| shape | 纯 deepgemm GEMM | gemm+push(SKIP_REDUCE) | +reduce(full) | sep | 当前 vs sep |
+|------|------|------|------|------|------|
+| 4096x4096x4096 | 626us | 755us | 819us | 1030us | 1.26x |
+| 8192x7168x4096 | 2617us | 2870us | 3034us | 3653us | 1.19x |
+
+两大开销：
+1. **push 开销（gemm+push − 纯GEMM ≈ 129~253us）> reduce tail（49~164us）**。
+   - reduce tail：实测 reduce kernel 49us(4096³)/162us(8192x7168)，**读 R 个 slot + 写 1 = (R+1)=9× 输出
+     ≈ 302MB，@6.16TB/s ≈ 已打满 HBM 带宽**。→ reduce **不是低效，是不可压缩的内存流量**（除非算法级降流量）。
+   - push 开销：自定义 gemm_rs kernel 比标准 gemm 慢 ~20%。根因疑为 **epilogue 用逐行 `tma_store_1d`
+     推 push（每行仅 ~128B 的小 TMA 传输）**，而标准 gemm 用整块 2D TMA store。
+
+### Verdict
+
+- 本轮所有快速改动**全部回退**（无一净正）。工作树保持在 `3efe39d`。
+- **唯一有效方向（高价值、大改）**：把 epilogue 的逐行 1D TMA push 改成**整块 2D TMA store**
+  （为每个目标 rank 建 TMA descriptor，远端 P2P TMA store——push-v3 历史验证可用）。这针对最大的
+  ~129~253us push 开销，理论可把 gemm+push 拉近纯 GEMM → 冲 ~1.4x。
+- 次选（大改）：reduce 算法级降流量（树形/分层 RS），把 (R+1)× 降到 ~2×。
+
+---
+
 ## 下一步计划（冲 >1.3x，聚焦中大 shape）
 
-1. 进一步缩小未掩盖的 reduce/push tail；探索 reduce 与下一次 GEMM 的跨调用 overlap（需 double-buffer scatter buffer）。
-2. 用 ncu/nsys profile fused kernel，定位 epilogue push 是否拖慢 GEMM、tail 占比。
+1. **[最高价值] epilogue push 改 2D TMA store**：host 为 R 个目标 rank 的 scatter slot 建 `CUtensorMap`，
+   kernel epilogue 用整块 2D TMA store 替代逐行 1D，消除小传输低效 → 缩小 push 开销。
+2. 次选：reduce 算法级降流量（树形/分层）。
 3. 每轮迭代必须记录 4/8 卡 × focus shape 的 benchmark 数据（见 RULE.md §7.1）。
 
 ---
