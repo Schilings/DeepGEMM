@@ -23,6 +23,7 @@ public:
         int bs, nheads, seq, head_dim;
         int tile_m;
         bool set_barrier;
+        bool seq_major;
         layout::SymBuffer<> sym_buffer_ptrs;
         LaunchArgs launch_args;
     };
@@ -34,9 +35,9 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_a2a_transpose_comm_impl<{}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&sm100_a2a_transpose_comm_impl<{}, {}, {}, {}>);
 }};
-)", args.num_ranks, args.tile_m, args.set_barrier ? "true" : "false");
+)", args.num_ranks, args.tile_m, args.set_barrier ? "true" : "false", args.seq_major ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -60,7 +61,8 @@ static void sm100_a2a_transpose_comm(const torch::Tensor& sym_buffer,
                                      const int& seq,
                                      const int& head_dim,
                                      const int& tile_m = 128,
-                                     const bool& set_barrier = false) {
+                                     const bool& set_barrier = false,
+                                     const bool& seq_major_in = false) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     // Standalone comm always uses ALL SMs (this is the realistic non-overlap deployment, and the
     // fair "separate" baseline in the bench). The fused path does its own SM carveout instead.
@@ -71,12 +73,19 @@ static void sm100_a2a_transpose_comm(const torch::Tensor& sym_buffer,
     int threads = 1024;
     if (const char* env = std::getenv("DG_A2AT_COMM_THREADS"))
         threads = std::max(32, std::atoi(env));
+    // Consume seq-major (BSHD, FlashAttention-native) input directly, so the caller need not
+    // .permute(BSHD->BHSD).contiguous() FA's output (that permute is a full HBM pass worth ~1.3x on
+    // the post-attn op). Off by default (BHSD contract unchanged); arg wins, env is a sweep override.
+    bool seq_major = seq_major_in;
+    if (const char* env = std::getenv("DG_A2AT_SEQ_MAJOR"))
+        seq_major = std::atoi(env) != 0;
 
     const SM100A2ATransposeCommRuntime::Args args = {
         .num_ranks = num_ranks,
         .bs = bs, .nheads = nheads, .seq = seq, .head_dim = head_dim,
         .tile_m = tile_m,
         .set_barrier = set_barrier,
+        .seq_major = seq_major,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .launch_args = LaunchArgs(num_sms, threads)
     };

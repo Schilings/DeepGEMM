@@ -153,6 +153,33 @@ flux 报告 `comm_time = fused_total − gemm_only`（暴露通信，overlap 越
 - **结论**：单节点的限制是 **comm 的 NVLink 写带宽（且 comm 带宽=SM 数）**，不是闲置算力。因此 fused
   在单节点 ≈ parity 是该模式 + 单节点拓扑的固有结果，B300 更多 SM 改变不了「comm 抠走的 SM ≈ 它藏住的量」。
 
+### FlashAttention 原生 BSHD 输入：省掉一次 permute（seq_major，已采用，opt-in）
+
+> 背景：真实训练的 attention 用 FlashAttention（FA2/FA4），其输出原生是 **BSHD = `[bs, seq, nheads, hd]`**
+> （seq 在 head 前）。我们 comm 默认契约是 **BHSD = `[bs, local_nheads, seq, hd]`**，所以拿 FA 的输出来喂
+> 必须先 `.permute(0,2,1,3).contiguous()` —— 这是 attention 张量的**一整趟 HBM 读+写**。
+
+- 加了 comm 的 **seq-major（BSHD）变体**（kernel 模板参数 `kSeqMajor`，默认 false 不改 BHSD 契约；
+  入口 `bf16_a2a_transpose_gemm_nt(..., seq_major=True)` / `bf16_a2a_transpose(sym, seq_major=True)`），
+  直接消费 FA 的 BSHD 输出，**省掉那次 permute**。正确性：BSHD 路径与 BHSD 路径**逐位一致**
+  （`tests/test_a2a_transpose_gemm.py` 三路 4/4 PASS）。
+- **是否提升 comm 带宽？几乎不**：BHSD/BSHD 的**写目标 `out_off` 完全相同**（瓶颈是 P2P 写），
+  BSHD 只让本地源读变连续。实测 comm-only 大 shape `95.1→94.5us`（≈0），小 shape 才 −5~13%。
+  → **转置不是 NVLink 带宽瓶颈**（瓶颈是写侧的 per-row local_hidden≈1792B 散射，与输入 layout 无关）。
+- **真正的收益来自省掉 permite 这趟 HBM**：在 FA 流水线口径下（BHSD 路径需 permute，BSHD 不需），
+  整个 post-attn 算子 **提速 1.25~1.45x（geo ≈1.32x）**：
+
+  | shape | permute(us) | BHSD(+permute) | BSHD(免permute) | drop-transpose |
+  |------|------|------|------|------|
+  | (1,32,2048,128,4096) | 20.5 | 67.6 | 46.7 | **1.45x** |
+  | (1,56,2048,128,7168) | 19.7 | 85.3 | 65.5 | 1.30x |
+  | (8,32,2048,128,4096) | 32.2 | 133.5 | 101.5 | 1.32x |
+  | (4,32,8192,128,4096) | 49.5 | 211.8 | 161.5 | 1.31x |
+  | (8,56,4096,128,7168) | 86.7 | 434.1 | 346.3 | **1.25x** |
+
+- **结论**：用 FA 时**优先 `seq_major=True`**——省掉 BSHD→BHSD 的 permute，约 1.3x。注意这是「省一趟 HBM
+  转置」的收益，**不是**提升了 NVLink 带宽（带宽瓶颈在写侧，需 layout 与 GEMM 协同才能再上，属独立工程）。
+
 - **试过但回退的（记录避免重复踩坑）**：
   - comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux `get_tile_info`）：让所有 rank 的 tile
     渐进 ready，**只救活 comm-heavy 大 shape（fused 452→407us，0.80→0.85x）**，却让中等 shape 回退

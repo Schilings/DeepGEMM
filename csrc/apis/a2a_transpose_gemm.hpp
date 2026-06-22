@@ -54,7 +54,8 @@ static void bf16_a2a_transpose_comm(const torch::Tensor& sym_buffer,
                                     const int& bs,
                                     const int& nheads,
                                     const int& seq,
-                                    const int& head_dim) {
+                                    const int& head_dim,
+                                    const bool& seq_major = false) {
 #if DG_TENSORMAP_COMPATIBLE
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 10);
@@ -62,7 +63,10 @@ static void bf16_a2a_transpose_comm(const torch::Tensor& sym_buffer,
     DG_HOST_ASSERT(num_ranks > 1);
     DG_HOST_ASSERT(rank_idx >= 0 and rank_idx < num_ranks);
     DG_HOST_ASSERT(nheads % num_ranks == 0 and seq % num_ranks == 0 and head_dim % 8 == 0);
-    sm100_a2a_transpose_comm(sym_buffer, sym_buffer_ptrs, rank_idx, bs, nheads, seq, head_dim);
+    // seq_major=true consumes FlashAttention-native BSHD input [bs, seq, local_nheads, head_dim]
+    // directly (no .permute to BHSD needed); false keeps the BHSD [bs, local_nheads, seq, head_dim].
+    sm100_a2a_transpose_comm(sym_buffer, sym_buffer_ptrs, rank_idx, bs, nheads, seq, head_dim,
+                             /*tile_m=*/128, /*set_barrier=*/false, /*seq_major_in=*/seq_major);
 #else
     DG_HOST_UNREACHABLE("BF16 A2A-transpose requires TensorMap support");
 #endif
@@ -107,7 +111,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("bf16_a2a_transpose_comm", &bf16_a2a_transpose_comm,
           pybind11::arg("sym_buffer"), pybind11::arg("sym_buffer_ptrs"),
           pybind11::arg("rank_idx"), pybind11::arg("bs"), pybind11::arg("nheads"),
-          pybind11::arg("seq"), pybind11::arg("head_dim"));
+          pybind11::arg("seq"), pybind11::arg("head_dim"),
+          pybind11::arg("seq_major") = false);
     m.def("bf16_a2a_transpose_gemm_nt", &bf16_a2a_transpose_gemm_nt,
           pybind11::arg("d"), pybind11::arg("gathered"), pybind11::arg("b"),
           pybind11::arg("sym_buffer"), pybind11::arg("sym_buffer_ptrs"),

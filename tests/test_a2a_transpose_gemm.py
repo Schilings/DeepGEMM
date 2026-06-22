@@ -115,9 +115,15 @@ def run_test(rank, num_gpus, port):
             get_symm_buffer_for_a2a_transpose_gemm,
             bf16_a2a_transpose_gemm_nt, bf16_a2a_transpose_gemm_nt_fused)
 
-        def run_and_diff(fn):
+        # BSHD (FlashAttention-native) equivalent of x_r: [bs, seq, local_nheads, head_dim].
+        x_bshd = x_r.permute(0, 2, 1, 3).contiguous()
+
+        def run_and_diff(fn, seq_major=False):
             sym = get_symm_buffer_for_a2a_transpose_gemm(group, bs, nheads, seq, head_dim)
-            sym.x.copy_(x_r)
+            if seq_major:
+                sym.x.view(-1).copy_(x_bshd.reshape(-1))   # write BSHD bytes; comm consumes directly
+            else:
+                sym.x.copy_(x_r)
             d_k = torch.zeros((bs * local_seq, N), dtype=torch.bfloat16, device=device)
             fn(d_k, Wo, sym)
             torch.cuda.synchronize()
@@ -128,16 +134,19 @@ def run_test(rank, num_gpus, port):
             dist.barrier()
             return md, rl
 
-        md0, rl0 = run_and_diff(bf16_a2a_transpose_gemm_nt)            # default (M0)
-        mdf, rlf = run_and_diff(bf16_a2a_transpose_gemm_nt_fused)      # fused (M1)
-        max_diff = max(md0, mdf)
-        rel = max(rl0, rlf)
-        # bf16 GEMM rounding tolerance; both paths must pass
-        passed = (rel_cand < 1e-3) and (rl0 < 0.02) and (rlf < 0.02)
+        md0, rl0 = run_and_diff(bf16_a2a_transpose_gemm_nt)            # default (M0, BHSD)
+        mdf, rlf = run_and_diff(bf16_a2a_transpose_gemm_nt_fused)      # fused (M1, BHSD)
+        # M0 seq-major (BSHD): must match the same ground truth (FA-native layout, no permute).
+        mds, rls = run_and_diff(lambda d, w, s: bf16_a2a_transpose_gemm_nt(d, w, s, seq_major=True),
+                                seq_major=True)
+        max_diff = max(md0, mdf, mds)
+        rel = max(rl0, rlf, rls)
+        # bf16 GEMM rounding tolerance; all three paths must pass
+        passed = (rel_cand < 1e-3) and (rl0 < 0.02) and (rlf < 0.02) and (rls < 0.02)
         if rank == 0:
             print(f"  ({bs},{nheads},{seq},{head_dim},{N})".ljust(26) +
                   f" | {max_diff:>10.6f} {rel:>10.7f} | {'PASS' if passed else 'FAIL'}"
-                  f"  (M0 rel={rl0:.1e}, fused rel={rlf:.1e})")
+                  f"  (M0 rel={rl0:.1e}, fused rel={rlf:.1e}, BSHD rel={rls:.1e})")
             num_passed += int(passed)
             if not passed:
                 fails.append((bs, nheads, seq, head_dim, N))

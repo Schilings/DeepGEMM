@@ -29,7 +29,13 @@ namespace deep_gemm {
 //
 //  Vectorized over head_dim with uint4 (8 bf16 = 16B); requires head_dim % 8 == 0.
 //
-template <uint32_t kNumRanks, uint32_t kTileM, bool kSetBarrier>
+// kSeqMajor: input is seq-major [bs, seq, local_nheads, head_dim] (BSHD, FlashAttention's native
+// output layout) instead of head-major [bs, local_nheads, seq, head_dim] (BHSD). With BSHD the
+// per-token [local_nheads, head_dim] = local_hidden slice is CONTIGUOUS in the source (and lands
+// in a contiguous local_hidden column block of the gathered output), so the seq<->head transpose
+// degenerates into a contiguous block copy — no scattered strided reads. (BHSD strides the source
+// by seq*head_dim across heads.) Lets us drop the redundant transpose when attention emits BSHD.
+template <uint32_t kNumRanks, uint32_t kTileM, bool kSetBarrier, bool kSeqMajor = false>
 __global__ void sm100_a2a_transpose_comm_impl(
         const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
         const uint32_t bs,
@@ -92,8 +98,12 @@ __global__ void sm100_a2a_transpose_comm_impl(
             const uint32_t s_local = s0 + s;                // within dst's local_seq
             const uint32_t global_seq = dst_rank * local_seq + s_local;
 
-            const uint64_t in_off = (static_cast<uint64_t>(b) * local_nheads + nh) * seq * vec_hd +
-                                    static_cast<uint64_t>(global_seq) * vec_hd + hd_v;
+            // BHSD: in[b, nh, global_seq, hd] (head-major, strided across heads by seq*head_dim).
+            // BSHD: in[b, global_seq, nh, hd] (seq-major; [nh,hd] contiguous = contiguous local_hidden).
+            const uint64_t in_off = kSeqMajor
+                ? ((static_cast<uint64_t>(b) * seq + global_seq) * local_nheads + nh) * vec_hd + hd_v
+                : (static_cast<uint64_t>(b) * local_nheads + nh) * seq * vec_hd +
+                      static_cast<uint64_t>(global_seq) * vec_hd + hd_v;
             const uint64_t out_off = (static_cast<uint64_t>(b) * local_seq + s_local) * vec_hidden +
                                      static_cast<uint64_t>(rank * local_nheads + nh) * vec_hd + hd_v;
             uint4* dst_ptr = sym_buffer.map(gathered_local + out_off, dst_rank);

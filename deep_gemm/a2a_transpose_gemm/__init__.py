@@ -84,11 +84,18 @@ def get_symm_buffer_for_a2a_transpose_gemm(group: dist.ProcessGroup,
     return BF16A2ATransposeGemmSymmBuffer(group, bs, nheads, seq, head_dim)
 
 
-def bf16_a2a_transpose(sym_buffer: BF16A2ATransposeGemmSymmBuffer) -> torch.Tensor:
-    """Run the transpose-scatter comm + SP-group barrier. Returns gathered [bs*local_seq, hidden]."""
+def bf16_a2a_transpose(sym_buffer: BF16A2ATransposeGemmSymmBuffer,
+                       seq_major: bool = False) -> torch.Tensor:
+    """Run the transpose-scatter comm + SP-group barrier. Returns gathered [bs*local_seq, hidden].
+
+    seq_major=True consumes FlashAttention-native BSHD input (sym.x laid out as
+    [bs, seq, local_nheads, head_dim]) directly — skipping the .permute(BSHD->BHSD).contiguous()
+    that the default BHSD layout would otherwise need on FA's output (that permute is a full HBM
+    pass, worth ~1.25-1.45x on the whole post-attn op). Default False keeps the BHSD x layout
+    [bs, local_nheads, seq, head_dim]."""
     _C.bf16_a2a_transpose_comm(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
-        sym_buffer.bs, sym_buffer.nheads, sym_buffer.seq, sym_buffer.head_dim)
+        sym_buffer.bs, sym_buffer.nheads, sym_buffer.seq, sym_buffer.head_dim, seq_major)
     # M0: ensure all peers finished writing this rank's gathered region before reading it.
     torch.cuda.synchronize()
     sym_buffer.group.barrier()
@@ -98,7 +105,8 @@ def bf16_a2a_transpose(sym_buffer: BF16A2ATransposeGemmSymmBuffer) -> torch.Tens
 
 def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
                                b: torch.Tensor,
-                               sym_buffer: BF16A2ATransposeGemmSymmBuffer):
+                               sym_buffer: BF16A2ATransposeGemmSymmBuffer,
+                               seq_major: bool = False):
     """DEFAULT (M0): A2A-transpose comm (all SMs, ring-rotated) + SP-group barrier + standard Wo GEMM.
 
     This is the fastest, most stable path on a SINGLE node: comm and GEMM each get all SMs, and the
@@ -111,9 +119,13 @@ def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
       d: output [bs*local_seq, N], bf16.
       b: Wo weight [N, hidden], bf16 (NT layout).
       sym_buffer: with this rank's attention output already in sym_buffer.x.
+      seq_major: if True, sym.x holds FlashAttention-native BSHD [bs, seq, local_nheads, head_dim]
+        and the comm consumes it directly (no .permute to BHSD). With FA-based attention this avoids
+        a full-HBM transpose pass and speeds the whole post-attn op ~1.25-1.45x. Default False expects
+        BHSD [bs, local_nheads, seq, head_dim].
     """
     import deep_gemm
-    a = bf16_a2a_transpose(sym_buffer)            # [bs*local_seq, hidden]
+    a = bf16_a2a_transpose(sym_buffer, seq_major=seq_major)   # [bs*local_seq, hidden]
     deep_gemm.bf16_gemm_nt(a, b, d)
 
 
