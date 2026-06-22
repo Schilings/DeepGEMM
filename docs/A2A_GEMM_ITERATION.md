@@ -40,8 +40,12 @@
 ### 待办（与用户确认后执行，建议独立分支）
 
 - A) 先定位并修复当前 token-A2A 的 3/6 正确性 FAIL（或直接在重写中废弃旧语义）。
-- B) 按上面数据流重写为 Ulysses post-attn A2A-transpose + Wo GEMM（comm 写 hidden 列偏移 + 转置；
-  GEMM 等 full-K per M-tile），test 参考改为 flux 等价的 transpose 语义。
+- B) 按 Ulysses post-attn A2A-transpose + Wo GEMM 重写（comm 写 hidden 列偏移 + 转置；GEMM 等 full-K
+  per M-tile），test 参考改为 flux 等价的 transpose 语义。
+
+> **详细重写设计（已完成 flux 深读，含转置索引契约 / barrier / 复用 SM100 AG-GEMM 骨架 / 文件改动 /
+> test 参考 / 里程碑）见 `docs/A2A_TRANSPOSE_GEMM_DESIGN.md`。** 选定「先 C 后 A」：设计文档(C)已就绪，
+> 阶段 A（起分支 `a2a-transpose-gemm` 实现）待用户确认开工。
 
 ---
 
