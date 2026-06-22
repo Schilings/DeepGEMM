@@ -49,6 +49,29 @@
     所以单节点接近持平。**结论：单节点 M0（串行、两段各占满 SM）仍是最快、最稳的选择；M1 现在是一个
     正确且经过 flux 式调优的 overlap 实现，真正的净收益要在 comm«gemm（大算力）或多节点场景体现。**
 
+### 为什么 flux 报告「有加速」而我们说「~parity」（基线口径差异，关键）
+
+> flux 的加速口径见 `flux/test/python/gemm_a2a_transpose/test_gemm_a2a_transpose.py`：
+
+- flux 的对照基线 `perf_torch` = **`torch.matmul`（cublas）+ `torch_pre_attn_all_to_all_transpose`**，
+  而后者（`flux/python/flux/testing/ulysses_sp_utils.py`）做通信的方式是
+  **`.permute(...).contiguous()`（一趟完整 HBM 转置）+ NCCL `all_to_all_single` + 再 `.permute().reshape()`**，
+  整体**串行**。flux 拿「fused 总时间」去比这个弱基线，自然大幅领先。
+- **本机实测对照（8 卡）**，证明 flux 的领先主要来自「单趟融合 comm kernel 远快于 NCCL+torch 转置」，
+  而不是 overlap 本身：
+
+  | shape | torch comm(NCCL+2转置) | 我们 comm(单趟) | torch 总(串行) | **我们 M0 串行** |
+  |------|------|------|------|------|
+  | (8,32,2048,128,4096) | 106.7us | 25.1us（**4.3×**）| 149.9us | **73.7us（1.6×）** |
+  | (4,32,8192,128,4096) | 165.9us | 47.5us（**3.5×**）| 248.7us | **136.4us（1.8×）** |
+  | (8,56,4096,128,7168) | 268.2us | 79.4us（**3.4×**）| 510.4us | **318.3us（1.6×）** |
+
+- **结论**：flux 的「主要收益」= 用单趟 GPU kernel 同时完成转置+all2all（避开 NCCL + 两趟 torch 转置），
+  这一点**我们的 M0 已经完全做到**（comm 比 torch 基线快 3~4×，M0 总时间比 torch 基线快 1.6~1.8×）。
+  flux 在此之上再叠加 overlap；而 overlap 单节点 ~parity（见上）。所以**「为什么 flux 能」的答案不是
+  它有魔法 overlap，而是它的基线是 NCCL+torch；换成强基线（我们的 M0/优化 comm），结论同样回到 ~parity。**
+  我们没有落后 flux——M0 即达到 flux 级的 comm 质量。
+
 ### 资源利用率分析（B300 SXM6，本机）
 
 > 针对「B 卡 SM 更多、NVLink 更快，是不是资源没吃满」做的核查。
