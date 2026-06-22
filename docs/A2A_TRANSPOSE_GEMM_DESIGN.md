@@ -11,8 +11,15 @@
   写 dst 的 hidden 列偏移 `rank*local_hidden`）+ 新 layout（`layout/bf16_a2a_transpose_gemm.cuh`：
   barrier/signal + input + gathered 三区）+ host/api/python（`a2a_transpose_gemm`）。M0 用
   `comm → SP-group barrier → 标准 bf16_gemm_nt`（无 overlap）。
-  **正确性 `tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS**（vs all_gather 重建的非循环
-  ground-truth，rel~1e-6；torch 候选 rel=0）。入口：`deep_gemm.bf16_a2a_transpose_gemm_nt(d, Wo, sym)`。
+  **正确性 `tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS**（M0 与 fused 两路都测，vs all_gather
+  非循环 ground-truth，rel~1e-6）。
+  **入口（已按结论翻转默认）**：`deep_gemm.bf16_a2a_transpose_gemm_nt(d, Wo, sym)` = **M0（默认、单节点最优）**；
+  `deep_gemm.bf16_a2a_transpose_gemm_nt_fused(...)` = **M1 融合（opt-in，多节点/comm«gemm 才用）**。
+- **完整 Ulysses 流程验证**：`tests/test_ulysses_attn_flow.py`（QKV 投影 + pre-attn A2A + SDPA + 我们的
+  post-attn a2a-gemm）end-to-end 对「全局重算并切 seq 分片」的参考 **{8卡} 3/3 PASS**（rel~1~3e-3，整条
+  bf16 流水线），且**只 profile post-attn a2a-gemm**（M0/fused）。证明本算子在真实 attn 流程里输入/输出语义正确。
+- **弱基线对照**：`benchmarks/bench_a2a_transpose_gemm.py` 增加 flux 式 torch 弱基线（permute+contiguous +
+  NCCL all_to_all + torch.matmul）。本机 8 卡：**我们 M0 比 torch 基线快 1.63~2.54×，comm 快 3~4.4×**。
 - **M1（overlap，已实现 + 已评测 + 已对齐 flux 调优）**：
   - 实现：comm 改 tile 粒度 + per-M-tile barrier（计数到 world_size，置 1）；融合 GEMM 消费者
     （`impls/sm100_bf16_a2a_transpose_gemm.cuh`）Load-A warp 等 `barrier[m_block]==1` 后再 load；

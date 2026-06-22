@@ -109,30 +109,38 @@ def run_test(rank, num_gpus, port):
         # candidate(torch) sanity vs ground truth (semantics lock)
         rel_cand = (d_cand.float() - d_gt.float()).abs().mean().item() / (d_gt.float().abs().mean().item() + 1e-8)
 
-        # --- kernel under test: real A2A-transpose comm + Wo GEMM ---
+        # --- kernels under test: BOTH default M0 and the opt-in fused M1 ---
         import deep_gemm
         from deep_gemm.a2a_transpose_gemm import (
-            get_symm_buffer_for_a2a_transpose_gemm, bf16_a2a_transpose_gemm_nt)
-        sym = get_symm_buffer_for_a2a_transpose_gemm(group, bs, nheads, seq, head_dim)
-        sym.x.copy_(x_r)
-        d_k = torch.zeros((bs * local_seq, N), dtype=torch.bfloat16, device=device)
-        bf16_a2a_transpose_gemm_nt(d_k, Wo, sym)
-        torch.cuda.synchronize()
+            get_symm_buffer_for_a2a_transpose_gemm,
+            bf16_a2a_transpose_gemm_nt, bf16_a2a_transpose_gemm_nt_fused)
 
-        diff = (d_k.float() - d_gt.float()).abs()
-        max_diff = diff.max().item()
-        rel = diff.mean().item() / (d_gt.float().abs().mean().item() + 1e-8)
-        # bf16 GEMM rounding tolerance
-        passed = (rel_cand < 1e-3) and (rel < 0.02) and (max_diff == max_diff)
+        def run_and_diff(fn):
+            sym = get_symm_buffer_for_a2a_transpose_gemm(group, bs, nheads, seq, head_dim)
+            sym.x.copy_(x_r)
+            d_k = torch.zeros((bs * local_seq, N), dtype=torch.bfloat16, device=device)
+            fn(d_k, Wo, sym)
+            torch.cuda.synchronize()
+            diff = (d_k.float() - d_gt.float()).abs()
+            md = diff.max().item()
+            rl = diff.mean().item() / (d_gt.float().abs().mean().item() + 1e-8)
+            sym.destroy()
+            dist.barrier()
+            return md, rl
+
+        md0, rl0 = run_and_diff(bf16_a2a_transpose_gemm_nt)            # default (M0)
+        mdf, rlf = run_and_diff(bf16_a2a_transpose_gemm_nt_fused)      # fused (M1)
+        max_diff = max(md0, mdf)
+        rel = max(rl0, rlf)
+        # bf16 GEMM rounding tolerance; both paths must pass
+        passed = (rel_cand < 1e-3) and (rl0 < 0.02) and (rlf < 0.02)
         if rank == 0:
             print(f"  ({bs},{nheads},{seq},{head_dim},{N})".ljust(26) +
                   f" | {max_diff:>10.6f} {rel:>10.7f} | {'PASS' if passed else 'FAIL'}"
-                  f"  (torch_ref rel={rel_cand:.1e})")
+                  f"  (M0 rel={rl0:.1e}, fused rel={rlf:.1e})")
             num_passed += int(passed)
             if not passed:
                 fails.append((bs, nheads, seq, head_dim, N))
-        sym.destroy()
-        dist.barrier()
 
     if rank == 0:
         print(f"\n  Summary: {num_passed}/{len(SHAPES)} passed" +

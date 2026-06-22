@@ -112,7 +112,8 @@ from .a2a_transpose_gemm import (
     BF16A2ATransposeGemmSymmBuffer,
     get_symm_buffer_for_a2a_transpose_gemm,
     bf16_a2a_transpose,
-    bf16_a2a_transpose_gemm_nt,
+    bf16_a2a_transpose_gemm_nt,          # default: M0 (comm + GEMM, all SMs)
+    bf16_a2a_transpose_gemm_nt_fused,    # opt-in: M1 fused overlap
 )
 
 

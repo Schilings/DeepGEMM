@@ -17,7 +17,19 @@ import torch.multiprocessing as mp
 import deep_gemm
 from deep_gemm import _C
 from deep_gemm.a2a_transpose_gemm import (
-    get_symm_buffer_for_a2a_transpose_gemm, bf16_a2a_transpose_gemm_nt)
+    get_symm_buffer_for_a2a_transpose_gemm,
+    bf16_a2a_transpose_gemm_nt, bf16_a2a_transpose_gemm_nt_fused)
+
+
+def torch_a2a_transpose(x_r, sp, group):
+    """flux-style WEAK baseline comm: torch permute+contiguous + NCCL all_to_all + permute/reshape.
+    x_r: [bs, local_nh, seq, hd] -> gathered [bs*local_seq, hidden]."""
+    bs, local_nh, seq, hd = x_r.shape
+    local_seq = seq // sp
+    send = x_r.view(bs, local_nh, sp, local_seq, hd).permute(2, 0, 3, 1, 4).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=group)
+    return recv.permute(1, 2, 0, 3, 4).reshape(bs * local_seq, local_nh * sp * hd).contiguous()
 
 
 def find_free_port():
@@ -56,7 +68,7 @@ def run_benchmark(rank, num_gpus, num_iters, port):
         print(f"\n{'='*96}\n  A2A-transpose + Wo GEMM bench: {num_gpus} GPUs, {num_iters} iters\n{'='*96}")
         # comm/gemm are measured at FULL SMs (the realistic non-overlap deployment); serial = their
         # sum = the fair baseline. fused uses the SM carveout (DG_A2AT_COMM_SMS) + 1024-thread comm.
-        print(f"{'(bs,nh,seq,hd,N)':<24} | {'comm(us)':>9} {'gemm(us)':>9} {'serial':>9} {'fused(us)':>10} | {'fus/ser':>8}")
+        print(f"{'(bs,nh,seq,hd,N)':<24} | {'torch comm/tot':>13} | {'ours comm/gemm M0 fused':>30} | {'M0/torch':>8}")
 
     def time_call(fn, resets):
         for _ in range(3):
@@ -91,25 +103,30 @@ def run_benchmark(rank, num_gpus, num_iters, port):
 
         rank_i = group.rank()
         ptrs = sym.handle.buffer_ptrs
-        # comm-only (no host barrier): pure transpose-scatter kernel time
+        # our comm-only (rotated, all SMs): pure transpose-scatter kernel time
         t_comm = time_call(lambda: _C.bf16_a2a_transpose_comm(
             sym.buffer, ptrs, rank_i, bs, nheads, seq, head_dim), resets=[])
         # gemm-only: standard GEMM on the gathered buffer
         t_gemm = time_call(lambda: deep_gemm.bf16_gemm_nt(sym.gathered, Wo, d), resets=[])
-        # fused (M1): comm overlapped with GEMM (per-M-tile barrier); reset barriers each iter
-        t_fused = time_call(lambda: bf16_a2a_transpose_gemm_nt(d, Wo, sym),
+        # M0 (default): our comm + GEMM serial == t_comm + t_gemm (our strong baseline)
+        t_m0 = t_comm + t_gemm
+        # M1 fused (opt-in): comm overlapped with GEMM (per-M-tile barrier); reset barriers each iter
+        t_fused = time_call(lambda: bf16_a2a_transpose_gemm_nt_fused(d, Wo, sym),
                             resets=[sym.reset_barriers])
+        # flux-style WEAK baseline: torch transpose-a2a (NCCL + 2 permutes) + torch.matmul, serial
+        Wo_t = Wo.t().contiguous()
+        t_torch_comm = time_call(lambda: torch_a2a_transpose(x_r, sp, group), resets=[])
+        def torch_total():
+            a = torch_a2a_transpose(x_r, sp, group)
+            return torch.matmul(a, Wo_t)
+        t_torch = time_call(torch_total, resets=[])
 
         if rank == 0:
-            t_sum = t_comm + t_gemm
-            sp_ratio = t_sum / t_fused if t_fused > 0 else 0.0
-            # flux convention: exposed comm = fused_total - gemm_only. If overlap worked, exposed
-            # should be << the real comm (t_comm). hidden = how much comm got hidden vs full comm.
-            exposed = t_fused - t_gemm
-            hidden_pct = (t_comm - exposed) / t_comm * 100.0 if t_comm > 0 else 0.0
+            vs_torch = t_torch / t_m0 if t_m0 > 0 else 0.0          # our M0 speedup over torch baseline
+            comm_x = t_torch_comm / t_comm if t_comm > 0 else 0.0   # our comm speedup over torch comm
             print(f"  ({bs},{nheads},{seq},{head_dim},{N})".ljust(24) +
-                  f" | {t_comm:>9.1f} {t_gemm:>9.1f} {t_sum:>9.1f} {t_fused:>10.1f} | {sp_ratio:>6.2f}x"
-                  f" | exposed={exposed:>6.1f} hidden={hidden_pct:>5.0f}%")
+                  f" | torch:{t_torch_comm:>6.0f}/{t_torch:>6.0f} | ours:{t_comm:>6.1f}/{t_gemm:>6.1f}"
+                  f" M0={t_m0:>6.1f} fused={t_fused:>6.1f} | M0/torch={vs_torch:>4.2f}x comm{comm_x:>4.1f}x")
         sym.destroy()
         dist.barrier()
 

@@ -14,7 +14,11 @@ Usage:
   d = torch.empty((bs*local_seq, N), dtype=torch.bfloat16, device='cuda')
   bf16_a2a_transpose_gemm_nt(d, Wo, sym)  # Wo: [N, hidden]
 
-M0 (correctness-first): comm-then-GEMM with an SP-group barrier (no overlap yet).
+Entry points:
+  bf16_a2a_transpose_gemm_nt        — DEFAULT (M0): comm(all SMs) + SP barrier + GEMM(all SMs).
+                                      Fastest/most stable on a single node.
+  bf16_a2a_transpose_gemm_nt_fused  — M1 (opt-in): comm/GEMM overlap via per-M-tile barrier.
+                                      ~parity on a single node; for comm<<gemm or multi-node.
 """
 
 import torch
@@ -92,19 +96,34 @@ def bf16_a2a_transpose(sym_buffer: BF16A2ATransposeGemmSymmBuffer) -> torch.Tens
     return sym_buffer.gathered
 
 
-def bf16_a2a_transpose_gemm_nt_m0(d: torch.Tensor,
-                                  b: torch.Tensor,
-                                  sym_buffer: BF16A2ATransposeGemmSymmBuffer):
-    """M0 fallback: A2A-transpose comm + SP-group barrier + standard Wo GEMM (no overlap)."""
+def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
+                               b: torch.Tensor,
+                               sym_buffer: BF16A2ATransposeGemmSymmBuffer):
+    """DEFAULT (M0): A2A-transpose comm (all SMs, ring-rotated) + SP-group barrier + standard Wo GEMM.
+
+    This is the fastest, most stable path on a SINGLE node: comm and GEMM each get all SMs, and the
+    rotated transpose-scatter comm is ~3-4x faster than NCCL all_to_all + torch transposes. Fusing
+    the overlap (see `..._fused`) is ~parity / net-negative on one node because the comm's SM
+    carveout slows the GEMM by more than the comm it hides; the fused path pays off only when
+    comm << gemm or across nodes.
+
+    Args:
+      d: output [bs*local_seq, N], bf16.
+      b: Wo weight [N, hidden], bf16 (NT layout).
+      sym_buffer: with this rank's attention output already in sym_buffer.x.
+    """
     import deep_gemm
     a = bf16_a2a_transpose(sym_buffer)            # [bs*local_seq, hidden]
     deep_gemm.bf16_gemm_nt(a, b, d)
 
 
-def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
-                               b: torch.Tensor,
-                               sym_buffer: BF16A2ATransposeGemmSymmBuffer):
-    """M1 (fused): transpose-scatter comm overlapped with the Wo GEMM via per-M-tile barrier.
+def bf16_a2a_transpose_gemm_nt_fused(d: torch.Tensor,
+                                     b: torch.Tensor,
+                                     sym_buffer: BF16A2ATransposeGemmSymmBuffer):
+    """M1 (fused, opt-in): transpose-scatter comm overlapped with the Wo GEMM via per-M-tile barrier.
+
+    On a single node this is ~parity / slightly slower than the default M0 (the comm SM carveout
+    costs more than the comm it hides). Prefer this only for comm<<gemm or multi-node setups.
 
     Args:
       d: output [bs*local_seq, N], bf16.
@@ -113,7 +132,7 @@ def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
 
     NOTE: the per-M-tile barriers must be 0 on entry. They are zeroed at buffer creation; for
     repeated calls on the same buffer, reset via sym_buffer.reset_barriers() with an SP-group
-    sync in between (see M2).
+    sync in between.
     """
     _C.bf16_a2a_transpose_gemm_nt(
         d, sym_buffer.gathered, b, sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
