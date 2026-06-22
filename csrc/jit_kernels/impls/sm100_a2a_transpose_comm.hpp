@@ -21,6 +21,8 @@ public:
     struct Args {
         int num_ranks;
         int bs, nheads, seq, head_dim;
+        int tile_m;
+        bool set_barrier;
         layout::SymBuffer<> sym_buffer_ptrs;
         LaunchArgs launch_args;
     };
@@ -32,9 +34,9 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_a2a_transpose_comm_impl<{}>);
+    auto ptr = reinterpret_cast<void*>(&sm100_a2a_transpose_comm_impl<{}, {}, {}>);
 }};
-)", args.num_ranks);
+)", args.num_ranks, args.tile_m, args.set_barrier ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -56,13 +58,17 @@ static void sm100_a2a_transpose_comm(const torch::Tensor& sym_buffer,
                                      const int& bs,
                                      const int& nheads,
                                      const int& seq,
-                                     const int& head_dim) {
+                                     const int& head_dim,
+                                     const int& tile_m = 128,
+                                     const bool& set_barrier = false) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_sms = device_runtime->get_num_sms();
 
     const SM100A2ATransposeCommRuntime::Args args = {
         .num_ranks = num_ranks,
         .bs = bs, .nheads = nheads, .seq = seq, .head_dim = head_dim,
+        .tile_m = tile_m,
+        .set_barrier = set_barrier,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .launch_args = LaunchArgs(num_sms, 256)
     };

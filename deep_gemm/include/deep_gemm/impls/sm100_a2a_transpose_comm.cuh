@@ -19,12 +19,17 @@ namespace deep_gemm {
 //  seq<->head transpose:
 //      gathered_dst[b, dst_seq, (r*local_nheads + nh), hd] = x[b, nh, gs, hd]
 //      where dst_rank = gs / local_seq,  dst_seq = gs % local_seq.
-//  After all ranks finish (host barrier), each rank's gathered region holds the full-hidden
+//  After all ranks finish, each rank's gathered region holds the full-hidden
 //  [bs, local_seq, hidden] = A matrix for the Wo GEMM.
+//
+//  Tile-granular: each CTA handles one (dst_rank, m_tile) — copies that tile's rows for dst and
+//  (if kSetBarrier) atomically decrements dst's per-tile barrier; when all kNumRanks sources have
+//  contributed, the barrier is set to 1 (consumed by the fused GEMM's per-tile wait). The M-tile
+//  granularity (kTileM) MUST equal the GEMM's BLOCK_M so barrier idx == GEMM m_block.
 //
 //  Vectorized over head_dim with uint4 (8 bf16 = 16B); requires head_dim % 8 == 0.
 //
-template <uint32_t kNumRanks>
+template <uint32_t kNumRanks, uint32_t kTileM, bool kSetBarrier>
 __global__ void sm100_a2a_transpose_comm_impl(
         const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
         const uint32_t bs,
@@ -37,38 +42,62 @@ __global__ void sm100_a2a_transpose_comm_impl(
     const uint32_t hidden = nheads * head_dim;
 
     constexpr uint32_t kPack = 8;                         // bf16 per uint4
-    const uint32_t vec_hd = head_dim / kPack;             // uint4 per head row
+    const uint32_t vec_hd = head_dim / kPack;
     const uint32_t vec_hidden = hidden / kPack;
 
     const layout::BF16A2ATransposeGemmWorkspace ws(
         sym_buffer.template get_base_ptr<void*>(), kNumRanks, bs, nheads, seq, head_dim);
 
     const uint4* in_vec = reinterpret_cast<const uint4*>(ws.template get_input_ptr<void>());
-    // local gathered base, as if writing locally; mapped to dst_rank below.
     uint4* gathered_local = reinterpret_cast<uint4*>(ws.template get_gathered_ptr<void>());
+    int32_t* barrier_local = ws.get_barrier_ptr();        // mapped to dst below
 
-    // iterate over all input vectors: layout [bs, local_nheads, seq, vec_hd] (vec_hd fastest)
-    const uint64_t total_vec = static_cast<uint64_t>(bs) * local_nheads * seq * vec_hd;
-    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    const uint32_t tiles_per_seq = (local_seq + kTileM - 1) / kTileM;
+    const uint32_t tiles_per_dst = bs * tiles_per_seq;
+    const uint32_t total_work = kNumRanks * tiles_per_dst;
 
-    for (uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < total_vec; i += stride) {
-        uint32_t hd_v = i % vec_hd;
-        uint64_t rem = i / vec_hd;
-        uint32_t gs = rem % seq;
-        uint64_t rem2 = rem / seq;
-        uint32_t nh = rem2 % local_nheads;
-        uint32_t b = static_cast<uint32_t>(rem2 / local_nheads);
+    // Signal that the comm kernel has launched (for the GEMM stream's stream-wait-value).
+    if (kSetBarrier and blockIdx.x == 0 and threadIdx.x == 0) {
+        asm volatile("st.relaxed.gpu.global.b32 [%0], 1;" : : "l"(ws.get_a2a_signal_ptr()));
+    }
 
-        const uint32_t dst_rank = gs / local_seq;
-        const uint32_t dst_seq = gs % local_seq;
+    for (uint32_t work = blockIdx.x; work < total_work; work += gridDim.x) {
+        const uint32_t dst_rank = work / tiles_per_dst;
+        const uint32_t tile = work % tiles_per_dst;
+        const uint32_t b = tile / tiles_per_seq;
+        const uint32_t t = tile % tiles_per_seq;
+        const uint32_t s0 = t * kTileM;
+        const uint32_t s1 = (s0 + kTileM < local_seq) ? (s0 + kTileM) : local_seq;
+        const uint32_t tile_rows = s1 - s0;
+        const uint32_t nelems = tile_rows * local_nheads * vec_hd;
 
-        // out offset (in uint4) within the gathered region [bs, local_seq, vec_hidden]
-        const uint64_t out_vec = (static_cast<uint64_t>(b) * local_seq + dst_seq) * vec_hidden +
-                                 static_cast<uint64_t>(rank * local_nheads + nh) * vec_hd + hd_v;
+        for (uint32_t i = threadIdx.x; i < nelems; i += blockDim.x) {
+            const uint32_t hd_v = i % vec_hd;
+            const uint32_t r1 = i / vec_hd;
+            const uint32_t nh = r1 % local_nheads;
+            const uint32_t s = r1 / local_nheads;          // [0, tile_rows)
+            const uint32_t s_local = s0 + s;                // within dst's local_seq
+            const uint32_t global_seq = dst_rank * local_seq + s_local;
 
-        uint4* dst_ptr = sym_buffer.map(gathered_local + out_vec, dst_rank);
-        *dst_ptr = in_vec[i];
+            const uint64_t in_off = (static_cast<uint64_t>(b) * local_nheads + nh) * seq * vec_hd +
+                                    static_cast<uint64_t>(global_seq) * vec_hd + hd_v;
+            const uint64_t out_off = (static_cast<uint64_t>(b) * local_seq + s_local) * vec_hidden +
+                                     static_cast<uint64_t>(rank * local_nheads + nh) * vec_hd + hd_v;
+            uint4* dst_ptr = sym_buffer.map(gathered_local + out_off, dst_rank);
+            *dst_ptr = in_vec[in_off];
+        }
+
+        if constexpr (kSetBarrier) {
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const uint32_t barrier_idx = b * tiles_per_seq + t;
+                int32_t* bptr = sym_buffer.map(barrier_local + barrier_idx, dst_rank);
+                asm volatile("fence.acq_rel.sys;\n");
+                int32_t prev = atomicAdd_system(bptr, -1);
+                if (prev - 1 == -static_cast<int32_t>(kNumRanks))
+                    asm volatile("st.release.sys.b32 [%0], 1;\n" : : "l"(bptr));
+            }
+        }
     }
 }
 
