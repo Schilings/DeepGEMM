@@ -5,6 +5,166 @@
 > `src/a2a_transpose_gemm`，在 SM100（B 卡）上落地。
 > 背景与「为什么旧实现不对」见 `A2A_GEMM_ITERATION.md` 顶部「当前状态」。
 
+## 实现进度（分支 `a2a-transpose-gemm`）
+
+- **M0（正确性，已完成）**：转置 scatter comm kernel（`impls/sm100_a2a_transpose_comm.cuh`，uint4 P2P，
+  写 dst 的 hidden 列偏移 `rank*local_hidden`）+ 新 layout（`layout/bf16_a2a_transpose_gemm.cuh`：
+  barrier/signal + input + gathered 三区）+ host/api/python（`a2a_transpose_gemm`）。M0 用
+  `comm → SP-group barrier → 标准 bf16_gemm_nt`（无 overlap）。
+  **正确性 `tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS**（M0 与 fused 两路都测，vs all_gather
+  非循环 ground-truth，rel~1e-6）。
+  **入口（已按结论翻转默认）**：`deep_gemm.bf16_a2a_transpose_gemm_nt(d, Wo, sym)` = **M0（默认、单节点最优）**；
+  `deep_gemm.bf16_a2a_transpose_gemm_nt_fused(...)` = **M1 融合（opt-in，多节点/comm«gemm 才用）**。
+- **完整 Ulysses 流程验证**：`tests/test_ulysses_attn_flow.py`（QKV 投影 + pre-attn A2A + SDPA + 我们的
+  post-attn a2a-gemm）end-to-end 对「全局重算并切 seq 分片」的参考 **{8卡} 3/3 PASS**（rel~1~3e-3，整条
+  bf16 流水线），且**只 profile post-attn a2a-gemm**（M0/fused）。证明本算子在真实 attn 流程里输入/输出语义正确。
+- **弱基线对照**：`benchmarks/bench_a2a_transpose_gemm.py` 增加 flux 式 torch 弱基线（permute+contiguous +
+  NCCL all_to_all + torch.matmul）。本机 8 卡：**我们 M0 比 torch 基线快 1.63~2.54×，comm 快 3~4.4×**。
+- **M1（overlap，已实现 + 已评测 + 已对齐 flux 调优）**：
+  - 实现：comm 改 tile 粒度 + per-M-tile barrier（计数到 world_size，置 1）；融合 GEMM 消费者
+    （`impls/sm100_bf16_a2a_transpose_gemm.cuh`）Load-A warp 等 `barrier[m_block]==1` 后再 load；
+    host（`csrc/sm100_bf16_a2a_transpose_gemm.hpp`）comm 走 comm_stream + GEMM 走 compute_stream，
+    **SM carveout**（`DG_A2AT_COMM_SMS`，默认 24）防 GEMM 饿死 comm 死锁。
+  - **正确性**：`tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS（融合路径）。
+
+  - ⚠️ **首版评测曾误判为「0.4~0.5x，单节点零和墙」——那是两个实现 bug 造成的假象，已修正：**
+    1. **comm block 只有 256 线程**：低 SM carveout 下，单 SM 的 NVLink 带宽由「在途 P2P store 数」决定，
+       256 线程远喂不满（要数千个 uint4 在途才能隐藏 NVLink 延迟）。实测大 shape `comm@16SM`：
+       **256 线程=491us，512=267us，1024=152us（3.2×）**。→ comm 线程数提到 **1024**（host 默认 + env）。
+    2. **GEMM 自旋用 `ld.acquire.sys` 死循环**：所有 GEMM CTA（comm_sms=16 时达 116 个）每轮都发
+       system-scope acquire load，**轰炸内存 fabric、反过来饿死 comm 的 P2P store**。→ 改为
+       **relaxed.sys 轮询 + `__nanosleep` 指数退避 + 命中后单次 `fence.acquire.sys`**（`ptx/ld_st.cuh`）。
+    - 两项修复后大 shape `(8,56,4096,128,7168)` fused **731→450us（1.6×）**，多数 shape 从 0.4~0.5x 升到 ~1.0x。
+
+  - **comm 带宽 vs SM 饱和曲线（8 卡，大 shape，1024 线程）**：comm 要 ~64 SM 才接近打满 NVLink；
+    `8SM=447us / 16=152 / 32~130 / 64=125 / 132=116`（≈440GB/s 上限）。
+
+  - **性能（8 卡，公平基线 = comm@全SM + gemm@全SM 串行；fused = 1024线程 + relaxed自旋 + comm_sms=24）**：
+
+    | shape (bs,nh,seq,hd,N) | comm us | gemm us | serial us | fused us | fused/serial |
+    |------|------|------|------|------|------|
+    | (1,32,2048,128,4096) | 20 | 30 | 50 | 49 | 1.01x |
+    | (1,56,2048,128,7168) | 22 | 45 | 67 | 72 | 0.93x |
+    | (8,32,2048,128,4096) | 40 | 64 | 103 | 113 | 0.92x |
+    | (4,32,8192,128,4096) | 70 | 100 | 170 | 173 | 0.98x |
+    | (1,32,16384,128,4096) | 39 | 62 | 101 | 114 | 0.89x |
+    | (8,56,4096,128,7168) | 112 | 251 | 363 | 452 | 0.80x |
+
+  - **修正后的 Verdict（诚实）**：**不是零和墙、也不是 0.4x 灾难——是「~parity」**。对齐 flux 调优后，
+    融合 overlap 机制确实生效（comm 被实质藏住），但在**本单节点**上 fused 仍 **0.8~1.0x（偶尔持平）、
+    尚未稳定超过串行**。物理本质：comm 要带宽=要 SM，从 GEMM 抠走 ~24 SM 的代价 ≈ 它藏住的 comm，
+    所以单节点接近持平。**结论：单节点 M0（串行、两段各占满 SM）仍是最快、最稳的选择；M1 现在是一个
+    正确且经过 flux 式调优的 overlap 实现，真正的净收益要在 comm«gemm（大算力）或多节点场景体现。**
+
+### 为什么 flux 报告「有加速」而我们说「~parity」（基线口径差异，关键）
+
+> flux 的加速口径见 `flux/test/python/gemm_a2a_transpose/test_gemm_a2a_transpose.py`：
+
+- flux 的对照基线 `perf_torch` = **`torch.matmul`（cublas）+ `torch_pre_attn_all_to_all_transpose`**，
+  而后者（`flux/python/flux/testing/ulysses_sp_utils.py`）做通信的方式是
+  **`.permute(...).contiguous()`（一趟完整 HBM 转置）+ NCCL `all_to_all_single` + 再 `.permute().reshape()`**，
+  整体**串行**。flux 拿「fused 总时间」去比这个弱基线，自然大幅领先。
+- **本机实测对照（8 卡）**，证明 flux 的领先主要来自「单趟融合 comm kernel 远快于 NCCL+torch 转置」，
+  而不是 overlap 本身：
+
+  | shape | torch comm(NCCL+2转置) | 我们 comm(单趟) | torch 总(串行) | **我们 M0 串行** |
+  |------|------|------|------|------|
+  | (8,32,2048,128,4096) | 106.7us | 25.1us（**4.3×**）| 149.9us | **73.7us（1.6×）** |
+  | (4,32,8192,128,4096) | 165.9us | 47.5us（**3.5×**）| 248.7us | **136.4us（1.8×）** |
+  | (8,56,4096,128,7168) | 268.2us | 79.4us（**3.4×**）| 510.4us | **318.3us（1.6×）** |
+
+- **结论**：flux 的「主要收益」= 用单趟 GPU kernel 同时完成转置+all2all（避开 NCCL + 两趟 torch 转置），
+  这一点**我们的 M0 已经完全做到**（comm 比 torch 基线快 3~4×，M0 总时间比 torch 基线快 1.6~1.8×）。
+  flux 在此之上再叠加 overlap；而 overlap 单节点 ~parity（见上）。所以**「为什么 flux 能」的答案不是
+  它有魔法 overlap，而是它的基线是 NCCL+torch；换成强基线（我们的 M0/优化 comm），结论同样回到 ~parity。**
+  我们没有落后 flux——M0 即达到 flux 级的 comm 质量。
+
+### 用 flux 自己的口径复核 overlap 增量（confirm）
+
+flux 报告 `comm_time = fused_total − gemm_only`（暴露通信，overlap 越好该值越小）。在本机对我们的 fused
+套同样口径：
+
+| shape | 真实 comm@全SM | exposed = fused−gemm | hidden% |
+|------|------|------|------|
+| (1,56,2048,128,7168) | 21.5us | 38.1us | −77% |
+| (4,32,8192,128,4096) | 61.7us | 76.5us | −24% |
+| (8,56,4096,128,7168) | 95.8us | 200.2us | −109% |
+
+- exposed **大于**真实 comm（hidden% 为负）→ **overlap 净增量为负**。大 shape 真实 comm 仅 96us，但
+  `fused−gemm`=200us，多出的 ~104us 是 **GEMM 被 carveout 砍到 124 SM 的变慢**，已超过藏住的 comm。
+- 即：单节点上「给 comm 抠 SM 让 GEMM 变慢」的代价 > 「藏住的 comm」，所以连 flux 的宽松口径都显示
+  overlap 不划算。这与前面的 ~parity / 带宽=SM 物理一致，进一步坐实**单节点用 M0（串行）最优**。
+
+### flux 确实是「真 overlap（双 stream）」，且这个算子也是节点内 P2P（核实，避免被带偏）
+
+> 逐行核对 `flux/src/a2a_transpose_gemm/ths_op/all_to_all_transpose_gemm_kernel.cc` +
+> `post_attn_a2a_transpose_impls.cu` + `post_attn_all_to_all_transpose_op.cc`。
+
+- **flux 是货真价实的双 stream overlap，机制与我们 M1 同构**（不是假 overlap）：
+  - comm 在默认 `stream`，GEMM 在独立的**最高优先级** `compute_stream`（构造时 `get_highest_cuda_stream_priority()`）；
+  - GEMM 流用 `CUStreamWaitValue(a2a_signal==1)` 作**启动闸门**；而 `a2a_signal` 是 comm kernel
+    在做完起始 `sync_peers` 后**立刻置位**（"notify the a2a kernel has been launched"，非 comm 完成），
+    所以 GEMM 一启动就和 comm **并发**跑；
+  - GEMM 内部再靠 **per-M-tile barrier**（comm `atomicAdd_system(tile_barrier,-1)`，最后一个
+    `st.release.sys` 置 1；GEMM 自旋等）逐 tile 消费 comm 产出。**这正是我们 M1 的设计**。
+  - flux 同样做 SM carveout：给 GEMM 传 `sm_margin + num_comm_sm`，comm 用 `num_comm_sm`。
+- **关键澄清**：所以「flux 报告加速」**不矛盾于**「我们说 overlap 单节点 ~parity」——两者同时成立：
+  flux 是真 overlap，但它的 headline 口径是 **vs torch 弱基线**，大头来自融合 comm kernel（这点 M0 已吃到）；
+  **它从没拿 overlap 去比一个 M0 式强串行基线**。别被"它有双 stream 所以一定更快"带偏。
+- **flux 这个算子也是单节点（节点内 NVLink P2P），不是跨节点**：框架层有 `nnodes / A2ARingMode / ring`
+  的多节点管线，但本算子的 buffer 全是 `flux_create_tensor_list(..., ring_mode=false)`（注释明说
+  "symm bufs **within node**"）、sync 用 `intra_node_sync_buffers`、kernel 直接 P2P 写 peer
+  （`barrier_ptrs[dst_rank]`，`is_p2p_atomic_supported` 查本地 peer），且**附带的唯一调优 config 是
+  `config_..._sm90_H800_tp8_nnodes1.cu`（nnodes1）**。→ **flux 实际演示/调优的就是单节点 8 卡 P2P，和我们一样。**
+  跨节点会落到 ring（框架里有，但非本算子展示路径）。**修正前述口嗨**：「overlap 净收益在多节点体现」对
+  双方都只是理论推断，flux 也没用这个算子实测过跨节点。
+
+### 单节点 M1 vs M0：M0 更快（最终裁定）
+
+- `fused/serial`（serial = comm@全SM + gemm@全SM）= **0.8~1.0x**（fused ≤ M0）；
+- flux 口径 `exposed = fused − gemm_only` 的 hidden% **为负**（大 shape 真实 comm 96us 但 fused−gemm=200us）；
+- M0 vs torch 弱基线快 **1.63~2.54×**。
+- **裁定：单节点 M0 > M1**。物理上 comm 带宽=SM 数，fused 给 comm 抠 ~24 SM 让 GEMM 变慢的代价
+  ≈/> 它藏住的 comm。这就是默认入口翻成 M0 的依据；M1（`..._fused`）保留为 comm«gemm / 多节点的 opt-in。
+
+### 资源利用率分析（B300 SXM6，本机）
+
+> 针对「B 卡 SM 更多、NVLink 更快，是不是资源没吃满」做的核查。
+
+- **硬件**：B300 SXM6，**148 SM**，287GB，8 卡全 NVSwitch（NV18，NVLink5 ≈ 900 GB/s/方向/卡）。
+- **SM 利用**：comm 与 GEMM 都已用满可用 SM（fused 用全部 148：comm carveout 24 + GEMM 124）。**不存在
+  空闲 SM**，瓶颈不在「SM 没用上」。
+- **通信旋转（ring/shifted all-to-all，已采用）**：原 dst-major 无旋转时**所有 rank 同时先打 dst0、再 dst1…**
+  → 任意时刻只有一个 GPU 的 NVLink ingress 在收（~1/R bisection）= 热点。改为**按 rank 旋转
+  `dst=(rank+step)%R`**（每个 step 是一个 permutation，rank r→dst r+s）后所有 ingress 链路同时忙，
+  **comm 大 shape 112→94us（≈459→545 GB/s，+16%），M0/serial 363→343us**。
+  - ⚠️ **旋转与 fused overlap 冲突**：旋转把「推给我的」贡献分散到所有 step（peer p 在 step=(my_rank−p)%R
+    才推我）→ 我的 tile 整段 comm 末尾才补齐 → GEMM 无法 overlap（fused 451→533）。**带宽最优（打散）与
+    overlap 最优（早集中到齐）天然冲突**。故**只在 M0/standalone comm 旋转（带宽优先、无消费者），
+    fused（`kSetBarrier`）保持不旋转**（早集中到齐、利于 overlap）。
+- **NVLink 利用（关键）**：comm 大 shape egress = 51.4MB/rank，旋转后 `comm@全SM=94us → ≈545 GB/s`
+  （未旋转 459=50%峰值）。剩余差距是**散射+转置 P2P 写的访问模式天花板，不是 MLP/线程不足**：
+  - 全 SM 下 comm 线程 256/512/1024 时间几乎不变（122/111/111us）→ 已饱和该模式下的写带宽。
+  - 手动 4× unroll（load/store 解耦提 MLP）对带宽**中性**。
+  - 对照：copy-engine **连续** P2P 单链路能到 **~667 GB/s** → 差距来自「每行仅 local_hidden≈1792B 连续、
+    跨行 stride=hidden」的散射写 + all-to-all，而非硬件没力气。
+- **能不能更快**：理论上 pull（远端读）或把转置折进 GEMM 的 TMA A-load（让网络传输变连续）可能逼近峰值，
+  但前者需重写 comm、后者 TMA 无法任意 gather，均为独立大工程，**未做**。
+- **结论**：单节点的限制是 **comm 的 NVLink 写带宽（且 comm 带宽=SM 数）**，不是闲置算力。因此 fused
+  在单节点 ≈ parity 是该模式 + 单节点拓扑的固有结果，B300 更多 SM 改变不了「comm 抠走的 SM ≈ 它藏住的量」。
+
+- **试过但回退的（记录避免重复踩坑）**：
+  - comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux `get_tile_info`）：让所有 rank 的 tile
+    渐进 ready，**只救活 comm-heavy 大 shape（fused 452→407us，0.80→0.85x）**，却让中等 shape 回退
+    （4,32,8192：0.98→0.72x），**平均 0.84x < dst-major 0.92x**，故**保留 dst-major**。根因：bench 同步取
+    最慢 rank，dst-major 下高 rank 的 tile 全在 comm 末尾才 ready → GEMM 几乎不 overlap（先空转再算）；
+    tile-major 修了这点但牺牲了其它 shape 的 comm 局部性。
+  - comm copy 循环 **4× unroll**（提 MLP）：带宽中性，回退保持简洁。
+  - **pull 模式 comm**（远端读代替远端写：每 rank 读所有 peer 的 input 填自己的 gathered，barrier 退化为
+    纯本地 gpu-scope，无跨卡原子）：本想远端读更易打满 NVLink，但**实测 B300 上 pull 全面慢于 push**
+    （大 shape 114→152us、(1,56,2048) 22→43us），即 remote write > remote read，故回退。
+- **M2（可选，未做）**：仅在 comm « gemm 的大算力 shape 或多节点场景下重启 overlap 调优；否则保持 M0。
+
 ---
 
 ## 1. 场景与数据流（Ulysses SP，post-attention）

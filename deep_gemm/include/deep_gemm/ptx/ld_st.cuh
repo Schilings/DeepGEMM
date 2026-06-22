@@ -222,6 +222,20 @@ CUTLASS_DEVICE uint32_t ld_acq_sys(const uint32_t* ptr) {
     return ret;
 }
 
+// Relaxed (no per-load ordering) system-scope load — cheap to spin on; pair with a single
+// `fence_acquire_sys()` AFTER the flag is observed to get the data-visibility ordering. Spinning
+// on this instead of `ld.acquire.sys` avoids flooding the NVLink/L2 fabric with acquire traffic
+// (which otherwise starves concurrent peer P2P stores in fused comm/GEMM overlap).
+CUTLASS_DEVICE uint32_t ld_relaxed_sys(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+CUTLASS_DEVICE void fence_acquire_sys() {
+    asm volatile("fence.acquire.sys;" ::: "memory");
+}
+
 CUTLASS_DEVICE uint64_t ld_acq_gpu(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));

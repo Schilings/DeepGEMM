@@ -2,6 +2,7 @@
 #include <torch/python.h>
 
 #include "apis/a2a_gemm.hpp"
+#include "apis/a2a_transpose_gemm.hpp"
 #include "apis/ag_gemm.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
@@ -32,6 +33,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::ag_gemm::register_apis(m);
 
     deep_gemm::a2a_gemm::register_apis(m);
+    deep_gemm::a2a_transpose_gemm::register_apis(m);
     deep_gemm::mega::register_apis(m);
     deep_gemm::runtime::register_apis(m);
 }
