@@ -95,6 +95,38 @@ flux 报告 `comm_time = fused_total − gemm_only`（暴露通信，overlap 越
 - 即：单节点上「给 comm 抠 SM 让 GEMM 变慢」的代价 > 「藏住的 comm」，所以连 flux 的宽松口径都显示
   overlap 不划算。这与前面的 ~parity / 带宽=SM 物理一致，进一步坐实**单节点用 M0（串行）最优**。
 
+### flux 确实是「真 overlap（双 stream）」，且这个算子也是节点内 P2P（核实，避免被带偏）
+
+> 逐行核对 `flux/src/a2a_transpose_gemm/ths_op/all_to_all_transpose_gemm_kernel.cc` +
+> `post_attn_a2a_transpose_impls.cu` + `post_attn_all_to_all_transpose_op.cc`。
+
+- **flux 是货真价实的双 stream overlap，机制与我们 M1 同构**（不是假 overlap）：
+  - comm 在默认 `stream`，GEMM 在独立的**最高优先级** `compute_stream`（构造时 `get_highest_cuda_stream_priority()`）；
+  - GEMM 流用 `CUStreamWaitValue(a2a_signal==1)` 作**启动闸门**；而 `a2a_signal` 是 comm kernel
+    在做完起始 `sync_peers` 后**立刻置位**（"notify the a2a kernel has been launched"，非 comm 完成），
+    所以 GEMM 一启动就和 comm **并发**跑；
+  - GEMM 内部再靠 **per-M-tile barrier**（comm `atomicAdd_system(tile_barrier,-1)`，最后一个
+    `st.release.sys` 置 1；GEMM 自旋等）逐 tile 消费 comm 产出。**这正是我们 M1 的设计**。
+  - flux 同样做 SM carveout：给 GEMM 传 `sm_margin + num_comm_sm`，comm 用 `num_comm_sm`。
+- **关键澄清**：所以「flux 报告加速」**不矛盾于**「我们说 overlap 单节点 ~parity」——两者同时成立：
+  flux 是真 overlap，但它的 headline 口径是 **vs torch 弱基线**，大头来自融合 comm kernel（这点 M0 已吃到）；
+  **它从没拿 overlap 去比一个 M0 式强串行基线**。别被"它有双 stream 所以一定更快"带偏。
+- **flux 这个算子也是单节点（节点内 NVLink P2P），不是跨节点**：框架层有 `nnodes / A2ARingMode / ring`
+  的多节点管线，但本算子的 buffer 全是 `flux_create_tensor_list(..., ring_mode=false)`（注释明说
+  "symm bufs **within node**"）、sync 用 `intra_node_sync_buffers`、kernel 直接 P2P 写 peer
+  （`barrier_ptrs[dst_rank]`，`is_p2p_atomic_supported` 查本地 peer），且**附带的唯一调优 config 是
+  `config_..._sm90_H800_tp8_nnodes1.cu`（nnodes1）**。→ **flux 实际演示/调优的就是单节点 8 卡 P2P，和我们一样。**
+  跨节点会落到 ring（框架里有，但非本算子展示路径）。**修正前述口嗨**：「overlap 净收益在多节点体现」对
+  双方都只是理论推断，flux 也没用这个算子实测过跨节点。
+
+### 单节点 M1 vs M0：M0 更快（最终裁定）
+
+- `fused/serial`（serial = comm@全SM + gemm@全SM）= **0.8~1.0x**（fused ≤ M0）；
+- flux 口径 `exposed = fused − gemm_only` 的 hidden% **为负**（大 shape 真实 comm 96us 但 fused−gemm=200us）；
+- M0 vs torch 弱基线快 **1.63~2.54×**。
+- **裁定：单节点 M0 > M1**。物理上 comm 带宽=SM 数，fused 给 comm 抠 ~24 SM 让 GEMM 变慢的代价
+  ≈/> 它藏住的 comm。这就是默认入口翻成 M0 的依据；M1（`..._fused`）保留为 comm«gemm / 多节点的 opt-in。
+
 ### 资源利用率分析（B300 SXM6，本机）
 
 > 针对「B 卡 SM 更多、NVLink 更快，是不是资源没吃满」做的核查。
