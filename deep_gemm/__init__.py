@@ -107,6 +107,14 @@ from .a2a_gemm import (
     bf16_a2a_gemm_nt,
 )
 
+# A2A-transpose + Wo GEMM kernels (Ulysses SP post-attention, correct dataflow)
+from .a2a_transpose_gemm import (
+    BF16A2ATransposeGemmSymmBuffer,
+    get_symm_buffer_for_a2a_transpose_gemm,
+    bf16_a2a_transpose,
+    bf16_a2a_transpose_gemm_nt,
+)
+
 
 
 

@@ -5,6 +5,18 @@
 > `src/a2a_transpose_gemm`，在 SM100（B 卡）上落地。
 > 背景与「为什么旧实现不对」见 `A2A_GEMM_ITERATION.md` 顶部「当前状态」。
 
+## 实现进度（分支 `a2a-transpose-gemm`）
+
+- **M0（正确性，已完成）**：转置 scatter comm kernel（`impls/sm100_a2a_transpose_comm.cuh`，uint4 P2P，
+  写 dst 的 hidden 列偏移 `rank*local_hidden`）+ 新 layout（`layout/bf16_a2a_transpose_gemm.cuh`：
+  barrier/signal + input + gathered 三区）+ host/api/python（`a2a_transpose_gemm`）。M0 用
+  `comm → SP-group barrier → 标准 bf16_gemm_nt`（无 overlap）。
+  **正确性 `tests/test_a2a_transpose_gemm.py {2,4,8}` 全 4/4 PASS**（vs all_gather 重建的非循环
+  ground-truth，rel~1e-6；torch 候选 rel=0）。入口：`deep_gemm.bf16_a2a_transpose_gemm_nt(d, Wo, sym)`。
+- **M1（overlap，进行中）**：per-M-tile barrier（comm 计数到 world_size）+ GEMM 消费者按 tile-ready
+  消费（替换 M0 的 barrier+标准 GEMM）；bench vs separate。
+- **M2（调优）**：comm SM 数 / TILE_M / raster / mc=2。
+
 ---
 
 ## 1. 场景与数据流（Ulysses SP，post-attention）
