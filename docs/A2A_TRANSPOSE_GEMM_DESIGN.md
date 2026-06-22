@@ -153,32 +153,36 @@ flux 报告 `comm_time = fused_total − gemm_only`（暴露通信，overlap 越
 - **结论**：单节点的限制是 **comm 的 NVLink 写带宽（且 comm 带宽=SM 数）**，不是闲置算力。因此 fused
   在单节点 ≈ parity 是该模式 + 单节点拓扑的固有结果，B300 更多 SM 改变不了「comm 抠走的 SM ≈ 它藏住的量」。
 
-### FlashAttention 原生 BSHD 输入：省掉一次 permute（seq_major，已采用，opt-in）
+### FlashAttention 原生 BSHD 输入：seq_major 是「layout 匹配」，不是「加速」（已纠正之前的误判）
 
-> 背景：真实训练的 attention 用 FlashAttention（FA2/FA4），其输出原生是 **BSHD = `[bs, seq, nheads, hd]`**
-> （seq 在 head 前）。我们 comm 默认契约是 **BHSD = `[bs, local_nheads, seq, hd]`**，所以拿 FA 的输出来喂
-> 必须先 `.permute(0,2,1,3).contiguous()` —— 这是 attention 张量的**一整趟 HBM 读+写**。
+> 背景：真实训练 attention 用 FlashAttention（FA2/FA4）。已核实其接口 `flash_attn_func(q,k,v)`
+> 输入/输出**都是 BSHD = `[bs, seq, nheads, hd]`**，seq↔head 的转置**在 FA kernel 内部完成、外围没有
+> 独立转置 op**。我们的 comm 同样把转置吸收在 kernel 内（默认契约 BHSD = `[bs, local_nheads, seq, hd]`）。
 
 - 加了 comm 的 **seq-major（BSHD）变体**（kernel 模板参数 `kSeqMajor`，默认 false 不改 BHSD 契约；
-  入口 `bf16_a2a_transpose_gemm_nt(..., seq_major=True)` / `bf16_a2a_transpose(sym, seq_major=True)`），
-  直接消费 FA 的 BSHD 输出，**省掉那次 permute**。正确性：BSHD 路径与 BHSD 路径**逐位一致**
-  （`tests/test_a2a_transpose_gemm.py` 三路 4/4 PASS）。
-- **是否提升 comm 带宽？几乎不**：BHSD/BSHD 的**写目标 `out_off` 完全相同**（瓶颈是 P2P 写），
-  BSHD 只让本地源读变连续。实测 comm-only 大 shape `95.1→94.5us`（≈0），小 shape 才 −5~13%。
-  → **转置不是 NVLink 带宽瓶颈**（瓶颈是写侧的 per-row local_hidden≈1792B 散射，与输入 layout 无关）。
-- **真正的收益来自省掉 permite 这趟 HBM**：在 FA 流水线口径下（BHSD 路径需 permute，BSHD 不需），
-  整个 post-attn 算子 **提速 1.25~1.45x（geo ≈1.32x）**：
+  入口 `bf16_a2a_transpose_gemm_nt(..., seq_major=True)`），直接消费 FA 的 BSHD 输出。BSHD 与 BHSD 路径
+  **逐位一致**（`tests/test_a2a_transpose_gemm.py` 三路 M0/fused/BSHD {2,4,8} 4/4 PASS）。
 
-  | shape | permute(us) | BHSD(+permute) | BSHD(免permute) | drop-transpose |
-  |------|------|------|------|------|
-  | (1,32,2048,128,4096) | 20.5 | 67.6 | 46.7 | **1.45x** |
-  | (1,56,2048,128,7168) | 19.7 | 85.3 | 65.5 | 1.30x |
-  | (8,32,2048,128,4096) | 32.2 | 133.5 | 101.5 | 1.32x |
-  | (4,32,8192,128,4096) | 49.5 | 211.8 | 161.5 | 1.31x |
-  | (8,56,4096,128,7168) | 86.7 | 434.1 | 346.3 | **1.25x** |
+- ⚠️ **纠正一次错误的口径**：曾经把「FA 出 BSHD → 喂 BHSD 算子需要的 `.permute`」**只算在我们一侧**，
+  得出「seq_major 提速 1.25~1.45x」——这是**失配惩罚**，不是公平加速。真实流水线里：torch-SDPA 出 BHSD
+  → 用 BHSD 算子（无 permute）；FA 出 BSHD → 用 seq_major 算子（无 permute）。**匹配时两侧都没有外部
+  permute**，就像 FA 自己把转置吸收在 kernel 内一样。那个 permute 只在「用错变体」时才出现。
 
-- **结论**：用 FA 时**优先 `seq_major=True`**——省掉 BSHD→BHSD 的 permute，约 1.3x。注意这是「省一趟 HBM
-  转置」的收益，**不是**提升了 NVLink 带宽（带宽瓶颈在写侧，需 layout 与 GEMM 协同才能再上，属独立工程）。
+- **公平对比（两个世界，baseline 也用对应 layout）**：comm 带宽 BHSD≈BSHD（写目标 `out_off` 相同，
+  转置非 NVLink 瓶颈）。torch baseline 用 `all_to_all_single` 时 **BHSD/BSHD 都需 ~2 次 permute**，
+  FA 的 BSHD 对它同样不省转置。结果 **M0 对各自 layout 的 torch baseline 加速两个世界基本一致**：
+
+  | shape | BHSD 世界 M0/torch | BSHD/FA 世界 M0/torch |
+  |------|------|------|
+  | (1,32,2048,128,4096) | 2.14x | 2.15x |
+  | (1,56,2048,128,7168) | 1.88x | 1.81x |
+  | (8,32,2048,128,4096) | 2.43x | 1.76x |
+  | (4,32,8192,128,4096) | 1.66x | 1.93x |
+  | (8,56,4096,128,7168) | 1.67x | 1.66x |
+
+- **结论**：`seq_major=True` 的价值是**给 FA 用户一个 BSHD-匹配的入口、避免一次失配 permute**（等价于
+  BHSD 算子之于 torch-SDPA），**不是**相对公平 baseline 的加速；FA 的 BSHD layout 对「我们 vs torch」
+  的比值**中性**（两个世界都 ~1.6-2.4x）。要再提 NVLink 带宽得改写侧（gathered/GEMM layout 协同），属独立工程。
 
 - **试过但回退的（记录避免重复踩坑）**：
   - comm work 改 **tile-major 排序**（tile 外层、dst 内层，对齐 flux `get_tile_info`）：让所有 rank 的 tile

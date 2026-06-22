@@ -22,14 +22,26 @@ from deep_gemm.a2a_transpose_gemm import (
 
 
 def torch_a2a_transpose(x_r, sp, group):
-    """flux-style WEAK baseline comm: torch permute+contiguous + NCCL all_to_all + permute/reshape.
-    x_r: [bs, local_nh, seq, hd] -> gathered [bs*local_seq, hidden]."""
+    """flux-style baseline comm from BHSD (torch-SDPA-native) attention output: permute+contiguous
+    + NCCL all_to_all_single + permute/reshape. x_r: [bs, local_nh, seq, hd] -> [bs*local_seq, hidden]."""
     bs, local_nh, seq, hd = x_r.shape
     local_seq = seq // sp
     send = x_r.view(bs, local_nh, sp, local_seq, hd).permute(2, 0, 3, 1, 4).contiguous()
     recv = torch.empty_like(send)
     dist.all_to_all_single(recv, send, group=group)
     return recv.permute(1, 2, 0, 3, 4).reshape(bs * local_seq, local_nh * sp * hd).contiguous()
+
+
+def torch_a2a_transpose_bshd(x_bshd, sp, group):
+    """FAIR baseline from BSHD (FlashAttention-native) attention output. Mirrors torch_a2a_transpose
+    but the input is seq-major [bs, seq, local_nh, hd], so the baseline ALSO gets whatever transpose
+    savings FA's layout provides (no gratuitous permute charged to one side only)."""
+    bs, seq, local_nh, hd = x_bshd.shape
+    local_seq = seq // sp
+    send = x_bshd.view(bs, sp, local_seq, local_nh, hd).permute(1, 0, 2, 3, 4).contiguous()
+    recv = torch.empty_like(send)
+    dist.all_to_all_single(recv, send, group=group)
+    return recv.permute(1, 2, 0, 3, 4).reshape(bs * local_seq, sp * local_nh * hd).contiguous()
 
 
 def find_free_port():
@@ -110,25 +122,23 @@ def run_benchmark(rank, num_gpus, num_iters, port):
         t_gemm = time_call(lambda: deep_gemm.bf16_gemm_nt(sym.gathered, Wo, d), resets=[])
         # M0 (default): our comm + GEMM serial == t_comm + t_gemm (our strong baseline)
         t_m0 = t_comm + t_gemm
+        Wo_t = Wo.t().contiguous()
 
-        # --- FlashAttention-native (BSHD) pipeline: is the BHSD-required transpose worth removing? ---
-        # FA returns attention output as BSHD [bs, seq, local_nh, hd]. To feed our current BHSD comm
-        # the pipeline must .permute(0,2,1,3).contiguous() (one extra HBM transpose). The seq-major
-        # comm (DG_A2AT_SEQ_MAJOR=1) consumes BSHD directly and skips that permute.
+        # --- FAIR FlashAttention(BSHD) world: BOTH our op and the torch baseline consume FA's native
+        # BSHD output (no gratuitous permute charged to one side). FA does the seq<->head transpose
+        # INSIDE its kernel (BSHD in/out), exactly as our comm absorbs it in-kernel. So a well-matched
+        # pipeline pays NO external permute on either side; seq_major just gives our op the BSHD-matching
+        # variant. This measures whether FA's BSHD layout changes the our-op-vs-baseline ratio at all.
         x_bshd = torch.randn((bs, seq, nheads // sp, head_dim), dtype=torch.bfloat16, device=device)
-        t_permute = time_call(lambda: x_bshd.permute(0, 2, 1, 3).contiguous(), resets=[])
-        os.environ['DG_A2AT_SEQ_MAJOR'] = '1'
         t_comm_bshd = time_call(lambda: _C.bf16_a2a_transpose_comm(
-            sym.buffer, ptrs, rank_i, bs, nheads, seq, head_dim), resets=[])
-        os.environ['DG_A2AT_SEQ_MAJOR'] = '0'
-        # FA pipeline cost: BHSD kernel pays the permute; BSHD kernel does not.
-        t_m0_fa_bhsd = t_permute + t_comm + t_gemm
-        t_m0_fa_bshd = t_comm_bshd + t_gemm
+            sym.buffer, ptrs, rank_i, bs, nheads, seq, head_dim, True), resets=[])  # seq_major=True
+        t_m0_bshd = t_comm_bshd + t_gemm
+        t_torch_bshd = time_call(lambda: torch.matmul(torch_a2a_transpose_bshd(x_bshd, sp, group), Wo_t),
+                                 resets=[])
         # M1 fused (opt-in): comm overlapped with GEMM (per-M-tile barrier); reset barriers each iter
         t_fused = time_call(lambda: bf16_a2a_transpose_gemm_nt_fused(d, Wo, sym),
                             resets=[sym.reset_barriers])
-        # flux-style WEAK baseline: torch transpose-a2a (NCCL + 2 permutes) + torch.matmul, serial
-        Wo_t = Wo.t().contiguous()
+        # flux-style baseline (BHSD / torch-SDPA world): torch transpose-a2a + torch.matmul, serial
         t_torch_comm = time_call(lambda: torch_a2a_transpose(x_r, sp, group), resets=[])
         def torch_total():
             a = torch_a2a_transpose(x_r, sp, group)
@@ -136,15 +146,15 @@ def run_benchmark(rank, num_gpus, num_iters, port):
         t_torch = time_call(torch_total, resets=[])
 
         if rank == 0:
-            vs_torch = t_torch / t_m0 if t_m0 > 0 else 0.0          # our M0 speedup over torch baseline
-            comm_x = t_torch_comm / t_comm if t_comm > 0 else 0.0   # our comm speedup over torch comm
-            fa_speedup = t_m0_fa_bhsd / t_m0_fa_bshd if t_m0_fa_bshd > 0 else 0.0  # gain from dropping permute
+            vs_torch = t_torch / t_m0 if t_m0 > 0 else 0.0               # BHSD world: M0 vs torch
+            vs_torch_bshd = t_torch_bshd / t_m0_bshd if t_m0_bshd > 0 else 0.0  # BSHD/FA world: M0 vs torch
+            comm_x = t_torch_comm / t_comm if t_comm > 0 else 0.0
             print(f"  ({bs},{nheads},{seq},{head_dim},{N})".ljust(24) +
                   f" | torch:{t_torch_comm:>6.0f}/{t_torch:>6.0f} | ours:{t_comm:>6.1f}/{t_gemm:>6.1f}"
                   f" M0={t_m0:>6.1f} fused={t_fused:>6.1f} | M0/torch={vs_torch:>4.2f}x comm{comm_x:>4.1f}x")
-            print(f"  {'  └─ FA(BSHD) pipeline:':<24}"
-                  f" permute={t_permute:>5.1f} | BHSD(+permute)={t_m0_fa_bhsd:>6.1f}"
-                  f" BSHD(no-permute)={t_m0_fa_bshd:>6.1f} | drop-transpose speedup={fa_speedup:>4.2f}x")
+            print(f"  {'  └─ FA(BSHD) world:':<24}"
+                  f" torch={t_torch_bshd:>6.1f} our-M0(seq_major)={t_m0_bshd:>6.1f} | M0/torch={vs_torch_bshd:>4.2f}x"
+                  f"   [both consume BSHD, no gratuitous permute]")
         sym.destroy()
         dist.barrier()
 
