@@ -72,6 +72,22 @@
   它有魔法 overlap，而是它的基线是 NCCL+torch；换成强基线（我们的 M0/优化 comm），结论同样回到 ~parity。**
   我们没有落后 flux——M0 即达到 flux 级的 comm 质量。
 
+### 用 flux 自己的口径复核 overlap 增量（confirm）
+
+flux 报告 `comm_time = fused_total − gemm_only`（暴露通信，overlap 越好该值越小）。在本机对我们的 fused
+套同样口径：
+
+| shape | 真实 comm@全SM | exposed = fused−gemm | hidden% |
+|------|------|------|------|
+| (1,56,2048,128,7168) | 21.5us | 38.1us | −77% |
+| (4,32,8192,128,4096) | 61.7us | 76.5us | −24% |
+| (8,56,4096,128,7168) | 95.8us | 200.2us | −109% |
+
+- exposed **大于**真实 comm（hidden% 为负）→ **overlap 净增量为负**。大 shape 真实 comm 仅 96us，但
+  `fused−gemm`=200us，多出的 ~104us 是 **GEMM 被 carveout 砍到 124 SM 的变慢**，已超过藏住的 comm。
+- 即：单节点上「给 comm 抠 SM 让 GEMM 变慢」的代价 > 「藏住的 comm」，所以连 flux 的宽松口径都显示
+  overlap 不划算。这与前面的 ~parity / 带宽=SM 物理一致，进一步坐实**单节点用 M0（串行）最优**。
+
 ### 资源利用率分析（B300 SXM6，本机）
 
 > 针对「B 卡 SM 更多、NVLink 更快，是不是资源没吃满」做的核查。

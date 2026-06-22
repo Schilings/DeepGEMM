@@ -103,8 +103,13 @@ def run_benchmark(rank, num_gpus, num_iters, port):
         if rank == 0:
             t_sum = t_comm + t_gemm
             sp_ratio = t_sum / t_fused if t_fused > 0 else 0.0
+            # flux convention: exposed comm = fused_total - gemm_only. If overlap worked, exposed
+            # should be << the real comm (t_comm). hidden = how much comm got hidden vs full comm.
+            exposed = t_fused - t_gemm
+            hidden_pct = (t_comm - exposed) / t_comm * 100.0 if t_comm > 0 else 0.0
             print(f"  ({bs},{nheads},{seq},{head_dim},{N})".ljust(24) +
-                  f" | {t_comm:>9.1f} {t_gemm:>9.1f} {t_sum:>9.1f} {t_fused:>10.1f} | {sp_ratio:>7.2f}x")
+                  f" | {t_comm:>9.1f} {t_gemm:>9.1f} {t_sum:>9.1f} {t_fused:>10.1f} | {sp_ratio:>6.2f}x"
+                  f" | exposed={exposed:>6.1f} hidden={hidden_pct:>5.0f}%")
         sym.destroy()
         dist.barrier()
 
