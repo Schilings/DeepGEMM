@@ -83,6 +83,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     // epilogue 线程数 = STORE_BLOCK_M, 每个线程负责 M 维的一个 element 行
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
+    // 禁止 A-side multicast: FP8 block-scaled GEMM 只能做 B-side (N 维) 2-CTA
+    // A 矩阵的 SFA 走 UTCCP 入 TMEM, SF 列对齐要求特殊, A 必须每 CTA 完整加载
     DG_STATIC_ASSERT(not kIsMulticastOnA or kNumMulticast == 1, "Invalid multicast");
     DG_STATIC_ASSERT(LOAD_BLOCK_M == BLOCK_M, "Only support tensor memory layout A/D");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
