@@ -381,7 +381,20 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         // M 维 wave 循环: FP8 A 矩阵在 M 维可拆为多个 wave, 每个 wave 做一次 fma
                         for (uint32_t w = 0; w < kNumMWaves; ++ w) {
                             DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
-                            a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(a_desc_base_lo, w * WAVE_BLOCK_M * BLOCK_K, k * UMMA_K);
+                            /*
+                            ┌──────────────────────────────┐  smem 起始
+                            │ atom 0: 所有 128 行 × 64 列   │  (128×64, swizzled)
+                            └──────────────────────────────┘
+                            ┌──────────────────────────────┐  smem + 128×64
+                            │ atom 1: 所有 128 行 × 64 列   │  (128×64, swizzled)  
+                            └──────────────────────────────┘
+                            同一行的 col 63 和 col 64 之间隔了 128×63 + 128×64 - 63 个元素，完全不连续。
+                            UMMA 通过 advance_umma_desc_lo 的 offset 参数做 atom 级跳跃来正确寻址
+                            */
+                            a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                                a_desc_base_lo,
+                                w * WAVE_BLOCK_M * BLOCK_K, // ← offset: 跨 atom 的大跳!
+                                k * UMMA_K); // ← k_idx: atom 内 K 偏移
                             // fma: D += A × B
                             //   参数3 = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N: TMEM 列偏移
                             //   参数4 = k_block_idx>0 or k>0: 首 K-block 第一步清零, 后续累加

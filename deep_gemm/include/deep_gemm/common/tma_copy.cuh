@@ -73,6 +73,22 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
                 // 每次 TMA 指令加载 BLOCK_OUTER × BLOCK_INNER_ATOM 个元素
                 // smem_ptr: 逐 atom 递增 BLOCK_OUTER * BLOCK_INNER_ATOM 个元素，保持 smem 内数据连续
                 // inner_idx: 逐 atom 递增 BLOCK_INNER_ATOM，对应 HBM 中 inner 维度的偏移
+                /*
+                SMEM 物理布局 (BLOCK_INNER=128, BLOCK_INNER_ATOM=64):
+                ┌─────────────────────────┐  ← smem (atom 0 start) 
+                │ rows 0..127, cols 0..63 │ atom 0: 128 rows × 64 cols (BF16, 128B swizzled)
+                │ (128×64, row-major)     │
+                └─────────────────────────┘
+                ┌─────────────────────────┐  ← smem + 128×64 (atom 1 start)
+                │ rows 0..127, cols 64..127│ atom 1: 128 rows × 64 cols (紧接 atom 0 后)
+                │ (128×64, row-major)     │
+                └─────────────────────────┘
+                即 先放所有行的前 64 列，再放所有行的后 64 列。同一行的 col 63 和 col 64 不在相邻地址，中间隔了 128×64 - 64 个元素。
+                TMA 一次 atom 必须按 BLOCK_OUTER × BLOCK_INNER_ATOM 的 tile 为单位搬运。
+                UMMA descriptor 在构造时已经知道 kSwizzleMode=128，所以 MMA 读 SMEM 时会按 swizzle 地址重新映射，不会读错位置。
+                SMEM 中不连续，但 UMMA 硬件通过 swizzle descriptor 自动修正索引。
+                这和 epilogue 的 XOR swizzle 原理类似——存入时布局改变，消费方知道自己该怎么读。
+                */
                 cute::SM90_TMA_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                              static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
                                              smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
