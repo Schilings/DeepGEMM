@@ -291,9 +291,35 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         auto sf_desc = make_sf_desc(nullptr);
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-        // SM100 UMMA SmemDescriptor: 地址/偏移以 16 字节为单位, 每个 lane 管一个 stage
+
+        /*
+        ═══════════════════════════════════════════════════════════════════════
+        UMMA SmemDescriptor 构造 — 与 TMA 的 swizzle 协议匹配
+        ═══════════════════════════════════════════════════════════════════════
+
+        TMA 存入 SMEM 时按 kSwizzleAMode/kSwizzleBMode 打乱了物理字节顺序
+        (如 swizzle-128B: atom 0=所有行×前64列, atom 1=所有行×后64列, 物理不连续)。
+
+        make_umma_desc 将同一个 swizzle 模式编码进 SmemDescriptor, 包含 4 个关键字段:
+          - layout_type_:        SWIZZLE_128B / SWIZZLE_64B / ... → 硬件由此知反解算法
+          - start_address_:      SMEM 起始物理地址 >> 4
+          - stride_byte_offset_: atom 间跨步 (MN 方向跳一个 atom 的字节距)
+          - leading_byte_offset_: 行列间跨步 (K 方向跳一行/一列的字节距)
+
+        UMMA::fma 发射时, SM100 硬件读取此描述符, 自动将 (逻辑行列) 映射到 (SMEM 物理地址),
+        无需软件手动反解 swizzle。这就是 TMA(生产者) 和 UMMA(消费者) 的协议层。
+
+        各 lane 预计算自己负责 stage 的 desc.lo:
+          - kNumStages 个 lane 各管一个 stage 的 SMEM 偏移
+          - /16 是因为 SmemDescriptor.start_address_ 以 16B 为单位
+          - 其余 lane 置 0 (不会用到)
+        后续通过 __shfl_sync 广播 stage_idx 对应 lane 的值, 无需查表。
+        ═══════════════════════════════════════════════════════════════════════
+        */
         auto a_desc = make_umma_desc<kMajorA, LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
         auto b_desc = make_umma_desc<kMajorB, LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        // desc.lo = 低 32 位: start_address | layout_type | base_offset, 包含 stage 0 的 SMEM 起始地址
+        // + lane_idx * SMEM_xxx_SIZE_PER_STAGE / 16: 各 lane 预存其负责 stage 的 desc.lo
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -365,6 +391,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 // Issue UMMA in the leader CTA
                 // mma_t: FP8×FP8 block-scaled, 根据 kNumMulticast 选单 SM 或 2-CTA cluster
                 using mma_t = cute::conditional_t<kNumMulticast == 1, SM100_MMA_MXF8F6F4_SS, SM100_MMA_MXF8F6F4_2x1SM_SS>;
+                // 通过 __shfl_sync 广播: 取出 stage_idx 号 lane 预存的 desc.lo
+                // 例: stage_idx=2 时, 所有 lane 会拿到 lane 2 上的 desc_lo (即 stage 2 的 SMEM 起始地址)
+                // 这样无需内存查表, 一个 warp shuffle 指令就完成 stage 切换
                 const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
                 if (cute::elect_one_sync()) {
@@ -376,24 +405,54 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         // 将编译期 instr_desc + 运行时 SF ID → 64 位立即数
                         const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sfa_id, sfb_id);
 
+                        /*
+                        advance_umma_desc_lo — swizzle 感知的 SMEM 地址推进
+
+                        desc.lo (SmemDescriptor 低 32 位):
+                          bits[15:0]:  start_address  (SMEM 物理地址 >> 4, 16B 对齐)
+                          bits[22:16]: layout_type    (SWIZZLE_128B/64B/.../NONE)
+                          bits[31:23]: base_offset    (原子内子偏移, 通常为 0)
+
+                        推进公式: desc_lo = base_lo + ((offset + k_idx * stride_k) * sizeof(dtype)) >> 4
+
+                        其中 stride_k:
+                          - K-major: stride_k = 1 (K 方向逐元素连续)
+                          - MN-major: stride_k = BLOCK_INNER_ATOM (K 方向跳跃整个 atom)
+
+                        offset 参数:
+                          - B 矩阵: offset=0, B 只有一层, 只需沿 K 推进 k * UMMA_K
+                          - A 矩阵: offset = w * WAVE_BLOCK_M * BLOCK_K,
+                            跨 M 维度 atom 的大跳 (MN-major 时整个 SMEM 的 M 段跳跃)
+                        */
                         b_desc.lo = advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(b_desc_base_lo, 0, k * UMMA_K);
                         #pragma unroll
                         // M 维 wave 循环: FP8 A 矩阵在 M 维可拆为多个 wave, 每个 wave 做一次 fma
                         for (uint32_t w = 0; w < kNumMWaves; ++ w) {
                             DG_STATIC_ASSERT((WAVE_BLOCK_M * BLOCK_K) % 128 == 0, "Invalid swizzling offset");
                             /*
+                            A 矩阵 (MN-major) 的 SMEM 物理布局 — 两级跳跃:
+
+                            物理布局 (swizzle128 + MN-major, LOAD_BLOCK_M=128):
                             ┌──────────────────────────────┐  smem 起始
                             │ atom 0: 所有 128 行 × 64 列   │  (128×64, swizzled)
                             └──────────────────────────────┘
                             ┌──────────────────────────────┐  smem + 128×64
-                            │ atom 1: 所有 128 行 × 64 列   │  (128×64, swizzled)  
+                            │ atom 1: 所有 128 行 × 64 列   │  (128×64, swizzled)
                             └──────────────────────────────┘
-                            同一行的 col 63 和 col 64 之间隔了 128×63 + 128×64 - 63 个元素，完全不连续。
-                            UMMA 通过 advance_umma_desc_lo 的 offset 参数做 atom 级跳跃来正确寻址
+                            同一行的 col 63 和 col 64 之间隔了 ~128×64 个元素, 完全不连续.
+
+                            advance_umma_desc_lo 的 offset + k_idx 两级寻址:
+                              - offset = w * WAVE_BLOCK_M * BLOCK_K
+                                wave 级大跳: 跨 M 维 atom (如 MN-major 时跳过整个 M 段)
+                              - k_idx = k * UMMA_K
+                                K 维微调: 在 atom 内沿 K 方向推进 sub-tile
+
+                            UMMA 硬件通过 SmemDescriptor.layout_type_ 自动反解 swizzle,
+                            所以软件只需给出正确的 SMEM 物理起始地址偏移, 不需要手动反排字节.
                             */
                             a_desc.lo = advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                                 a_desc_base_lo,
-                                w * WAVE_BLOCK_M * BLOCK_K, // ← offset: 跨 atom 的大跳!
+                                w * WAVE_BLOCK_M * BLOCK_K, // ← offset: 跨 M atom 的大跳
                                 k * UMMA_K); // ← k_idx: atom 内 K 偏移
                             // fma: D += A × B
                             //   参数3 = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N: TMEM 列偏移
@@ -421,8 +480,92 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             tmem_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
         }
     } else if (warp_idx == 2) {
-        // UTCCP transpose warp: 将 TMA 加载的 SFA/SFB (row-major) 转置为 UTCCP 需要的 col-major 布局
-        // 每 128 个 uint32 为一个 unit, 32 lane 做 XOR shuffle 转置
+        /*
+        ═══════════════════════════════════════════════════════════════════════
+        Warp 2 — UTCCP SMEM 转置 (三级流水线的第二级)
+        ═══════════════════════════════════════════════════════════════════════
+
+        数据流全貌:
+          HBM                       SMEM                          SMEM                       TMEM
+        ┌──────────┐    TMA     ┌─────────────┐   转置       ┌─────────────┐   UTCCP    ┌──────────┐
+        │ sf[M][K] │ ────────→  │  row-major   │ ──────────→ │  K-major    │ ─────────→ │ col[k]   │
+        │ row-major│ (warp 0)   │ sf[0..127]   │  (warp 2)   │ 32-lane交织  │ (warp 1)  │ 32b×N列  │
+        └──────────┘            └─────────────┘              └─────────────┘            └──────────┘
+
+        为什么需要转置？
+        ─────────────────
+        1. TMA 将 SFA 加载为 row-major: smem_sfa[0..127] 连续存放 128 个 uint32,
+           即第 i 个位置 = sf[M_start + i] (行优先, 逐 M 排列).
+
+        2. UTCCP (SM100_UTCCP_4x32dp128bit) 要求 SMEM 数据为 K-major 布局:
+           - 每"行"宽度 = 128 bits = 4 个 uint32 (K 方向)
+           - "行"数由 SMEM descriptor 的 SBO 控制
+           - UTCCP 从 SMEM 源拷贝 4 行 × 32 列 (每列 128b) → 输出到 4 个连续 TMEM 列
+
+        3. make_sf_desc 构造的 SMEM descriptor:
+             layout = SWIZZLE_NONE, SBO = 8×16 = 128B, LBO = 0
+           即: 每行 128b 宽, MN 方向相邻行间隔 128B, K 方向无跳跃.
+           UTCCP 以此 layout 解释 SMEM → 需要 K-major 而非 row-major.
+
+        三级 warp 流水线:
+          warp 0 (TMA load):   从 HBM 搬 A/B/SF 数据到 SMEM
+                   ↓ (full_barrier wait)
+          warp 2 (transpose):  将 SF 从 row-major 转置为 K-major (原地改写 SMEM)
+                   ↓ (fence_view_async_shared → with_sf_full_barrier arrive)
+          warp 1 (UMMA issue):  UTCCP 拷贝 SF 到 TMEM → UMMA fma 计算
+
+        ═══════════════════════════════════════════════════════════════════════
+        转置算法: 32-lane warp XOR shuffle
+        ═══════════════════════════════════════════════════════════════════════
+
+        将 128 个 uint32 (SF_BLOCK_M 对齐到 128) 原地转置.
+        32 个 lane 协作, 每个 lane 处理 4 个元素 (32×4=128).
+
+        XOR 模式解析 (以 lane 0 为例):
+          lane_idx=0, lane_idx>>3=0:
+            i=0: 读 (0^0)*32+0 = 0×32+0 = 0,      写 0*4+(0^0) = 0
+            i=1: 读 (1^0)*32+0 = 1×32+0 = 32,     写 0*4+(1^0) = 1
+            i=2: 读 (2^0)*32+0 = 2×32+0 = 64,     写 0*4+(2^0) = 2
+            i=3: 读 (3^0)*32+0 = 3×32+0 = 96,     写 0*4+(3^0) = 3
+          → lane 0 从 [0, 32, 64, 96] 读, 写到 [0, 1, 2, 3]
+
+          lane_idx=8, lane_idx>>3=1:
+            i=0: 读 (0^1)*32+8 = 1×32+8 = 40,     写 8*4+(0^1) = 33
+            i=1: 读 (1^1)*32+8 = 0×32+8 = 8,      写 8*4+(1^1) = 32
+            i=2: 读 (2^1)*32+8 = 3×32+8 = 104,    写 8*4+(2^1) = 35
+            i=3: 读 (3^1)*32+8 = 2×32+8 = 72,     写 8*4+(3^1) = 34
+          → lane 8 从 [40, 8, 104, 72] 读, 写到 [33, 32, 35, 34]
+
+        读模式: 每 8 个 lane 为一个 XOR 组, lane 内读跨 4 行 × 32 列的交错数据
+        写模式: 按 lane 列优先写入, 形成 32 列 × 4 行的 dense K-major 布局
+
+        转置前 (row-major): sf[0], sf[1], sf[2], ..., sf[127]
+        转置后 (K-major):   适合 UTCCP 按 128b 宽行读取的排列,
+                           lane 0=col0, lane 1=col1, ..., lane 31=col31,
+                           每列 4 个值组成连续的 K 维宽行
+
+        ═══════════════════════════════════════════════════════════════════════
+        TMEM 中 SF 的摆放
+        ═══════════════════════════════════════════════════════════════════════
+
+        TMEM 共 512 列 (SM100), 每列 32 bits:
+        ┌─────────────────────────┬────────────────┬────────────────┐
+        │     Accumulator 区      │    SFA 区       │    SFB 区      │
+        │  kNumAccumTmemCols 列   │  kNumSFATmem   │  kNumSFBTmem   │
+        │  (epilogue stages ×     │  Cols =        │  Cols =        │
+        │   waves × BLOCK_N)      │  SF_BLOCK_M/32  │  SF_BLOCK_N/32 │
+        └─────────────────────────┴────────────────┴────────────────┘
+
+        SFA: kNumSFATmemCols = 128/32 = 4 列
+        1 次 UTCCP copy 将 128 个 uint32 (4×32dp128bit) → 4 个 TMEM 列.
+        循环 i = 0..ceil_div(SF_BLOCK_M, 128) 覆盖所有 M 行.
+
+        UMMA fma 引用:
+          SFA 列 = kTmemStartColOfSFA + w * (kNumUTCCPAlignedElems / 32)
+                 = kTmemStartColOfSFA + w * 4
+          每个 M wave 分配 4 个 TMEM 列, 硬件通过 sfa_id 选择列内偏移.
+        ═══════════════════════════════════════════════════════════════════════
+        */
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             uint32_t values[4];
@@ -438,14 +581,15 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const auto& num_total_k_blocks = ceil_div(scheduler.current_shape_k, BLOCK_K);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait TMA arrival
+                // 等待 warp 0 的 TMA 完成 — SFA/SFB 数据已在 SMEM 中
                 full_barriers[stage_idx]->wait(phase);
 
-                // Transpose for UTCCP at certain stages
+                // 只在 SF 需要加载的 K-block 做转置 (同 TMA 加载频率)
                 if (k_block_idx % kNumSFAStagesPerLoad == 0) {
                     #pragma unroll
                     for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
                         utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + i * kNumUTCCPAlignedElems);
+                    // 异步代理 fence: 确保 warp 2 的 SMEM 写入对 warp 1 的 UTCCP 读取可见
                     // TODO: figure out whether the proxy fence is valid for 2-CTA cases
                     cutlass::arch::fence_view_async_shared();
                 }
@@ -457,7 +601,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     cutlass::arch::fence_view_async_shared();
                 }
 
-                // Arrive
+                // 转置完成, 通知 warp 1 可以开始 UTCCP + UMMA
                 with_sf_full_barriers[stage_idx]->arrive(0u);
             }
         }
