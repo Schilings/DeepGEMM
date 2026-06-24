@@ -130,19 +130,33 @@ struct Scheduler {
     uint32_t num_blocks_in_group;
     bool is_peer_cta_alive = true;
 
-    // For grouped GEMM
-    int* grouped_layout;
-    uint32_t current_group_idx = 0;
-    // Only used for masked layout
+    // ── 分组 GEMM 成员变量 ──
+    int* grouped_layout;                                // 分组布局数组指针 (含义因 GEMM 类型而异)
+    uint32_t current_group_idx = 0;                     // 当前处理的组编号 (expert / K 组 / batch)
+
+    // MGroupedMasked 专用: 各 expert 的 M block 累积和
+    //   cumsum = 前面所有 expert 的 M block 数之和
+    //   用于判断 next_block_idx 落在哪个 expert 的 tile 范围
     uint32_t current_m_cumsum = 0;
-    // Only used for contiguous psum layout
+
+    // MGroupedContiguousWithPsumLayout 专用: psum 层的 M 维度管理
+    //   last_psum_m      — 上一个 psum 层的 M (对齐后), 用于计算当前 M block 的全局偏移
+    //   current_psum_m   — 当前 psum 层的 M 大小 (从 grouped_layout 读取)
+    //   current_m_block_cumsum — psum 层的 M block 累积和 (同 MGroupMasked 的 current_m_cumsum 角色)
     uint32_t last_psum_m = 0, current_psum_m, current_m_block_cumsum = 0;
-    // Only used for k-grouped layout
+
+    // KGroupedContiguous 专用: K 维分组管理
+    //   current_shape_k        — 当前 K 组的大小 (用于 TMA load 边界)
+    //   current_num_valid_groups — 已处理的有效 K 组数 (用于判断 next_block_idx 属于哪个 K 组)
+    //   current_k_cumsum       — K 维累积偏移 (用于 get_global_idx<IndexType::K> 地址计算)
+    //   current_sf_k_cumsum    — SF K 维累积偏移 (用于 get_global_idx<IndexType::SF_K> 地址计算)
+    //   预取: 当前组用完时, 直接取 next_* 避免运行时查表
     uint32_t current_shape_k, current_num_valid_groups = 0, current_k_cumsum = 0, current_sf_k_cumsum = 0;
     uint32_t next_group_idx, next_shape_k;
 
-    // Only used for k-grouped gemm
-    // 在 grouped_layout 中查找下一个 non-zero K 维度
+    // 在 grouped_layout 中扫描下一个非零 K 维度, 跳过 K=0 的空组
+    // 用于 KGroupedContiguous 的组切换 (如 SwiGLU gate+up, 某些组可能为零)
+    // 输入 group_idx 会被更新为找到的组号, shape_k 为对应 K 大小
     CUTLASS_DEVICE void get_next_k_group(uint32_t &group_idx, uint32_t &shape_k) const {
         for (; group_idx < kNumGroups; ++ group_idx) {
             shape_k = grouped_layout[group_idx];
@@ -327,8 +341,13 @@ struct Scheduler {
         }
     }
 
-    // For swap A/B and psum layout only
-    // 获取 M block 内的有效对齐 M (考虑 psum layout 的尾部不完整 block)
+    // 获取当前 M block 内的有效行数 (已对齐到 UMMA 步长)
+    // 仅 MGroupedContiguousWithPsumLayout 需要此计算:
+    //   - 最后一层 psum 的 M 可能不足以填满整个 BLOCK_M
+    //   - 例如 last_psum_m=64, BLOCK_M=128, 最后一层 M 不到 128
+    //   - 此时需将该 block 的有效行数向上对齐到 UMMA_STEP_N (16)
+    //   - 判断条件: 当前是否为该 psum 层的最后一个 block
+    //     (m_block_idx == last_psum_m / BLOCK_M + num_m_blocks - 1)
     CUTLASS_DEVICE uint32_t get_aligned_effective_m_in_block(const uint32_t& m_block_idx) const {
         constexpr uint32_t UMMA_STEP_N = 16;
         DG_STATIC_ASSERT(BLOCK_M % UMMA_STEP_N == 0, "Invalid alignment");
@@ -456,11 +475,18 @@ struct Scheduler {
             if (next_block_idx >= num_blocks)
                 return false;
 
-            // For SM90 only
-            // NOTES: we don't have to set `is_peer_cta_alive` for masked grouped GEMM, as it must be aligned
-            is_peer_cta_alive = num_n_blocks % kNumMulticast == 0 or                  // Always aligned on N (constant bypass)
-                                num_m_blocks % kNumMulticast == 0 or                  // Always aligned on M (constant bypass)
-                                (next_block_idx ^ 1) < num_blocks;                    // Peer CTA in bound
+            // SM90 TMA multicast 的 peer-CTA 存活检测
+            // SM90 multicast 将相邻两个 CTA 配对 (blockIdx.x 与 blockIdx.x^1)
+            // 需要判断 peer CTA 是否还有 tile, 决定是否继续发出 multicast load
+            // 三种情况下 peer 始终存活:
+            //   1. N 被 multicast 整除 → 所有 N 方向组都是满的, peer 不会遇到尾端
+            //   2. M 被 multicast 整除 → M 方向组都是满的, 同上
+            //   3. next_block_idx ^ 1 < num_blocks → 通过 XOR 翻转最低位,
+            //      得到的 peer block_idx 仍在范围内
+            // 注意: MGroupedMasked 不需要此检查, 因为每个 expert 内部必定对齐
+            is_peer_cta_alive = num_n_blocks % kNumMulticast == 0 or
+                                num_m_blocks % kNumMulticast == 0 or
+                                (next_block_idx ^ 1) < num_blocks;
             get_swizzled_block_idx(next_block_idx, m_block_idx, n_block_idx);
         }
         return true;

@@ -16,16 +16,19 @@
 namespace deep_gemm {
 
 // JIT runtime for the Ulysses SP post-attn A2A-transpose scatter comm kernel.
+// `generate_impl` 生成 JIT 代码: #include .cuh 文件并实例化 kernel 模板:
+//   sm100_a2a_transpose_comm_impl<kNumRanks, kTileM, kSetBarrier, kSeqMajor>
+// 四个模板参数由 Args 中的运行时值决定 (set_barrier/seq_major 为编译期 bool)
 class SM100A2ATransposeCommRuntime final : public LaunchRuntime<SM100A2ATransposeCommRuntime> {
 public:
     struct Args {
-        int num_ranks;
-        int bs, nheads, seq, head_dim;
-        int tile_m;
-        bool set_barrier;
-        bool seq_major;
-        layout::SymBuffer<> sym_buffer_ptrs;
-        LaunchArgs launch_args;
+        int num_ranks;               // SP 组 GPU 数 → 模板参数 kNumRanks
+        int bs, nheads, seq, head_dim; // 输入 shape
+        int tile_m;                  // M-tile 粒度 → 模板参数 kTileM (须 = GEMM BLOCK_M)
+        bool set_barrier;            // 是否写 per-tile barrier → 模板参数 kSetBarrier (M1 fused)
+        bool seq_major;              // 输入是否 BSHD 布局 → 模板参数 kSeqMajor
+        layout::SymBuffer<> sym_buffer_ptrs; // 跨 rank 对称内存指针
+        LaunchArgs launch_args;      // grid/block 配置
     };
 
     static std::string generate_impl(const Args& args) {
@@ -53,6 +56,19 @@ static void __instantiate_kernel() {{
 // Launch the transpose-scatter comm on the current stream. Each rank pushes its attention output
 // into every peer's gathered region (hidden-column offset rank*local_hidden) with the seq<->head
 // transpose. Caller must barrier across the SP group before reading the gathered buffer (M0).
+//
+// 参数:
+//   sym_buffer      — 本地 sym_buffer tensor 包装 (PyTorch _symmetric_memory)
+//   sym_buffer_ptrs — 所有 rank 的 sym_buffer 数据指针 vector (用于 P2P 地址映射)
+//   rank_idx        — 当前 rank 编号 [0, num_ranks)
+//   bs, nheads, seq, head_dim — 输入 x 的 shape (详见 .cuh 注释)
+//   tile_m          — M-tile 粒度 (默认 128, 须与 GEMM BLOCK_M 一致)
+//   set_barrier     — 是否写 per-M-tile barrier:
+//                       false = M0 独立模式 (纯 comm, 不加 barrier)
+//                       true  = M1 fused (写 barrier 供 GEMM 消费者逐 tile 等待)
+//   seq_major_in    — 输入是否 BSHD 布局:
+//                       false = 默认 BHSD [bs,local_nheads,seq,head_dim]
+//                       true  = BSHD  [bs,seq,local_nheads,head_dim] (FlashAttention 原生)
 static void sm100_a2a_transpose_comm(const torch::Tensor& sym_buffer,
                                      const std::vector<int64_t>& sym_buffer_ptrs,
                                      const int& rank_idx,
