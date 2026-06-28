@@ -5,7 +5,7 @@ torch-native (NCCL all_to_all + torch.matmul) baseline, across shapes, for BSHD 
 Chain per rank r (sp = world_size, sequence-parallel input):
   X_local[bs, local_seq, hidden]
     --[PRE]  fused QKV-proj GEMM + A2A-transpose --> q,k,v [bs, seq, local_nh, hd]
-    --[ATTN] attention (SDPA) -------------------->  attn  [bs, local_nh, seq, hd]
+    --[ATTN] attention (FlashAttention-4) -------->  attn  [bs, local_nh, seq, hd]
     --[POST] A2A-transpose + Wo GEMM (overlapped)->  y     [bs*local_seq, N]
 
 For each shape and layout we compare:
@@ -33,7 +33,6 @@ Usage: python benchmarks/bench_ulysses_full_attn_flow.py <num_gpus> [iters]
 
 import os, sys, socket, math
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -76,6 +75,7 @@ def run(rank, ng, port, iters):
     from deep_gemm.a2a_transpose_gemm import (
         get_symm_buffer_for_a2a_transpose_gemm,
         bf16_a2a_transpose_gemm_nt, bf16_a2a_transpose_gemm_nt_fused)
+    from flash_attn.cute import flash_attn_func as fa4_func   # FlashAttention-4 (see docs/INSTALL_FA4.md)
 
     def time_call(fn, it, resets=()):
         for _ in range(3):
@@ -123,10 +123,15 @@ def run(rank, ng, port, iters):
         n_qkv = 3 * hidden
         local_nqkv = n_qkv // sp                 # = 3*local_nh*hd
 
-        # ---- attention timed ONCE (uniform-length THD == BSHD); local_nh heads, full seq ----
-        qb = torch.randn((bs, local_nh, seq, head_dim), dtype=torch.bfloat16, device=dev)
+        # ---- attention timed ONCE with FlashAttention-4 (uniform-length THD == BSHD); local_nh heads ----
+        # FA4 native dense layout is [B, S, H, D]; bs uniform-length sequences == both layouts' attn FLOPs.
+        qb = torch.randn((bs, seq, local_nh, head_dim), dtype=torch.bfloat16, device=dev)
         kb = torch.randn_like(qb); vb = torch.randn_like(qb)
-        t_attn = time_call(lambda: F.scaled_dot_product_attention(qb, kb, vb, scale=scale), iters)
+
+        def attn_fa4():
+            o = fa4_func(qb, kb, vb, softmax_scale=scale, causal=False)
+            return o[0] if isinstance(o, tuple) else o
+        t_attn = time_call(attn_fa4, iters)
 
         for layout in ('BSHD', 'THD'):
             lbs, lseq = (bs, seq) if layout == 'BSHD' else (1, bs * seq)

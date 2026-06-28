@@ -22,27 +22,15 @@ Usage: python tests/test_ulysses_varlen_thd.py <num_gpus>
 import os, sys, socket, math
 from itertools import accumulate
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from fa4_attn import fa4_attn_varlen_thd
 
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0)); return s.getsockname()[1]
-
-
-def varlen_sdpa_thd(q, k, v, cu, scale):
-    """Per-sequence SDPA on THD tensors q,k,v [T, H, hd] with cu_seqlens cu. -> [T, H, hd]."""
-    out = torch.empty_like(q)
-    for i in range(len(cu) - 1):
-        s, e = int(cu[i]), int(cu[i + 1])
-        qi = q[s:e].transpose(0, 1)            # [H, L, hd]
-        ki = k[s:e].transpose(0, 1)
-        vi = v[s:e].transpose(0, 1)
-        oi = F.scaled_dot_product_attention(qi, ki, vi, scale=scale)
-        out[s:e] = oi.transpose(0, 1)
-    return out
 
 
 def run(rank, ng, port):
@@ -57,13 +45,6 @@ def run(rank, ng, port):
     from deep_gemm.a2a_transpose_gemm import (
         get_symm_buffer_for_a2a_transpose_gemm, bf16_a2a_transpose_gemm_nt)
 
-    have_fa = False
-    try:
-        from flash_attn import flash_attn_varlen_func
-        have_fa = True
-    except Exception:
-        pass
-
     nheads, head_dim, N = 16, 128, 2048
     hidden = nheads * head_dim
     local_nh = nheads // sp
@@ -71,7 +52,6 @@ def run(rank, ng, port):
     T = sum(seqlens)                          # 2048
     assert T % sp == 0, "padded packed total_tokens must be divisible by sp"
     T_local = T // sp
-    scale = 1.0 / math.sqrt(head_dim)
     cu = torch.tensor([0] + list(accumulate(seqlens)), dtype=torch.int32, device=dev)
     max_seq = max(seqlens)
 
@@ -98,11 +78,7 @@ def run(rank, ng, port):
         return torch.cat(recv, dim=0)                                  # [sp*T_local=T, local_nh, hd] = packed order
     qf, kf, vf = pre_a2a(q), pre_a2a(k), pre_a2a(v)                     # [T, local_nh, hd]
 
-    if have_fa:
-        attn = flash_attn_varlen_func(qf, kf, vf, cu, cu, max_seq, max_seq,
-                                      dropout_p=0.0, softmax_scale=scale, causal=False)
-    else:
-        attn = varlen_sdpa_thd(qf, kf, vf, cu, scale)                  # [T, local_nh, hd] THD
+    attn = fa4_attn_varlen_thd(qf, kf, vf, cu, max_seq, head_dim)       # [T, local_nh, hd] THD
 
     # ---- post-attn A2A-transpose + Wo GEMM (OUR seq_major op; THD == bs=1, seq=T) ----
     sym = get_symm_buffer_for_a2a_transpose_gemm(group, 1, nheads, T, head_dim)
@@ -115,7 +91,7 @@ def run(rank, ng, port):
     qg = (Xg @ Wq).view(T, nheads, head_dim)
     kg = (Xg @ Wk).view(T, nheads, head_dim)
     vg = (Xg @ Wv).view(T, nheads, head_dim)
-    ag = varlen_sdpa_thd(qg, kg, vg, cu, scale).reshape(T, hidden)     # [T, hidden]
+    ag = fa4_attn_varlen_thd(qg, kg, vg, cu, max_seq, head_dim).reshape(T, hidden)   # [T, hidden]
     Yg = (ag.float() @ Wo.float().t())
     y_ref = Yg[rank * T_local:(rank + 1) * T_local]                    # [T_local, N]
 
@@ -124,8 +100,7 @@ def run(rank, ng, port):
     flags = torch.tensor([1.0 if passed else 0.0], device=dev)
     dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
     if rank == 0:
-        attn_impl = "flash_attn_varlen" if have_fa else "manual per-seq SDPA"
-        print(f"  attn={attn_impl}  seqlens={seqlens} T={T} sp={sp} T_local={T_local} local_nh={local_nh}")
+        print(f"  attn=flash_attn_4_varlen  seqlens={seqlens} T={T} sp={sp} T_local={T_local} local_nh={local_nh}")
         print(f"  rel={rel:.3e}  ->  {'PASS' if flags.item() > 0.5 else 'FAIL'}"
               f"   (uniform packed-token split + our seq_major THD op)")
     dist.destroy_process_group(); os._exit(0)

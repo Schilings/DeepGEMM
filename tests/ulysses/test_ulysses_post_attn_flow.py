@@ -8,7 +8,7 @@ Flow per rank r (sp_size = world_size, sequence-parallel input):
   X_local[bs, local_seq, hidden]                       # rank r owns seq shard [r*local_seq:...]
   --QKV proj (local)-->        q,k,v [bs, local_seq, nheads, hd]
   --pre-attn A2A (transpose)-> q,k,v [bs, seq, local_nheads, hd]   # gather seq, scatter heads
-  --attention (SDPA, per local head, full seq)--> attn[bs, local_nheads, seq, hd]  == our op's x_r
+  --attention (FlashAttention-4, per local head, full seq)--> attn[bs, local_nheads, seq, hd]  == our op's x_r
   --post-attn A2A-transpose + Wo GEMM (OUR OP)--> y[bs*local_seq, N]
 
 Correctness: each rank also computes the WHOLE thing from the all-gathered global X (full QKV +
@@ -20,9 +20,10 @@ Usage: python tests/test_ulysses_attn_flow.py <num_gpus> [iters]
 
 import os, sys, socket, math
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from fa4_attn import fa4_attn_bhsd
 
 
 def find_free_port():
@@ -46,11 +47,6 @@ def pre_attn_a2a(t, sp, group):
     recv = [torch.empty_like(send[0]) for _ in range(sp)]
     dist.all_to_all(recv, send, group=group)      # recv[s]: src s's seq shard, OUR heads
     return torch.cat(recv, dim=1)                  # [bs, seq, local_nh, hd]
-
-
-def sdpa(q, k, v, hd):
-    """q,k,v [bs, H, seq, hd] -> [bs, H, seq, hd]."""
-    return F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(hd))
 
 
 def run(rank, ng, port, iters):
@@ -108,8 +104,8 @@ def run(rank, ng, port, iters):
         qf = pre_attn_a2a(q, sp, group)                         # [bs, seq, local_nh, hd]
         kf = pre_attn_a2a(k, sp, group)
         vf = pre_attn_a2a(v, sp, group)
-        attn = sdpa(qf.permute(0, 2, 1, 3), kf.permute(0, 2, 1, 3),
-                    vf.permute(0, 2, 1, 3), head_dim)           # [bs, local_nh, seq, hd] == x_r
+        attn = fa4_attn_bhsd(qf.permute(0, 2, 1, 3), kf.permute(0, 2, 1, 3),
+                             vf.permute(0, 2, 1, 3), head_dim)   # [bs, local_nh, seq, hd] == x_r
         attn = attn.contiguous()
 
         # ---- post-attn A2A-transpose + Wo GEMM (OUR OP) ----
@@ -126,7 +122,7 @@ def run(rank, ng, port, iters):
         qg = (Xg @ Wq).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
         kg = (Xg @ Wk).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
         vg = (Xg @ Wv).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
-        ag = sdpa(qg, kg, vg, head_dim)                         # [bs, nheads, seq, hd]
+        ag = fa4_attn_bhsd(qg, kg, vg, head_dim)                # [bs, nheads, seq, hd]
         ag = ag.permute(0, 2, 1, 3).reshape(bs, seq, hidden)    # [bs, seq, hidden]
         Yg = (ag.float() @ Wo.float().t())                      # [bs, seq, N]
         y_ref = Yg[:, rank * local_seq:(rank + 1) * local_seq, :].reshape(bs * local_seq, N)

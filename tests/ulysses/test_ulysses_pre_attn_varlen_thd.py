@@ -25,27 +25,15 @@ Usage: python tests/ulysses/test_ulysses_pre_attn_varlen_thd.py <num_gpus>
 import os, sys, socket, math
 from itertools import accumulate
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from fa4_attn import fa4_attn_varlen_thd
 
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0)); return s.getsockname()[1]
-
-
-def varlen_sdpa_thd(q, k, v, cu, scale):
-    """Per-sequence SDPA on THD tensors q,k,v [T, H, hd] with cu_seqlens cu. -> [T, H, hd]."""
-    out = torch.empty_like(q)
-    for i in range(len(cu) - 1):
-        s, e = int(cu[i]), int(cu[i + 1])
-        qi = q[s:e].transpose(0, 1)            # [H, L, hd]
-        ki = k[s:e].transpose(0, 1)
-        vi = v[s:e].transpose(0, 1)
-        oi = F.scaled_dot_product_attention(qi, ki, vi, scale=scale)
-        out[s:e] = oi.transpose(0, 1)
-    return out
 
 
 def build_wqkv_rankmajor(Wq, Wk, Wv, sp, local_nh, hd):
@@ -71,13 +59,6 @@ def run(rank, ng, port):
     import deep_gemm
     from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose, bf16_gemm_a2a_transpose_nt
 
-    have_fa = False
-    try:
-        from flash_attn import flash_attn_varlen_func
-        have_fa = True
-    except Exception:
-        pass
-
     nheads, head_dim = 16, 128
     hidden = nheads * head_dim
     local_nh = nheads // sp
@@ -87,7 +68,6 @@ def run(rank, ng, port):
     assert T % sp == 0, "packed total_tokens must be divisible by sp"
     T_local = T // sp                         # uniform packed-token shard
     assert T_local % 128 == 0, "local_seq (T//sp) must be a multiple of 128 for the kernel"
-    scale = 1.0 / math.sqrt(head_dim)
     cu = torch.tensor([0] + list(accumulate(seqlens)), dtype=torch.int32, device=dev)
     max_seq = max(seqlens)
 
@@ -109,11 +89,7 @@ def run(rank, ng, port):
     kf = out[..., loc:2 * loc].reshape(T, local_nh, head_dim)
     vf = out[..., 2 * loc:3 * loc].reshape(T, local_nh, head_dim)
 
-    if have_fa:
-        attn = flash_attn_varlen_func(qf, kf, vf, cu, cu, max_seq, max_seq,
-                                      dropout_p=0.0, softmax_scale=scale, causal=False)
-    else:
-        attn = varlen_sdpa_thd(qf, kf, vf, cu, scale)                      # [T, local_nh, hd] THD
+    attn = fa4_attn_varlen_thd(qf, kf, vf, cu, max_seq, head_dim)           # [T, local_nh, hd] THD
     torch.cuda.synchronize()
 
     # ---- single-process reference: global fused QKV + per-seq varlen attention, slice head group ----
@@ -121,11 +97,7 @@ def run(rank, ng, port):
     qg = (Xg @ Wq.t()).view(T, nheads, head_dim)[:, hs, :].contiguous()    # [T, local_nh, hd]
     kg = (Xg @ Wk.t()).view(T, nheads, head_dim)[:, hs, :].contiguous()
     vg = (Xg @ Wv.t()).view(T, nheads, head_dim)[:, hs, :].contiguous()
-    if have_fa:
-        attn_ref = flash_attn_varlen_func(qg, kg, vg, cu, cu, max_seq, max_seq,
-                                          dropout_p=0.0, softmax_scale=scale, causal=False)
-    else:
-        attn_ref = varlen_sdpa_thd(qg, kg, vg, cu, scale)                  # [T, local_nh, hd]
+    attn_ref = fa4_attn_varlen_thd(qg, kg, vg, cu, max_seq, head_dim)      # [T, local_nh, hd]
 
     def rel_err(x, y):
         return (x.float() - y.float()).abs().mean().item() / (y.float().abs().mean().item() + 1e-8)
@@ -136,8 +108,7 @@ def run(rank, ng, port):
     flags = torch.tensor([1.0 if passed else 0.0], device=dev)
     dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=group)
     if rank == 0:
-        attn_impl = "flash_attn_varlen" if have_fa else "manual per-seq SDPA"
-        print(f"  attn={attn_impl}  seqlens={seqlens} T={T} sp={sp} T_local={T_local} local_nh={local_nh}")
+        print(f"  attn=flash_attn_4_varlen  seqlens={seqlens} T={T} sp={sp} T_local={T_local} local_nh={local_nh}")
         print(f"  rel q/k/v/attn={rel_q:.1e}/{rel_k:.1e}/{rel_v:.1e}/{rel_a:.1e}  ->  "
               f"{'PASS' if flags.item() > 0.5 else 'FAIL'}"
               f"   (uniform packed-token split + our fused pre-attn THD op)")

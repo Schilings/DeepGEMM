@@ -4,7 +4,7 @@ FULL Ulysses SP attention flow using BOTH fused ops end-to-end, with correctness
 Flow per rank r (sp = world_size, sequence-parallel input):
   X_local[bs, local_seq, hidden]                       # rank r owns seq shard [r*local_seq:...]
   --[PRE-ATTN OP] fused QKV proj + A2A-transpose--> q,k,v [bs, seq, local_nheads, hd]   (OUR op #1)
-  --attention (SDPA, per local head, full seq)-->  attn  [bs, local_nheads, seq, hd]
+  --attention (FlashAttention-4, per local head, full seq)--> attn [bs, local_nheads, seq, hd]
   --[POST-ATTN OP] A2A-transpose + Wo GEMM-->      y     [bs*local_seq, N]              (OUR op #2)
 
 PRE-ATTN op:  bf16_gemm_a2a_transpose_nt  (QKV is ONE fused linear Wqkv[3*nheads*hd, hidden],
@@ -20,9 +20,10 @@ Usage: python tests/test_ulysses_full_attn_flow.py <num_gpus> [iters]
 
 import os, sys, socket, math
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from fa4_attn import fa4_attn_bhsd
 
 
 def find_free_port():
@@ -46,10 +47,6 @@ def build_wqkv_rankmajor(Wq, Wk, Wv, sp, local_nh, hd):
         sl = slice(d * rows, (d + 1) * rows)
         blocks += [Wq[sl], Wk[sl], Wv[sl]]
     return torch.cat(blocks, dim=0).contiguous()
-
-
-def sdpa(q, k, v, hd):
-    return F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(hd))
 
 
 def run(rank, ng, port, iters):
@@ -104,9 +101,9 @@ def run(rank, ng, port, iters):
         kf = out[..., loc:2 * loc].reshape(bs, seq, local_nh, head_dim)
         vf = out[..., 2 * loc:3 * loc].reshape(bs, seq, local_nh, head_dim)
 
-        # ---- attention (per local head, full seq) ----
-        attn = sdpa(qf.permute(0, 2, 1, 3), kf.permute(0, 2, 1, 3),
-                    vf.permute(0, 2, 1, 3), head_dim).contiguous()        # [bs, local_nh, seq, hd]
+        # ---- attention (FlashAttention-4, per local head, full seq) ----
+        attn = fa4_attn_bhsd(qf.permute(0, 2, 1, 3), kf.permute(0, 2, 1, 3),
+                             vf.permute(0, 2, 1, 3), head_dim).contiguous()  # [bs, local_nh, seq, hd]
 
         # ---- POST-ATTN OP: A2A-transpose + Wo GEMM ----
         sym_post = get_symm_buffer_for_a2a_transpose_gemm(group, bs, nheads, seq, head_dim)
@@ -122,12 +119,13 @@ def run(rank, ng, port, iters):
         qg = (Xg @ Wq.t()).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
         kg = (Xg @ Wk.t()).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
         vg = (Xg @ Wv.t()).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
-        # Attention MUST be computed per rank head-group (each rank runs SDPA on its own local_nh
-        # heads). A single all-head SDPA instead differs by ~1e-3 in bf16 purely from a different
-        # head-count tiling / reduction order -- a reference artifact, not real error. Keeping the
-        # final Wo projection in FP32 so rel reflects the genuine bf16-output-GEMM accuracy floor.
-        ag_groups = [sdpa(qg[:, d * local_nh:(d + 1) * local_nh], kg[:, d * local_nh:(d + 1) * local_nh],
-                          vg[:, d * local_nh:(d + 1) * local_nh], head_dim) for d in range(sp)]
+        # Attention MUST be computed per rank head-group (each rank runs FA4 on its own local_nh
+        # heads). A single all-head attention instead differs by ~1e-3 in bf16 purely from a
+        # different head-count tiling / reduction order -- a reference artifact, not real error.
+        # Keeping the final Wo projection in FP32 so rel reflects the genuine bf16-output-GEMM floor.
+        ag_groups = [fa4_attn_bhsd(qg[:, d * local_nh:(d + 1) * local_nh],
+                                   kg[:, d * local_nh:(d + 1) * local_nh],
+                                   vg[:, d * local_nh:(d + 1) * local_nh], head_dim) for d in range(sp)]
         ag = torch.cat(ag_groups, dim=1).permute(0, 2, 1, 3).reshape(bs, seq, hidden)
         Yg = (ag.float() @ Wo.float().t())                              # [bs, seq, N]
         y_ref = Yg[:, rank * local_seq:(rank + 1) * local_seq, :].reshape(bs * local_seq, N)

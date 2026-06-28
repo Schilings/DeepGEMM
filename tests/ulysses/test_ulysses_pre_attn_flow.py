@@ -5,7 +5,7 @@ fused QKV-proj GEMM + A2A-transpose (OUR op `bf16_gemm_a2a_transpose_nt`).
 Flow per rank r (sp = world_size, sequence-parallel input):
   X_local[bs, local_seq, hidden]                       # rank r owns seq shard [r*local_seq:...]
   --fused QKV proj + A2A-transpose (OUR OP)--> q,k,v [bs, seq, local_nheads, hd]  # gather seq, scatter heads
-  --attention (SDPA, per local head, full seq)--> attn[bs, local_nheads, seq, hd]
+  --attention (FlashAttention-4, per local head, full seq)--> attn[bs, local_nheads, seq, hd]
 
 QKV is a SINGLE fused linear Wqkv[3*nheads*hd, hidden] (NT layout). Its rows are laid out
 rank-major so the op's contiguous-N scatter lands each rank's [Q, K, V] head group together:
@@ -22,9 +22,10 @@ Usage: python tests/test_ulysses_pre_attn_flow.py <num_gpus> [iters]
 
 import os, sys, socket, math
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from fa4_attn import fa4_attn_bhsd
 
 
 def find_free_port():
@@ -50,11 +51,6 @@ def build_wqkv_rankmajor(Wq, Wk, Wv, sp, local_nh, hd):
         sl = slice(d * rows, (d + 1) * rows)
         blocks += [Wq[sl], Wk[sl], Wv[sl]]
     return torch.cat(blocks, dim=0).contiguous()
-
-
-def sdpa(q, k, v, hd):
-    """q,k,v [bs, H, seq, hd] -> [bs, H, seq, hd]."""
-    return F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(hd))
 
 
 def run(rank, ng, port, iters):
@@ -107,8 +103,8 @@ def run(rank, ng, port, iters):
         qf = out[..., 0:loc].reshape(bs, seq, local_nh, head_dim)
         kf = out[..., loc:2 * loc].reshape(bs, seq, local_nh, head_dim)
         vf = out[..., 2 * loc:3 * loc].reshape(bs, seq, local_nh, head_dim)
-        attn = sdpa(qf.permute(0, 2, 1, 3), kf.permute(0, 2, 1, 3),
-                    vf.permute(0, 2, 1, 3), head_dim).contiguous()        # [bs, local_nh, seq, hd]
+        attn = fa4_attn_bhsd(qf.permute(0, 2, 1, 3), kf.permute(0, 2, 1, 3),
+                             vf.permute(0, 2, 1, 3), head_dim).contiguous()  # [bs, local_nh, seq, hd]
         torch.cuda.synchronize()
 
         # ---- single-process reference (each rank recomputes the whole flow globally) ----
@@ -119,8 +115,8 @@ def run(rank, ng, port, iters):
         qg = (Xg @ Wq.t()).view(bs, seq, nheads, head_dim)[:, :, hs, :]
         kg = (Xg @ Wk.t()).view(bs, seq, nheads, head_dim)[:, :, hs, :]
         vg = (Xg @ Wv.t()).view(bs, seq, nheads, head_dim)[:, :, hs, :]
-        attn_ref = sdpa(qg.permute(0, 2, 1, 3), kg.permute(0, 2, 1, 3),
-                        vg.permute(0, 2, 1, 3), head_dim).contiguous()    # [bs, local_nh, seq, hd]
+        attn_ref = fa4_attn_bhsd(qg.permute(0, 2, 1, 3), kg.permute(0, 2, 1, 3),
+                                 vg.permute(0, 2, 1, 3), head_dim).contiguous()  # [bs, local_nh, seq, hd]
 
         def rel_err(x, y):
             return (x.float() - y.float()).abs().mean().item() / (y.float().abs().mean().item() + 1e-8)
