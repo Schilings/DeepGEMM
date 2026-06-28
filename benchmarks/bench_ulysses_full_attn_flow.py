@@ -52,12 +52,14 @@ def find_free_port():
 
 
 # (bs, nheads, seq, head_dim)  -- SQUARE weights: hidden = N = nheads*head_dim
+# LONG-SEQUENCE regime: Ulysses SP only makes sense for long sequences. With sp=8 each rank
+# holds local_seq = (bs*seq)/8 tokens; all below give local_seq that is a multiple of 128.
 SHAPES = [
-    (1, 32, 4096, 128),   # hidden = 4096
-    (1, 56, 4096, 128),   # hidden = 7168
-    (2, 32, 4096, 128),   # hidden = 4096   (THD T = 8192)
-    (2, 56, 2048, 128),   # hidden = 7168   (THD T = 4096)
-    (1, 64, 8192, 128),   # hidden = 8192
+    (1, 32, 32768,  128),   # hidden=4096  | 1 sequence of  32K tokens  (per-rank  4K)
+    (1, 64, 32768,  128),   # hidden=8192  | 1 sequence of  32K tokens  (per-rank  4K)
+    (1, 64, 65536,  128),   # hidden=8192  | 1 sequence of  64K tokens  (per-rank  8K)
+    (1, 32, 131072, 128),   # hidden=4096  | 1 sequence of 128K tokens  (per-rank 16K)
+    (2, 32, 32768,  128),   # hidden=4096  | BSHD 2x32K ; THD packs to 1x64K (BSHD==THD demo)
 ]
 
 
@@ -106,11 +108,12 @@ def run(rank, ng, port, iters):
         print(f"  GPU: {torch.cuda.get_device_name(rank)}   "
               f"(SQUARE weights: Wq/Wk/Wv/Wo=[hidden,hidden], Wqkv=[3*hidden,hidden]; hidden=N=nh*hd)")
         print(f"  times in us = ours/torch/async ; speedups = vs_torch/vs_async (x)")
-        print(f"{'='*132}")
-        print(f"{'(bs,nh,seq,hd) hid':<22} {'lay':>4} | "
+        print(f"  shape col = hidden, nheads, effective(lbs x lseq), L=per-rank local_seq")
+        print(f"{'='*140}")
+        print(f"{'h / nh / lbs x lseq / L':<28} {'lay':>4} | "
               f"{'pre o/t/a':>17} {'attn':>6} {'post o/t/a':>17} | "
               f"{'e2e o/t/a':>17} | {'e2e t/a':>9} | {'c+g t/a':>9}")
-        print('-' * 132)
+        print('-' * 140)
 
     results = []
     for (bs, nheads, seq, head_dim) in SHAPES:
@@ -247,8 +250,8 @@ def run(rank, ng, port, iters):
             sp_cg_a = (t_pre_a + t_post_a) / cg_o if cg_o > 0 else 0.0
 
             if rank == 0:
-                tag = f"({bs},{nheads},{seq},{head_dim}) {hidden}"
-                print(f"{tag:<22} {layout:>4} | "
+                tag = f"h{hidden} nh{nheads} {lbs}x{lseq} L{llocal_seq}"
+                print(f"{tag:<28} {layout:>4} | "
                       f"{t_pre_o:>5.0f}/{t_pre_t:>5.0f}/{t_pre_a:<5.0f} {t_attn:>6.0f} "
                       f"{t_post_o:>5.0f}/{t_post_t:>5.0f}/{t_post_a:<5.0f} | "
                       f"{e2e_o:>5.0f}/{e2e_t:>5.0f}/{e2e_a:<5.0f} | "
@@ -260,13 +263,13 @@ def run(rank, ng, port, iters):
     if rank == 0 and results:
         geo = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else 0.0
         col = lambda lay, k: [r[k] for r in results if r['layout'] == lay and r[k] > 0]
-        print('-' * 132)
+        print('-' * 140)
         for lay in ('BSHD', 'THD'):
             print(f"  {lay}: geo_mean e2e speedup     vs_torch = {geo(col(lay, 'sp_e2e_t')):.3f}x"
                   f"   vs_async = {geo(col(lay, 'sp_e2e_a')):.3f}x")
             print(f"        geo_mean comm+GEMM speedup vs_torch = {geo(col(lay, 'sp_cg_t')):.3f}x"
                   f"   vs_async = {geo(col(lay, 'sp_cg_a')):.3f}x")
-        print('=' * 132 + '\n')
+        print('=' * 140 + '\n')
     dist.destroy_process_group(); os._exit(0)
 
 
