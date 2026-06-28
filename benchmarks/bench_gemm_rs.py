@@ -1,9 +1,10 @@
 """
-GEMM-RS Performance Benchmark: Main Fused vs Separate (GEMM + NCCL RS)
+GEMM-RS Performance Benchmark: Main Fused vs Torch-Native vs DeepGEMM-Separate
 
-Compares:
-  1. bf16_gemm_nt + torch.distributed.reduce_scatter_tensor  -- separate baseline
-  2. bf16_gemm_rs_nt (current production fused path)          -- main fused
+Compares three paths (all produce the same [tokens_per_rank, N] reduce-scattered output):
+  1. torch.matmul(a, b.t()) + torch.distributed.reduce_scatter_tensor  -- torch-native baseline
+  2. bf16_gemm_nt           + torch.distributed.reduce_scatter_tensor  -- deepgemm-separate baseline
+  3. bf16_gemm_rs_nt (current production fused path)                   -- main fused
 
 Usage:
   python benchmarks/bench_gemm_rs.py [num_gpus] [num_iters]

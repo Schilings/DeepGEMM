@@ -10,7 +10,7 @@
 
 | 算子 | 入口符号 | 当前最佳（focus 中大 / geo vs sep） | 正确性 | 分支 / tag | 详细文档 |
 |------|---------|------|------|------|------|
-| **GEMM-RS** | `bf16_gemm_rs_nt` | 8卡 focus **1.22~1.23x** / geo **1.14x** | 6/6 PASS @ {2,4,8} | `main`（2D TMA push）；1D 版存档 tag `gemm-rs-1d-stable` | `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md` / `FLUX_GEMM_RS_STUDY.md` |
+| **GEMM-RS** | `bf16_gemm_rs_nt` | focus vs sep：8卡 **1.20x** / 4卡 **1.20x**；vs torch-native：8卡 1.16x / 4卡 1.18x；全13-shape geo **1.14x** | 6/6 PASS @ {2,4,8}（test 已加 torch 原生 gemm+RS 交叉对照）| `main`（2D TMA push）；1D 版存档 tag `gemm-rs-1d-stable` | `GEMM_RS_DESIGN.md` / `GEMM_RS_ITERATION.md` / `FLUX_GEMM_RS_STUDY.md` |
 | **A2A-transpose-GEMM**（Ulysses post-attn，正确版）| `bf16_a2a_transpose_gemm_nt`=**默认 M0 串行** / `_fused`=M1 overlap(opt-in)；`seq_major=True` 接 FA 原生 BSHD/THD | **M0 单节点最优**：比 torch(NCCL+2转置)基线快 **1.6~2.4×**，comm 快 3~4×（只转 1 次、融进 comm）；M1 overlap 单节点 **~parity（净负）**；`seq_major` 是 layout 匹配(非加速)，**直接覆盖 THD/varlen（uniform 切，comm 不需要 cu_seqlens）** | **{2,4,8} 4/4 PASS**（M0/fused/seq_major 三路）；`test_ulysses_attn_flow` {8}3/3；`test_ulysses_varlen_thd`(FA varlen){8} PASS | **已并入 `main`**（merge `5516d8d`） | `A2A_TRANSPOSE_GEMM_DESIGN.md`（flux 双stream/基线口径/资源/seq_major/THD 全记录）|
 | **A2A-GEMM**（旧 token-A2A，**语义错误**）| `bf16_a2a_gemm_nt` | — | ⚠️ **3/6 FAIL** + 语义错位（token(M)-A2A，非 Ulysses）→ 已被上面的 transpose 版取代 | `main`（保留未删）| `A2A_GEMM_ITERATION.md` / `A2A_GEMM_DESIGN.md`（旧）|
 | **AG-GEMM** | `bf16_ag_gemm_nt` | geo **~1.13x**（8 卡）| PASS | `main`（仅 PDL 默认开启被保留）| `AG_GEMM_ITERATION.md` / `AG_GEMM_FLUX_REFERENCE.md` |

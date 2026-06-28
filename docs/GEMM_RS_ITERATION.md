@@ -14,8 +14,12 @@
 
 ## 当前状态（接班 · 本节为 GEMM-RS 权威当前态）
 
-- 入口：`bf16_gemm_rs_nt`；正确性 `tests/test_gemm_rs.py {2,4,8}` 全 **6/6 PASS, max_diff=0.0**。
-- **性能（本机实测，vs sep）**：8 卡 focus 中大 **1.22~1.23x** / 全 13-shape geo **1.14x**；4 卡 focus **1.19x**。
+- 入口：`bf16_gemm_rs_nt`；正确性 `tests/test_gemm_rs.py {2,4,8}` 全 **6/6 PASS, max_diff=0.0**（vs DeepGEMM+FP32-RS 参考精确一致）。
+  test 已增加 **torch 原生 gemm+RS 交叉对照**（fused vs torch-native rel_err≈0.25%，因 torch 走 bf16 累加而 fused 用 FP32 累加，fused 精度更高，见 Iter 15）。
+- **性能（本机 B300，实测，focus 中大 5 shape geo）**：
+  - 8 卡：vs torch-native **1.155x** / vs sep **1.199x**（avg fused 1294T）；
+  - 4 卡：vs torch-native **1.180x** / vs sep **1.196x**（avg fused 1333T）。
+  - 历史口径全 13-shape geo ≈ **1.14x vs sep**。
 - **main 当前实现 = 整块 2D TMA store push**（Iteration 14，`4d6ad76`）：epilogue 复用标准
   `epilogue::sm100_store_cd`（swizzled STSM + `SM90_TMA_STORE_2D`）直推各 dst_rank 的 scatter slot；
   代码更干净、性能与旧 1D 版等价（NVLink 带宽-bound）。
@@ -542,6 +546,57 @@ host event 序（下轮 GEMM 等本轮 reduce）+ 起始 tag41 barrier 保证。
   传输 tail（数据必须跨卡），本架构内基本不可压缩。
 - 处置：保留在分支 `gemm-rs-2d-tma-push`（更干净的实现，8卡不劣）；main 维持 1.22x 不变。
   要真正冲 >1.3x 只剩**算法级降通信量**（树形/分层 RS，把 push 的 (R-1)×、reduce 的 (R+1)× 降下来）。
+
+---
+
+## 2026-06-28：Iteration 15 — test 增加 torch 原生 gemm+RS 交叉对照 baseline + 刷新 4/8 卡 focus bench（保留）
+
+### 背景
+
+`benchmarks/bench_gemm_rs.py` 本就已有 torch 原生 baseline（`run_torch_native` = `torch.matmul + dist.reduce_scatter_tensor`，
+输出含 `Torch` / `vs Torch` 列），但 `tests/test_gemm_rs.py` 的正确性参考只有 DeepGEMM 自己的
+`bf16_gemm_nt + 手工 FP32 RS`，缺少 torch 原生路径作为对照。本轮把 torch 原生 gemm+RS 作为交叉对照补进 test，
+并刷新本机 4/8 卡 focus bench 数据。
+
+### Change
+
+- `tests/test_gemm_rs.py`：新增 `compute_torch_native()`（`torch.matmul(a, b.t())` + NCCL `reduce_scatter_tensor`，
+  bf16 路径，与 bench 的 `run_torch_native` 完全一致）。`run_single_shape_test` 额外计算并报告
+  `fused vs torch-native` 的 `max_diff_torch / rel_error_torch`，并纳入 pass 判据（阈值同 ref，`0.01×num_ranks`）。
+  表头新增 `vs Torch Max / vs Torch Rel` 两列。
+- `benchmarks/bench_gemm_rs.py`：无需改动（torch 原生 baseline 已存在）。
+
+### Result
+
+- 正确性 `tests/test_gemm_rs.py 8`：**6/6 PASS**。
+  - vs ref（DeepGEMM+FP32-RS）：`max_diff=0.0`（逐元素精确）。
+  - vs torch 原生：`rel_err≈0.0025`（0.25%），`max_diff` 16~32（bf16 大幅值的单元素量化差）。
+    说明 fused 的 FP32 累加比 torch 原生的 bf16 reduce_scatter **更精确**——torch 原生才是误差来源。
+- 性能（本机 B300，focus 中大 5 shape，20 iter）：
+
+  | GPUs | shape | Torch(us) | Sep(us) | Fused(us) | vs torch | vs sep |
+  |------|-------|----------:|--------:|----------:|---------:|-------:|
+  | 8 | 4096x4096x4096 | 1023.8 | 1035.4 | 801.9 | 1.28x | 1.29x |
+  | 8 | 4096x7168x4096 | 1776.0 | 1847.1 | 1491.2 | 1.19x | 1.24x |
+  | 8 | 4096x4096x7168 | 1519.7 | 1571.1 | 1464.3 | 1.04x | 1.07x |
+  | 8 | 8192x4096x4096 | 2026.6 | 2110.1 | 1713.2 | 1.18x | 1.23x |
+  | 8 | 8192x7168x4096 | 3495.4 | 3727.3 | 3173.8 | 1.10x | 1.17x |
+  | **8 geo** | focus | | | | **1.155x** | **1.199x** |
+  | 4 | 4096x4096x4096 | 503.1 | 511.5 | 415.0 | 1.21x | 1.23x |
+  | 4 | 4096x7168x4096 | 865.2 | 879.2 | 720.2 | 1.20x | 1.22x |
+  | 4 | 4096x4096x7168 | 782.3 | 770.4 | 705.4 | 1.11x | 1.09x |
+  | 4 | 8192x4096x4096 | 1007.1 | 1014.8 | 817.5 | 1.23x | 1.24x |
+  | 4 | 8192x7168x4096 | 1705.6 | 1775.8 | 1482.4 | 1.15x | 1.20x |
+  | **4 geo** | focus | | | | **1.180x** | **1.196x** |
+
+  - avg fused：8 卡 1294T、4 卡 1333T；torch-native 8 卡 1122T / 4 卡 1131T；sep 8 卡 1081T / 4 卡 1117T。
+  - 最弱 shape 仍是 K=7168（4096x4096x7168，8 卡 vs sep 1.07x / 4 卡 1.09x），与历史结论一致
+    （GEMM 长、reduce/push 占比相对小，但 NVLink push 体量大）。
+
+### Verdict
+
+- **保留**。纯测试侧增强（不改 kernel），无性能/正确性风险；torch 原生对照证实 fused 精度优于 torch 原生 bf16 RS。
+- 性能与历史口径一致（focus 中大 ~1.20x vs sep），无回退。
 
 ---
 

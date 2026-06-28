@@ -5,8 +5,9 @@ Comprehensive validation test for BF16 GEMM + Reduce-Scatter
 Tests:
   1. Multiple shapes covering small/medium/large hidden dimensions
   2. Correctness against reference (bf16_gemm + FP32 manual reduce-scatter)
-  3. Consistency across multiple runs (determinism)
-  4. Edge cases: minimum M, large K, large N (7168)
+  3. Cross-check against torch-native baseline (torch.matmul + NCCL reduce_scatter)
+  4. Consistency across multiple runs (determinism)
+  5. Edge cases: minimum M, large K, large N (7168)
 
 Usage:
     python tests/test_gemm_rs.py [num_gpus]        # default: 2
@@ -86,6 +87,27 @@ def compute_reference(a, b, rank_idx, num_ranks, tokens_per_rank, local_rank):
     return ref
 
 
+def compute_torch_native(a, b, rank_idx, num_ranks, tokens_per_rank, local_rank, group):
+    """
+    Torch-native baseline: torch.matmul (full GEMM) + NCCL reduce_scatter_tensor.
+
+    This is the most common path a user would write by hand, and is exactly the
+    `run_torch_native` baseline used in benchmarks/bench_gemm_rs.py. It computes
+    the reduce-scatter entirely in BF16 (no manual FP32 accumulation), so it is a
+    real-world cross-check rather than the exact FP32 ground truth.
+    """
+    n_dim = b.shape[0]
+    # Full GEMM: [total_m, n], same on every rank (a, b broadcast from src=0).
+    d_full = torch.matmul(a, b.t())  # bf16
+    y_torch = torch.zeros((tokens_per_rank, n_dim), dtype=torch.bfloat16,
+                          device=f'cuda:{local_rank}')
+    dist.reduce_scatter_tensor(y_torch, d_full.contiguous(),
+                               op=dist.ReduceOp.SUM, group=group)
+    torch.cuda.synchronize(local_rank)
+    del d_full
+    return y_torch
+
+
 def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
                           tokens_per_rank, n_dim, k_dim,
                           verbose=True):
@@ -104,8 +126,12 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     torch.cuda.synchronize(local_rank)
     dist.barrier()
 
-    # Compute reference
+    # Compute reference (DeepGEMM gemm + manual FP32 reduce-scatter = exact ground truth)
     ref = compute_reference(a, b, rank_idx, num_ranks, tokens_per_rank, local_rank)
+    dist.barrier()
+
+    # Torch-native baseline (torch.matmul + NCCL reduce_scatter, bf16): real-world cross-check
+    y_torch = compute_torch_native(a, b, rank_idx, num_ranks, tokens_per_rank, local_rank, group)
     dist.barrier()
 
     # Create symmetric buffer
@@ -134,18 +160,29 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     ref_abs_mean = ref.float().abs().mean().item()
     rel_error = mean_diff / max(ref_abs_mean, 1e-8)
 
+    # Cross-check fused vs torch-native baseline (both bf16 reduce-scatter,
+    # so they should match closely; small diffs come from bf16 accumulation order).
+    max_diff_torch = (y.float() - y_torch.float()).abs().max().item()
+    mean_diff_torch = (y.float() - y_torch.float()).abs().mean().item()
+    torch_abs_mean = y_torch.float().abs().mean().item()
+    rel_error_torch = mean_diff_torch / max(torch_abs_mean, 1e-8)
+    del y_torch
+
     # Determine pass/fail
     # BF16 GEMM has inherent precision limits.
     # For multi-GPU reduce-scatter, each intermediate BF16 → FP32 → BF16 round-trip
     # introduces ~0.4% relative error. With N ranks, we accumulate N-1 such truncations.
     # Use relative error as the primary metric, with a per-rank scaling factor.
     max_rel_error_threshold = 0.01 * num_ranks  # ~1% per rank is acceptable for BF16
-    passed = rel_error < max_rel_error_threshold and consistency_diff < 0.01
+    passed = (rel_error < max_rel_error_threshold
+              and rel_error_torch < max_rel_error_threshold
+              and consistency_diff < 0.01)
 
     sym_buffer.destroy()
     dist.barrier()
 
-    return passed, max_diff, mean_diff, rel_error, consistency_diff
+    return (passed, max_diff, mean_diff, rel_error, consistency_diff,
+            max_diff_torch, rel_error_torch)
 
 
 def run_test(local_rank: int, num_local_ranks: int, run_all: bool = False):
@@ -160,8 +197,9 @@ def run_test(local_rank: int, num_local_ranks: int, run_all: bool = False):
         print(f"  BF16 GEMM-RS Correctness Test (Pull-based): {num_ranks} GPUs")
         print(f"  Testing {len(shapes)} shapes {'(full suite)' if run_all else '(basic suite)'}")
         print(f"{'='*80}\n")
-        print(f"{'Shape (M/rank×N×K)':<22} | {'Max Diff':>9} {'Mean Diff':>10} {'Rel Err':>9} {'Consist':>9} | {'Status'}")
-        print(f"{'-'*22} | {'-'*9} {'-'*10} {'-'*9} {'-'*9} | {'-'*8}")
+        print(f"{'Shape (M/rank×N×K)':<22} | {'Max Diff':>9} {'Rel Err':>9} {'Consist':>9} | "
+              f"{'vs Torch Max':>12} {'vs Torch Rel':>12} | {'Status'}")
+        print(f"{'-'*22} | {'-'*9} {'-'*9} {'-'*9} | {'-'*12} {'-'*12} | {'-'*8}")
 
     all_passed = True
     results = []
@@ -170,13 +208,15 @@ def run_test(local_rank: int, num_local_ranks: int, run_all: bool = False):
         total_m = tokens_per_rank * num_ranks
 
         try:
-            passed, max_diff, mean_diff, rel_error, consistency_diff = run_single_shape_test(
+            (passed, max_diff, mean_diff, rel_error, consistency_diff,
+             max_diff_torch, rel_error_torch) = run_single_shape_test(
                 rank_idx, num_ranks, local_rank, group,
                 tokens_per_rank, n_dim, k_dim
             )
         except Exception as e:
             passed = False
             max_diff = mean_diff = rel_error = consistency_diff = float('nan')
+            max_diff_torch = rel_error_torch = float('nan')
             if rank_idx == 0:
                 print(f"  ❌ ERROR: {e}")
 
@@ -185,7 +225,8 @@ def run_test(local_rank: int, num_local_ranks: int, run_all: bool = False):
         if rank_idx == 0:
             status = "✅ PASS" if passed else "❌ FAIL"
             shape_str = f"{tokens_per_rank}×{n_dim}×{k_dim}"
-            print(f"{shape_str:<22} | {max_diff:>9.6f} {mean_diff:>10.7f} {rel_error:>9.6f} {consistency_diff:>9.6f} | {status}")
+            print(f"{shape_str:<22} | {max_diff:>9.6f} {rel_error:>9.6f} {consistency_diff:>9.6f} | "
+                  f"{max_diff_torch:>12.6f} {rel_error_torch:>12.6f} | {status}")
 
         if not passed:
             all_passed = False
