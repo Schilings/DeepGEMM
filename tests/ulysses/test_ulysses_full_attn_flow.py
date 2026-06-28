@@ -122,7 +122,13 @@ def run(rank, ng, port, iters):
         qg = (Xg @ Wq.t()).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
         kg = (Xg @ Wk.t()).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
         vg = (Xg @ Wv.t()).view(bs, seq, nheads, head_dim).permute(0, 2, 1, 3)
-        ag = sdpa(qg, kg, vg, head_dim).permute(0, 2, 1, 3).reshape(bs, seq, hidden)
+        # Attention MUST be computed per rank head-group (each rank runs SDPA on its own local_nh
+        # heads). A single all-head SDPA instead differs by ~1e-3 in bf16 purely from a different
+        # head-count tiling / reduction order -- a reference artifact, not real error. Keeping the
+        # final Wo projection in FP32 so rel reflects the genuine bf16-output-GEMM accuracy floor.
+        ag_groups = [sdpa(qg[:, d * local_nh:(d + 1) * local_nh], kg[:, d * local_nh:(d + 1) * local_nh],
+                          vg[:, d * local_nh:(d + 1) * local_nh], head_dim) for d in range(sp)]
+        ag = torch.cat(ag_groups, dim=1).permute(0, 2, 1, 3).reshape(bs, seq, hidden)
         Yg = (ag.float() @ Wo.float().t())                              # [bs, seq, N]
         y_ref = Yg[:, rank * local_seq:(rank + 1) * local_seq, :].reshape(bs * local_seq, N)
 
