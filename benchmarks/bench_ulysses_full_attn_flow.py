@@ -63,6 +63,11 @@ SHAPES = [
 ]
 
 
+def kfmt(n):
+    """Human-readable token count: 32768 -> '32K', 131072 -> '128K', non-multiples kept as-is."""
+    return f"{n // 1024}K" if n >= 1024 and n % 1024 == 0 else str(n)
+
+
 def build_wqkv_rankmajor(Wq, Wk, Wv, sp, local_nh, hd):
     """Rank-major [Q,K,V] head-group blocks: rows[d*local_n:(d+1)*local_n] = [Q(d),K(d),V(d)]."""
     rows = local_nh * hd
@@ -250,7 +255,7 @@ def run(rank, ng, port, iters):
             sp_cg_a = (t_pre_a + t_post_a) / cg_o if cg_o > 0 else 0.0
 
             if rank == 0:
-                tag = f"h{hidden} nh{nheads} {lbs}x{lseq} L{llocal_seq}"
+                tag = f"h{hidden} nh{nheads} {lbs}x{kfmt(lseq)} L{kfmt(llocal_seq)}"
                 print(f"{tag:<28} {layout:>4} | "
                       f"{t_pre_o:>5.0f}/{t_pre_t:>5.0f}/{t_pre_a:<5.0f} {t_attn:>6.0f} "
                       f"{t_post_o:>5.0f}/{t_post_t:>5.0f}/{t_post_a:<5.0f} | "
