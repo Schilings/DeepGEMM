@@ -1,6 +1,8 @@
 """
-Full Ulysses SP attention flow, with correctness end-to-end and profiling of ONLY the post-attn
-A2A-transpose + Wo GEMM (our op).
+Ulysses SP **POST-ATTN** flow, with correctness end-to-end and profiling of ONLY the post-attn
+A2A-transpose + Wo GEMM (our op `bf16_a2a_transpose_gemm_nt`). The pre-attn QKV proj + A2A here
+is done with plain torch/NCCL (reference path); see test_ulysses_pre_attn_flow.py for the fused
+pre-attn op, and test_ulysses_full_attn_flow.py for both fused ops end-to-end.
 
 Flow per rank r (sp_size = world_size, sequence-parallel input):
   X_local[bs, local_seq, hidden]                       # rank r owns seq shard [r*local_seq:...]

@@ -2,7 +2,10 @@
 
 > 入口符号：`bf16_gemm_a2a_transpose_nt`
 > 设计文档：`docs/GEMM_A2A_TRANSPOSE_DESIGN.md`
-> test / bench：`tests/test_gemm_a2a_transpose.py` / `benchmarks/bench_gemm_a2a_transpose.py`
+> 单算子 test / bench：`tests/test_gemm_a2a_transpose.py` / `benchmarks/bench_gemm_a2a_transpose.py`
+> Ulysses 端到端 test：`tests/test_ulysses_pre_attn_flow.py`（pre-attn 融合 QKV proj+A2A）、
+> `tests/test_ulysses_full_attn_flow.py`（pre+post 两算子端到端）；post-attn 对照见
+> `tests/test_ulysses_post_attn_flow.py` / `tests/test_ulysses_post_attn_varlen_thd.py`
 
 ---
 

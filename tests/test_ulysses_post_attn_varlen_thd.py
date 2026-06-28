@@ -1,8 +1,9 @@
 """
-Verify the claim: with THD (packed varlen) Ulysses SP, the sequence dimension can be split
-UNIFORMLY across the whole packed total_tokens (not per-sequence). If so, the post-attn
-A2A-transpose is a plain uniform split == our existing seq_major kernel (bs=1, seq=total_tokens),
-and NO cu_seqlens-aware "dyn-seq" comm kernel is needed (cu_seqlens only matters inside attention).
+**POST-ATTN** varlen (THD) verification. Verify the claim: with THD (packed varlen) Ulysses SP,
+the sequence dimension can be split UNIFORMLY across the whole packed total_tokens (not
+per-sequence). If so, the post-attn A2A-transpose is a plain uniform split == our existing
+seq_major kernel (bs=1, seq=total_tokens), and NO cu_seqlens-aware "dyn-seq" comm kernel is needed
+(cu_seqlens only matters inside attention). Op under test: `bf16_a2a_transpose_gemm_nt` (seq_major).
 
 Flow per rank r (sp = world_size), packed THD, uniform token split:
   X_local[T_local, hidden]                              # rank r owns packed tokens [r*T_local:...]
