@@ -127,6 +127,13 @@ from .gemm_rs import (
     bf16_gemm_rs_nt,
 )
 
+# GEMM + A2A-transpose kernels (Ulysses SP pre-attention, dual of a2a_transpose_gemm)
+from .gemm_a2a_transpose import (
+    GemmA2ATransposeSymmBuffer,
+    get_symm_buffer_for_gemm_a2a_transpose,
+    bf16_gemm_a2a_transpose_nt,
+)
+
 
 
 

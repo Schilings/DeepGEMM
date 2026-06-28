@@ -46,6 +46,8 @@
 | **GEMM-RS** | `bf16_gemm_rs_nt` | `GEMM_RS_DESIGN.md` | `GEMM_RS_ITERATION.md` | `FLUX_GEMM_RS_STUDY.md` | `tests/test_gemm_rs.py` / `benchmarks/bench_gemm_rs.py` |
 | **AG-GEMM** | `bf16_ag_gemm_nt` | （见 ITERATION 背景节） | `AG_GEMM_ITERATION.md` | `AG_GEMM_FLUX_REFERENCE.md` | `tests/test_ag_gemm.py` / `benchmarks/bench_ag_gemm.py` |
 | **A2A-GEMM** | `bf16_a2a_gemm_nt` | `A2A_GEMM_DESIGN.md`（旧token-A2A）+ `A2A_TRANSPOSE_GEMM_DESIGN.md`（Ulysses重写目标）| `A2A_GEMM_ITERATION.md` | flux `src/a2a_transpose_gemm` | `tests/test_a2a_gemm.py` / `benchmarks/bench_a2a_gemm.py` |
+| **A2A-transpose-GEMM**（Ulysses post-attn）| `bf16_a2a_transpose_gemm_nt` | `A2A_TRANSPOSE_GEMM_DESIGN.md` | （见 DESIGN 顶部）| flux `src/a2a_transpose_gemm` | `tests/test_a2a_transpose_gemm.py` / `benchmarks/bench_a2a_transpose_gemm.py` |
+| **GEMM-A2A-transpose**（Ulysses **pre-attn**）| `bf16_gemm_a2a_transpose_nt` | `GEMM_A2A_TRANSPOSE_DESIGN.md` | `GEMM_A2A_TRANSPOSE_ITERATION.md` | GEMM-RS（直接改写）/ A2A-transpose-GEMM（对偶）| `tests/test_gemm_a2a_transpose.py` / `benchmarks/bench_gemm_a2a_transpose.py` |
 
 **通用知识（所有算子都应吸收）**：
 - `docs/PROGRESS.md`：**算子进度总览 / 索引** —— 先看这里挑选/确认目标算子的当前状态与分支/tag。

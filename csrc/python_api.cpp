@@ -9,6 +9,7 @@
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/gemm_rs.hpp"
+#include "apis/gemm_a2a_transpose.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega.hpp"
 
@@ -29,6 +30,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::hyperconnection::register_apis(m);
     deep_gemm::gemm::register_apis(m);
     deep_gemm::gemm_rs::register_apis(m);
+    deep_gemm::gemm_a2a_transpose::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::ag_gemm::register_apis(m);
 
