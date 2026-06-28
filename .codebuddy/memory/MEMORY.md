@@ -18,6 +18,12 @@
 - 接口坑：dense 用 **[B,S,H,D]**（非 BHSD）；varlen 用 [T,H,D]+cu_seqlens（关键字传，第 4 个位置是 qv）；无 dropout_p；返回可能是 tuple。
 - 测试/bench 统一经 `tests/ulysses/fa4_attn.py` 的 `fa4_attn_bhsd` / `fa4_attn_varlen_thd` 调用。
 
+## 待办 / TODO
+- **Ulysses bench 加 async Ulysses baseline**（2026-06-28 用户提出，未做）：
+  当前 torch-native PRE 是串行（整块 QKV GEMM → 一次完整 A2A，不重叠）。需补一条 async Ulysses：
+  把 Q/K/V 拆开分别算，用多 stream 做计算-通信流水线重叠（Q GEMM 完即发 A2A，同时算 K，依此类推），
+  作为比串行 torch-native 更强的对照，以体现融合算子（单 kernel epilogue scatter 重叠）相对手工重叠的额外收益。
+
 ## 仓库结构 / 语义
 - `tests/` 按职责分子目录：`core/`（单卡正确性/性能 + 共享 `generators.py` + sanitizer，必须同目录）、
   `comm/`（通信融合 GEMM）、`ulysses/`（Ulysses SP 端到端 pre/post/full）、`debug/`。
