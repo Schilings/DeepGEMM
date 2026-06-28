@@ -22,7 +22,7 @@ def import_baseline():
         from tilelang.profiler.bench import do_bench
         spec = importlib.util.spec_from_file_location(
             'tilelang_ops',
-            os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'third-party', 'tilelang_ops', '__init__.py'))
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'third-party', 'tilelang_ops', '__init__.py'))
         tilelang_ops = importlib.util.module_from_spec(spec)
         sys.modules['tilelang_ops'] = tilelang_ops
         spec.loader.exec_module(tilelang_ops)
