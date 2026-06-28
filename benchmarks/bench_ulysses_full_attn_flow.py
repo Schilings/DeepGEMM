@@ -8,12 +8,21 @@ Chain per rank r (sp = world_size, sequence-parallel input):
     --[ATTN] attention (FlashAttention-4) -------->  attn  [bs, local_nh, seq, hd]
     --[POST] A2A-transpose + Wo GEMM (overlapped)->  y     [bs*local_seq, N]
 
-For each shape and layout we compare:
-  fused chain = PRE(ours) + ATTN + POST(ours, comm/GEMM overlapped)
-  torch chain = PRE(matmul + a2a) + ATTN + POST(a2a + matmul)
-ATTN is identical on both paths (not optimized here), so we report BOTH:
-  * e2e speedup        = torch-chain / fused-chain         (honest full-chain number)
-  * comm+GEMM speedup  = (PRE+POST torch)/(PRE+POST ours)   (where the fused ops actually help)
+For each shape and layout we compare THREE chains:
+  fused chain = PRE(ours)                 + ATTN + POST(ours, comm/GEMM overlapped)
+  torch chain = PRE(matmul + a2a, serial) + ATTN + POST(a2a + matmul, serial)
+  async chain = PRE(split-QKV multi-stream overlap) + ATTN + POST(token-chunk multi-stream overlap)
+ATTN is identical on all paths (not optimized here), so we report speedups vs BOTH baselines:
+  * e2e speedup        = (torch | async)-chain / fused-chain          (honest full-chain numbers)
+  * comm+GEMM speedup  = (PRE+POST torch | async)/(PRE+POST ours)     (where the fused ops actually help)
+
+ASYNC ULYSSES baseline (stronger, hand-rolled overlap): instead of the serial torch path (one big QKV
+GEMM -> one full all_to_all), it splits the work and pipelines compute vs comm on >=2 CUDA streams:
+  * PRE : split into Q/K/V -> 3 separate GEMM + 3 separate A2A; A2A(Q) overlaps the K GEMM, etc.
+  * POST: split tokens into chunks -> per-chunk (transpose-scatter + A2A); chunk A2As overlap the
+          Wo GEMM of already-arrived chunks.
+This is the fair "manual multi-stream overlap" reference; our fused ops instead overlap inside a single
+kernel (epilogue scatter), so the gap async->ours isolates the extra gain over hand-rolled overlap.
 
 EQUIVALENCE (BSHD vs THD): a shape (bs, nheads, seq, hd) is run as
   * BSHD: `bs` sequences of length `seq`, batched   -> tokens = bs*seq.
@@ -92,15 +101,16 @@ def run(rank, ng, port, iters):
         return tot / it * 1000.0  # us
 
     if rank == 0:
-        print(f"\n{'='*126}")
-        print(f"  Ulysses FULL attn-chain speedup (fused 2 ops vs torch-native): {ng} GPUs, iters={iters}")
+        print(f"\n{'='*132}")
+        print(f"  Ulysses FULL attn-chain speedup (fused 2 ops vs torch-native vs async-Ulysses): {ng} GPUs, iters={iters}")
         print(f"  GPU: {torch.cuda.get_device_name(rank)}   "
               f"(SQUARE weights: Wq/Wk/Wv/Wo=[hidden,hidden], Wqkv=[3*hidden,hidden]; hidden=N=nh*hd)")
-        print(f"{'='*126}")
+        print(f"  times in us = ours/torch/async ; speedups = vs_torch/vs_async (x)")
+        print(f"{'='*132}")
         print(f"{'(bs,nh,seq,hd) hid':<22} {'lay':>4} | "
-              f"{'pre ours/torch':>14} {'attn':>7} {'post ours/torch':>15} | "
-              f"{'e2e ours/torch':>16} {'e2e':>6} | {'c+g':>5}")
-        print('-' * 126)
+              f"{'pre o/t/a':>17} {'attn':>6} {'post o/t/a':>17} | "
+              f"{'e2e o/t/a':>17} | {'e2e t/a':>9} | {'c+g t/a':>9}")
+        print('-' * 132)
 
     results = []
     for (bs, nheads, seq, head_dim) in SHAPES:
@@ -120,6 +130,7 @@ def run(rank, ng, port, iters):
         Wqkv = build_wqkv_rankmajor(Wq, Wk, Wv, sp, local_nh, head_dim)   # [3*hidden, hidden]
         Wqkv_t = Wqkv.t().contiguous()
         Wo_t = Wo.t().contiguous()
+        Wq_t = Wq.t().contiguous(); Wk_t = Wk.t().contiguous(); Wv_t = Wv.t().contiguous()  # async-PRE split GEMMs
         n_qkv = 3 * hidden
         local_nqkv = n_qkv // sp                 # = 3*local_nh*hd
 
@@ -173,32 +184,89 @@ def run(rank, ng, port, iters):
                 gathered = recv_po.permute(1, 2, 0, 3, 4).reshape(local_m, sp * local_nh * head_dim)
                 torch.matmul(gathered, Wo_t)
 
+            # ---- async-Ulysses PRE: split Q/K/V -> 3 GEMM + 3 A2A, multi-stream compute/comm overlap ----
+            qkv_feat = local_nh * head_dim                 # per-(Q|K|V) local feature width; hidden = sp*qkv_feat
+            Wt_qkv = (Wq_t, Wk_t, Wv_t)
+            send_qkv = [torch.empty((sp, lbs, llocal_seq, qkv_feat), dtype=torch.bfloat16, device=dev) for _ in range(3)]
+            recv_qkv = [torch.empty_like(s) for s in send_qkv]
+            comm_stream = torch.cuda.Stream()
+
+            def pre_async():
+                comp = torch.cuda.current_stream()
+                done = []
+                for i in range(3):                          # Q, K, V
+                    d = torch.matmul(X_local, Wt_qkv[i]).view(lbs, llocal_seq, sp, qkv_feat)
+                    send_qkv[i].copy_(d.permute(2, 0, 1, 3))
+                    ev = torch.cuda.Event(); ev.record(comp)
+                    with torch.cuda.stream(comm_stream):    # A2A(i) overlaps GEMM(i+1) on comp stream
+                        comm_stream.wait_event(ev)
+                        dist.all_to_all_single(recv_qkv[i], send_qkv[i], group=group)
+                        de = torch.cuda.Event(); de.record(comm_stream); done.append(de)
+                for de in done:
+                    comp.wait_event(de)
+
+            # ---- async-Ulysses POST: split tokens into chunks -> per-chunk (scatter+A2A) overlaps Wo GEMM ----
+            nseg = 4
+            while llocal_seq % nseg:
+                nseg //= 2                                  # llocal_seq is a multiple of 128 -> ends at nseg>=1
+            seg = llocal_seq // nseg
+            send_seg = [torch.empty((sp, lbs, seg, local_nh, head_dim), dtype=torch.bfloat16, device=dev) for _ in range(nseg)]
+            recv_seg = [torch.empty_like(s) for s in send_seg]
+            comm_stream_po = torch.cuda.Stream()
+
+            def post_async():
+                comp = torch.cuda.current_stream()
+                src = x_bhsd.view(lbs, local_nh, sp, llocal_seq, head_dim).permute(2, 0, 3, 1, 4)  # non-contig view
+                base = torch.cuda.Event(); base.record(comp)
+                done = []
+                with torch.cuda.stream(comm_stream_po):     # pipeline all chunk scatter+A2A on comm stream
+                    comm_stream_po.wait_event(base)
+                    for c in range(nseg):
+                        send_seg[c].copy_(src[:, :, c * seg:(c + 1) * seg])
+                        dist.all_to_all_single(recv_seg[c], send_seg[c], group=group)
+                        ev = torch.cuda.Event(); ev.record(comm_stream_po); done.append(ev)
+                for c in range(nseg):                        # GEMM(c) waits A2A(c); overlaps later A2As
+                    comp.wait_event(done[c])
+                    gc = recv_seg[c].permute(1, 2, 0, 3, 4).reshape(lbs * seg, sp * local_nh * head_dim)
+                    torch.matmul(gc, Wo_t)
+
             t_pre_o = time_call(pre_fused, iters)
             t_pre_t = time_call(pre_torch, iters)
+            t_pre_a = time_call(pre_async, iters)
             t_post_o = time_call(post_fused, iters, resets=[sym_post.reset_barriers])
             t_post_t = time_call(post_torch, iters)
+            t_post_a = time_call(post_async, iters)
 
             e2e_o = t_pre_o + t_attn + t_post_o
             e2e_t = t_pre_t + t_attn + t_post_t
-            sp_e2e = e2e_t / e2e_o if e2e_o > 0 else 0.0
-            sp_cg = (t_pre_t + t_post_t) / (t_pre_o + t_post_o) if (t_pre_o + t_post_o) > 0 else 0.0
+            e2e_a = t_pre_a + t_attn + t_post_a
+            cg_o = t_pre_o + t_post_o
+            sp_e2e_t = e2e_t / e2e_o if e2e_o > 0 else 0.0
+            sp_e2e_a = e2e_a / e2e_o if e2e_o > 0 else 0.0
+            sp_cg_t = (t_pre_t + t_post_t) / cg_o if cg_o > 0 else 0.0
+            sp_cg_a = (t_pre_a + t_post_a) / cg_o if cg_o > 0 else 0.0
 
             if rank == 0:
                 tag = f"({bs},{nheads},{seq},{head_dim}) {hidden}"
                 print(f"{tag:<22} {layout:>4} | "
-                      f"{t_pre_o:>6.0f}/{t_pre_t:<7.0f} {t_attn:>7.0f} {t_post_o:>6.0f}/{t_post_t:<8.0f} | "
-                      f"{e2e_o:>7.0f}/{e2e_t:<8.0f} {sp_e2e:>5.2f}x | {sp_cg:>4.2f}x")
-                results.append({'layout': layout, 'sp_e2e': sp_e2e, 'sp_cg': sp_cg})
+                      f"{t_pre_o:>5.0f}/{t_pre_t:>5.0f}/{t_pre_a:<5.0f} {t_attn:>6.0f} "
+                      f"{t_post_o:>5.0f}/{t_post_t:>5.0f}/{t_post_a:<5.0f} | "
+                      f"{e2e_o:>5.0f}/{e2e_t:>5.0f}/{e2e_a:<5.0f} | "
+                      f"{sp_e2e_t:>4.2f}/{sp_e2e_a:<4.2f} | {sp_cg_t:>4.2f}/{sp_cg_a:<4.2f}")
+                results.append({'layout': layout, 'sp_e2e_t': sp_e2e_t, 'sp_e2e_a': sp_e2e_a,
+                                'sp_cg_t': sp_cg_t, 'sp_cg_a': sp_cg_a})
             sym_pre.destroy(); sym_post.destroy(); dist.barrier()
 
     if rank == 0 and results:
         geo = lambda xs: math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else 0.0
-        print('-' * 126)
+        col = lambda lay, k: [r[k] for r in results if r['layout'] == lay and r[k] > 0]
+        print('-' * 132)
         for lay in ('BSHD', 'THD'):
-            e = [r['sp_e2e'] for r in results if r['layout'] == lay and r['sp_e2e'] > 0]
-            c = [r['sp_cg'] for r in results if r['layout'] == lay and r['sp_cg'] > 0]
-            print(f"  {lay}: geo_mean e2e speedup = {geo(e):.3f}x   |   geo_mean comm+GEMM speedup = {geo(c):.3f}x")
-        print('=' * 126 + '\n')
+            print(f"  {lay}: geo_mean e2e speedup     vs_torch = {geo(col(lay, 'sp_e2e_t')):.3f}x"
+                  f"   vs_async = {geo(col(lay, 'sp_e2e_a')):.3f}x")
+            print(f"        geo_mean comm+GEMM speedup vs_torch = {geo(col(lay, 'sp_cg_t')):.3f}x"
+                  f"   vs_async = {geo(col(lay, 'sp_cg_a')):.3f}x")
+        print('=' * 132 + '\n')
     dist.destroy_process_group(); os._exit(0)
 
 

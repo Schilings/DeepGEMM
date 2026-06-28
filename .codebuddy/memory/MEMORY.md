@@ -19,10 +19,17 @@
 - 测试/bench 统一经 `tests/ulysses/fa4_attn.py` 的 `fa4_attn_bhsd` / `fa4_attn_varlen_thd` 调用。
 
 ## 待办 / TODO
-- **Ulysses bench 加 async Ulysses baseline**（2026-06-28 用户提出，未做）：
-  当前 torch-native PRE 是串行（整块 QKV GEMM → 一次完整 A2A，不重叠）。需补一条 async Ulysses：
-  把 Q/K/V 拆开分别算，用多 stream 做计算-通信流水线重叠（Q GEMM 完即发 A2A，同时算 K，依此类推），
-  作为比串行 torch-native 更强的对照，以体现融合算子（单 kernel epilogue scatter 重叠）相对手工重叠的额外收益。
+- （已完成 2026-06-28）~~Ulysses bench 加 async Ulysses baseline~~ → 见下「Ulysses bench async 基线」。
+
+## Ulysses bench async-Ulysses 基线（2026-06-28 完成）
+- 文件 `benchmarks/bench_ulysses_full_attn_flow.py` 现对比**三条链路**：fused(ours) / torch-native(串行) / async-Ulysses(手工多 stream 重叠)。
+- async PRE：拆 Q/K/V → 用 `Wq_t/Wk_t/Wv_t` 各做一次 GEMM + 各发一次 `all_to_all_single`，
+  comp 默认流算 GEMM、`comm_stream` 侧流发 A2A，event 串依赖：A2A(Q) 与 K 的 GEMM 重叠。
+- async POST：token 维 `llocal_seq` 切 `nseg`(≤4，按 128 整除回退) 块，逐块在 `comm_stream_po` 上 scatter+A2A 流水线，
+  comp 流上各块 GEMM 等自己那块 A2A 完成 → 与后续块 A2A 重叠（split-token，非 split-K）。
+- 表格列：时间 `us=ours/torch/async`，加速比 `vs_torch/vs_async`；汇总 geo_mean 同时给两个口径。
+- 文档 `docs/ULYSSES_FULL_ATTN_BENCH.md` 第 1 节已补三链路说明；第 4 节结果表标注为加 async 前的旧数据，async 列待 B300×8 重跑补全。
+- 注意：脚本只 `py_compile` 过，**尚未真正多卡跑过**，下次需实跑验证（NCCL 双流重叠正确性 + 数字）。
 
 ## 仓库结构 / 语义
 - `tests/` 按职责分子目录：`core/`（单卡正确性/性能 + 共享 `generators.py` + sanitizer，必须同目录）、
