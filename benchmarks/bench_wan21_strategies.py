@@ -18,8 +18,16 @@ from wan21.bench_utils import find_free_port, time_call, rel_diff, gather_to_ran
 
 WAN21_SHAPES = [
     (40, 8192,  128,  4, 16, 128, '8K verify'),
-    (40, 32768, 128, 21, 30, 52,  '480p 32K'),
-    (40, 75776, 128, 21, 45, 80,  '720p 74K'),
+    # 480p 81 frames: T=21, H=30, W=52 → 32760 tokens (pad 32768 for sp=8)
+    (40, 32768, 128, 21, 30, 52,  '480p 81f'),
+    # 720p 81 frames: T=21, H=45, W=80 → 75600 tokens (pad 75776)
+    (40, 75776, 128, 21, 45, 80,  '720p 81f'),
+    # 1080p 81 frames: T=21, H=67, W=120 → 168840 tokens (pad 172032 = 168*1024)
+    (40, 172032, 128, 21, 67, 120, '1080p 81f'),
+    # 480p x2 videos (batch=2): 2*32760 = 65520 tokens (pad 65536)
+    (40, 65536, 128, 42, 30, 52,  '480p x2'),
+    # 720p x2 videos (batch=2): 2*75600 = 151200 tokens (pad 151552)
+    (40, 151552, 128, 42, 45, 80, '720p x2'),
 ]
 
 def get_strategy(name, cfg, sp_cfg):
