@@ -60,6 +60,12 @@ SHAPES = [
     (1, 64, 65536,  128),   # hidden=8192  | 1 sequence of  64K tokens  (per-rank  8K)
     (1, 32, 131072, 128),   # hidden=4096  | 1 sequence of 128K tokens  (per-rank 16K)
     (2, 32, 32768,  128),   # hidden=4096  | BSHD 2x32K ; THD packs to 1x64K (BSHD==THD demo)
+    # 🌟 Wan2.1 attention shapes (vae_stride=(4,8,8), patch=(1,2,2); 81帧→T_latent=21)
+    #   seq = (T/4)×(H/16)×(W/16); 480p 832×480: 21×30×52=32760→pad 32768; 720p 1280×720: 21×45×80=75600→pad 75776
+    (1, 40, 32768,  128),   # 🌟 Wan2.1 14B 480p 81帧 | hidden=5120 nh=40 | per-rank 4K
+    (1, 40, 75776,  128),   # 🌟 Wan2.1 14B 720p 81帧 | hidden=5120 nh=40 | per-rank 9472
+    (1, 16, 32768,  128),   # 🌟 Wan2.1 1.3B 480p 81帧| hidden=2048 nh=16 | per-rank 4K
+    (1, 16, 75776,  128),   # 🌟 Wan2.1 1.3B 720p 81帧| hidden=2048 nh=16 | per-rank 9472
 ]
 
 
