@@ -1,6 +1,6 @@
 # 算子开发进度总览（索引）
 
-> 最后更新：2026-06-22
+> 最后更新：2026-06-30
 > 用途：**新会话据此挑选/确认目标算子**，再读该算子的 `*_DESIGN` / `*_ITERATION` 文档接班继续开发。
 > 规则见 `docs/RULE.md`；接班流程见 `docs/SESSION_MEMORY.md`。
 
@@ -15,6 +15,37 @@
 | **GEMM-A2A-transpose**（Ulysses **pre-attn**，GEMM+A2A）| `bf16_gemm_a2a_transpose_nt` | 8卡 geo vs sep **1.42x** / vs torch-native **1.54x**；4卡 vs sep **1.44x** / vs torch **1.55x**；fused 平均 ~1190 TFLOPS | **{2,4,8} 全 PASS**，max_diff/rel/consist **恒 0.0**（纯排列，逐元素等于精确参考；torch `matmul+all_to_all` 亦 0.0）| `main`（单 kernel，抄 GEMM-RS 改 N 切分+删 reduce+转置散射）| `GEMM_A2A_TRANSPOSE_DESIGN.md` / `GEMM_A2A_TRANSPOSE_ITERATION.md` |
 | **A2A-GEMM**（旧 token-A2A，**语义错误**）| `bf16_a2a_gemm_nt` | — | ⚠️ **3/6 FAIL** + 语义错位（token(M)-A2A，非 Ulysses）→ 已被上面的 transpose 版取代 | `main`（保留未删）| `A2A_GEMM_ITERATION.md` / `A2A_GEMM_DESIGN.md`（旧）|
 | **AG-GEMM** | `bf16_ag_gemm_nt` | geo **~1.13x**（8 卡）| PASS | `main`（仅 PDL 默认开启被保留）| `AG_GEMM_ITERATION.md` / `AG_GEMM_FLUX_REFERENCE.md` |
+
+---
+
+## Wan2.1 14B Ulysses SP Attention Benchmark（2026-06-30 新增）
+
+> 详见 `docs/WAN21_ULYSSES_BENCH.md`。代码在 `benchmarks/wan21/`。
+
+真实 Wan2.1 14B 训练场景（THD/PackedSequence），三条策略对比 FWD+BWD：
+
+| 策略 | PRE | POST | BWD POST | BWD PRE |
+|------|-----|------|----------|---------|
+| **serial** (baseline) | matmul + NCCL A2A | NCCL A2A + matmul | serial A2A-inv + matmul | serial A2A-inv + matmul |
+| **fused_std** | `bf16_gemm_a2a_transpose_nt` | `bf16_a2a_transpose_gemm_nt_fused` | serial A2A-inv + matmul | serial A2A-inv + matmul |
+| **fused_var** | `bf16_gemm_a2a_transpose_nt` | `bf16_gemm_rs_nt` (Wo 行拆分) | **`bf16_ag_gemm_nt`** (AG+GEMM) | serial A2A-inv + matmul |
+
+8 GPU B300 结果（FWD+BWD, us）：
+
+| Shape | serial | fused_std | fused_var | 加速比 |
+|-------|--------|-----------|-----------|--------|
+| 1x8K | 4821 | 6470 | **4335** | 1.11x |
+| 1x32K | 18261 | 19131 | **17008** | 1.07x |
+| 1x74K | 74746 | 74163 | **71972** | 1.04x |
+| 1x168K | 341607 | 337642 | **334064** | 1.02x |
+| 1x64K | 58657 | 57613 | **56456** | 1.04x |
+| 1x148K | 268541 | 266519 | **263839** | 1.02x |
+
+- **fused_var 全面最优**：所有 shape FWD+BWD 都最快
+- **正确性**：2卡 1x8K serial verify → FWD rel=0.0019, BWD grad_X=0.0016, grad_W=0.0034 → PASS
+- **后续优化**：BWD PRE 的 A2A-inverse 尚未用融合算子；attention 是长序列瓶颈可考虑 SP+CP
+
+---
 
 > 每个算子的「最新当前状态 / 接班信息」见对应 `*_ITERATION.md` 顶部「当前状态」节，
 > 本表只做一行总览，避免与各算子文档重复维护细节。
