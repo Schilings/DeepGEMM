@@ -1,26 +1,36 @@
-"""Fused Variant Ulysses: GEMM+A2A (PRE) + GEMM+RS (POST).
-BWD: PRE uses A2A+GEMM (serial), POST uses AG+GEMM (fused).
+"""Fused Variant Ulysses: GEMM+A2A (PRE fwd) + GEMM+RS (POST fwd).
+
+BWD uses DUAL fused ops:
+  POST_bwd: AG+GEMM (bf16_ag_gemm_nt) — all-gather grad_y then GEMM with Wo_r_local
+  PRE_bwd:  A2A+GEMM (serial A2A-inv + matmul) — inverse of GEMM+A2A forward
+
+Weight grads computed serially.
 """
 
 import torch
 import torch.distributed as dist
 from .base import UlyssesBase
-from ..model import build_wqkv_rankmajor
 
 
 class FusedVariantUlysses(UlyssesBase):
     def _create_buffers(self):
         from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
         from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs
+        from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm
         n_qkv = self.cfg.n_qkv
         local_N = self.cfg.dim // self.sp_size
         local_m = self.local_m
-        # PRE buffer
+        # PRE forward: GEMM+A2A
         self.sym_pre = get_symm_buffer_for_gemm_a2a_transpose(
             self.group, self.bs, self.seq, n_qkv)
-        # POST forward: GEMM+RS
+        # POST forward: GEMM+RS (A=attn_local[local_m, local_hidden], B=Wo_r_local[local_N, local_hidden])
         self.sym_gemm_rs = get_symm_buffer_for_gemm_rs(self.group, local_m, local_N)
-        # POST backward: AG+GEMM (created lazily when needed)
+        # POST backward: AG+GEMM
+        # A_local = grad_y [local_m, local_N], all-gather on token dim → [full_m, local_N]
+        # B = Wo_r_local [local_hidden, local_N] (NT layout)
+        # d = A_gathered @ B^T = [full_m, local_hidden]
+        # hidden = local_N (the gather input feature width)
+        self.sym_ag_gemm = get_symm_buffer_for_bf16_ag_gemm(self.group, local_m, local_N)
         # Wo row-split per rank
         rank = self.group.rank()
         Wo = self.model.o_proj.weight
@@ -33,6 +43,8 @@ class FusedVariantUlysses(UlyssesBase):
         if hasattr(self, 'sym_pre'): self.sym_pre.destroy()
         if hasattr(self, 'sym_gemm_rs'):
             self.sym_gemm_rs.handle = None; self.sym_gemm_rs.buffer = None; self.sym_gemm_rs.group = None
+        if hasattr(self, 'sym_ag_gemm'):
+            self.sym_ag_gemm.handle = None; self.sym_ag_gemm.buffer = None; self.sym_ag_gemm.group = None
 
     def _pre_forward(self, x_local, llseq):
         from deep_gemm import bf16_gemm_a2a_transpose_nt
@@ -43,40 +55,54 @@ class FusedVariantUlysses(UlyssesBase):
         return qkv
 
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
-        """GEMM+RS: attn_local @ Wo_r_local^T → reduce-scatter → y[lm, local_N]."""
+        """GEMM+RS: attn_local @ Wo_r_local^T → reduce-scatter → y[local_m, local_N]."""
         from deep_gemm.gemm_rs import bf16_gemm_rs_nt
-        lm = lbs * llseq if lbs != 1 else self.local_m
         local_N = self.cfg.dim // self.sp_size
-        lm_actual = self.bs * (self.seq // self.sp_size) if self.layout == 'THD' else lbs * llseq
+        lm_actual = self.bs * (self.seq // self.sp_size)
         attn_local = o.reshape(self.bs * self.seq, self.local_hidden).contiguous()
         y = torch.empty((lm_actual, local_N), dtype=torch.bfloat16, device=o.device)
         bf16_gemm_rs_nt(y, attn_local, self.Wo_r_local, self.sym_gemm_rs, lm_actual)
         return y
 
     def _post_backward(self, grad_y, cache, lbs, lseq, llseq, lm, grid, **kw):
-        """POST BWD: AG+GEMM (fused).
-        grad_y[lm, local_N] → all-gather → grad_y_full[bs*seq, local_N]
-        → GEMM(grad_y_full, Wo_r_local) → grad_attn_local[bs*seq, local_hidden]
-        Weight grad grad_Wo_r_local = grad_y_full^T @ attn_local (serial).
+        """POST BWD: AG+GEMM (bf16_ag_gemm_nt).
+
+        Forward: attn_local @ Wo_r_local^T → RS → y[local_m, local_N]
+        Backward: grad_y[local_m, local_N] → AG → grad_y_full[bs*seq, local_N]
+                  → GEMM(grad_y_full, Wo_r_local^T) → grad_attn[bs*seq, local_hidden]
+
+        bf16_ag_gemm_nt does: d = all_gather(A_local) @ B^T
+          A_local = grad_y [local_m, local_N]
+          B = Wo_r_local [local_hidden, local_N]  (NT layout, so B^T = Wo_r_local^T)
+          d = grad_attn [bs*seq, local_hidden]
         """
+        from deep_gemm.ag_gemm import bf16_ag_gemm_nt
         sp = self.sp_size
         local_N = self.cfg.dim // sp
         local_hidden = self.local_hidden
-        o = cache
-        # All-gather grad_y along seq → grad_y_seq[bs*seq, local_N]
+        o = cache  # [bs, seq, local_nh, hd]
+        full_m = self.bs * self.seq
+
+        # Fused activation grad: AG+GEMM
+        # Copy grad_y into sym buffer's x [local_m, local_N]
+        self.sym_ag_gemm.x[:lm, :local_N].copy_(grad_y)
+        grad_attn_flat = torch.empty((full_m, local_hidden), dtype=torch.bfloat16, device=grad_y.device)
+        bf16_ag_gemm_nt(grad_attn_flat, self.Wo_r_local, self.sym_ag_gemm, lm)
+        # grad_attn_flat = [full_m, local_hidden] → [bs, seq, local_nh, hd]
+        grad_attn = grad_attn_flat.reshape(self.bs, self.seq, self.local_nh, self.head_dim)
+
+        # Weight grad (serial): grad_Wo_r_local = grad_y_full^T @ attn_local
+        # Need grad_y_full: recompute from all-gather
         gy_list = [torch.empty_like(grad_y) for _ in range(sp)]
         dist.all_gather(gy_list, grad_y, group=self.group)
-        grad_y_full = torch.cat(gy_list, dim=0)  # [bs*seq, local_N]
-        # grad_attn_local = grad_y_full @ Wo_r_local → [bs*seq, local_hidden]
-        attn_local = o.reshape(self.bs * self.seq, local_hidden).contiguous()
-        grad_attn_local = torch.matmul(grad_y_full, self.Wo_r_local)
+        grad_y_full = torch.cat(gy_list, dim=0)  # [full_m, local_N]
+        attn_local = o.reshape(full_m, local_hidden).contiguous()
         grad_Wo_r_local = torch.matmul(grad_y_full.t(), attn_local)
-        # grad_attn → [bs, seq, local_nh, hd]
-        grad_attn = grad_attn_local.reshape(self.bs, self.seq, self.local_nh, self.head_dim)
+
         return grad_attn, grad_Wo_r_local
 
     def _pre_backward(self, grad_qkv, lbs, lseq, llseq, lm, x_local, **kw):
-        """PRE BWD: A2A-inverse (serial) + GEMM."""
+        """PRE BWD: A2A-inv (serial) + GEMM (serial for weight grad)."""
         sp = self.sp_size; lnq = self.local_nqkv; n_qkv = self.cfg.n_qkv
         send = grad_qkv.view(lbs, llseq, sp, lnq).permute(2, 0, 1, 3).contiguous()
         recv = torch.empty_like(send)

@@ -17,17 +17,12 @@ from wan21.model import WanSelfAttention, build_wqkv_rankmajor
 from wan21.bench_utils import find_free_port, time_call, rel_diff, gather_to_rank0
 
 WAN21_SHAPES = [
-    (40, 8192,  128,  4, 16, 128, '8K verify'),
-    # 480p 81 frames: T=21, H=30, W=52 → 32760 tokens (pad 32768 for sp=8)
-    (40, 32768, 128, 21, 30, 52,  '480p 81f'),
-    # 720p 81 frames: T=21, H=45, W=80 → 75600 tokens (pad 75776)
-    (40, 75776, 128, 21, 45, 80,  '720p 81f'),
-    # 1080p 81 frames: T=21, H=67, W=120 → 168840 tokens (pad 172032 = 168*1024)
-    (40, 172032, 128, 21, 67, 120, '1080p 81f'),
-    # 480p x2 videos (batch=2): 2*32760 = 65520 tokens (pad 65536)
-    (40, 65536, 128, 42, 30, 52,  '480p x2'),
-    # 720p x2 videos (batch=2): 2*75600 = 151200 tokens (pad 151552)
-    (40, 151552, 128, 42, 45, 80, '720p x2'),
+    (40, 8192,   128,  4, 16, 128, '1x8K'),
+    (40, 32768,  128, 21, 30, 52,  '1x32K'),
+    (40, 75776,  128, 21, 45, 80,  '1x74K'),
+    (40, 172032, 128, 21, 67, 120, '1x168K'),
+    (40, 65536,  128, 42, 30, 52,  '1x64K'),
+    (40, 151552, 128, 42, 45, 80,  '1x148K'),
 ]
 
 def get_strategy(name, cfg, sp_cfg):
@@ -56,7 +51,7 @@ def run(rank, ng, port, iters, verify, strategies):
         print(f"  Strategies: {', '.join(strategies)}")
         print(f"  dim={dim} nh={nh} hd={hd} sp={ng} local_nh={nh//ng}")
         print(f"{'='*140}")
-        print(f"{'shape':<14} {'strategy':<12} | {'FWD':>7} {'ATTN':>6} {'BWD':>7} | {'fwd':>6} {'bX':>6} {'bW':>6} | {'st':>4}")
+        print(f"{'shape':<10} {'strategy':<12} | {'FWD':>7} {'ATTN':>6} {'BWD':>7} {'F+B':>8} | {'fwd':>6} {'bX':>6} {'bW':>6} | {'st':>4}")
         print('-' * 140)
 
     for (nheads, seq, head_dim, gt, gh, gw, label) in WAN21_SHAPES:
@@ -72,7 +67,7 @@ def run(rank, ng, port, iters, verify, strategies):
         X_local = X_full[:, rank*llseq:(rank+1)*llseq, :].reshape(llseq, hidden).contiguous()
 
         ref_out = ref_gX = ref_gW_parts = ref_grad_y = None
-        do_verify = verify and 'verify' in label
+        do_verify = verify and '8K' in label
 
         for strat_name in strategies:
             sp_cfg = SPConfig(sp_size=ng, group=group, layout='THD', use_fused_ops=True)
@@ -177,7 +172,7 @@ def run(rank, ng, port, iters, verify, strategies):
                 f_r = f"{fwd_rel:.4f}" if fwd_rel >= 0 else "  -   "
                 x_r = f"{bX_rel:.4f}" if bX_rel >= 0 else "  -   "
                 w_r = f"{bW_rel:.4f}" if bW_rel >= 0 else "  -   "
-                print(f"{label:<14} {strat_name:<12} | {t_fwd:>7.0f} {t_attn:>6.0f} {t_bwd:>7.0f} | {f_r:>6} {x_r:>6} {w_r:>6} | {status:>4}")
+                print(f"{label:<10} {strat_name:<12} | {t_fwd:>7.0f} {t_attn:>6.0f} {t_bwd:>7.0f} {t_fwd+t_bwd:>8.0f} | {f_r:>6} {x_r:>6} {w_r:>6} | {status:>4}")
 
             strat.destroy_buffers()
             dist.barrier()
