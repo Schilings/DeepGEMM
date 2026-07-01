@@ -185,4 +185,4 @@ def bf16_fused_qkv_norm_a2a_nt(
         out[:, :, local_q_n+local_kv_n:].add_(
             bias[q_dim+kv_dim:].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
 
-    return out.clone(), rms
+    return out, rms  # return sym buffer view (no clone)
