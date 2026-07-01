@@ -164,7 +164,7 @@ def run(rank, ng, port, iters, verify, strategies):
                     strat.sym_post.reset_barriers(); dist.barrier(group)
                 y_test = strat.forward(X_local, grid, llseq)
                 gX, gWqkv, gWo = strat.backward(grad_y_local, X_local, grid, llseq)
-                dist.all_reduce(gWqkv, op=dist.ReduceOp.SUM, group=group)
+                # gradient sync already done inside backward() (Wqkv always; Wo unless _wo_sharded)
                 gX_full = gather_to_rank0(gX, group, ng)
                 if rank == 0 and ref_gX is not None:
                     bX_rel = rel_diff(gX_full[:ref_gX.reshape(-1,hidden).shape[0]].reshape(-1,hidden),

@@ -43,6 +43,7 @@ class FusedVariantUlysses(UlyssesBase):
             rank * local_N:(rank + 1) * local_N,
             rank * self.local_hidden:(rank + 1) * self.local_hidden].contiguous()
         self.Wo_r_local_t = self.Wo_r_local.t().contiguous()
+        self._wo_sharded = True  # Wo is row-split → weight grad is local, no all-reduce needed
 
     def destroy_buffers(self):
         if hasattr(self, 'sym_pre'): self.sym_pre.destroy()
