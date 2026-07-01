@@ -28,7 +28,8 @@ class UlyssesBase(nn.Module):
         super().__init__()
         self.cfg = config
         self.sp = sp_config
-        self.model = WanSelfAttention(config)
+        self.model = WanSelfAttention(config.dim, config.num_heads, config.head_dim,
+                                      qk_norm=config.qk_norm, eps=config.eps)
         self.scale = config.scale
         self.sp_size = sp_config.sp_size
         self.group = sp_config.group
@@ -53,13 +54,15 @@ class UlyssesBase(nn.Module):
         self._create_buffers()
 
     def _build_weights(self):
-        # Model now has fused qkv_proj [3*dim, dim] — reorder to rank-major for SP
-        Wqkv_weight = self.model.qkv_proj.weight  # [3*dim, dim] (Q,K,V concatenated)
-        Wqkv = build_wqkv_rankmajor(Wqkv_weight, self.sp_size, self.local_nh, self.head_dim)
+        # Model has separate q/k/v (official Wan2.1 layout) — reorder to rank-major for SP
+        Wq = self.model.q.weight
+        Wk = self.model.k.weight
+        Wv = self.model.v.weight
+        Wqkv = build_wqkv_rankmajor(Wq, Wk, Wv, self.sp_size, self.local_nh, self.head_dim)
         self.Wqkv = nn.Parameter(Wqkv.clone(), requires_grad=True)
         self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
-        self.Wo = self.model.o_proj.weight  # [dim, dim], managed by FSDP2 via model
-        self.Wo_t = Wo.t().contiguous()
+        self.Wo = self.model.o.weight  # [dim, dim], managed by FSDP2 via model
+        self.Wo_t = self.Wo.t().contiguous()
 
     def _create_buffers(self):
         pass

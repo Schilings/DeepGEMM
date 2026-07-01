@@ -35,7 +35,7 @@ class FusedVariantUlysses(UlyssesBase):
             self.group, self.bs, 3 * self.cfg.num_heads, self.seq, self.head_dim)
         # Wo row-split per rank — nn.Parameter for FSDP2 (ignored, grad is local)
         rank = self.group.rank()
-        Wo = self.model.o_proj.weight
+        Wo = self.model.o.weight
         Wo_r = Wo[
             rank * local_N:(rank + 1) * local_N,
             rank * self.local_hidden:(rank + 1) * self.local_hidden].contiguous()

@@ -99,10 +99,11 @@ def run(rank, ng, port, iters, verify, strategies):
 
             # Build reference BEFORE FSDP2 (it converts params to DTensor)
             if do_verify and rank == 0 and ref_out is None:
-                ref_m = WanSelfAttention(model_cfg, device=dev).to(dev)
+                ref_m = WanSelfAttention(model_cfg.dim, model_cfg.num_heads, model_cfg.head_dim,
+                                         qk_norm=model_cfg.qk_norm, eps=model_cfg.eps).to(dev)
                 ref_m.load_state_dict(strat.model.state_dict())
                 Xr = X_full.clone().requires_grad_(True)
-                yr = ref_m(Xr, grid)
+                yr = ref_m(Xr, grid, ref_m.freqs)
                 torch.manual_seed(123)
                 gy_full = torch.randn_like(yr)
                 grads = torch.autograd.grad(yr, [Xr] + list(ref_m.parameters()), gy_full)
