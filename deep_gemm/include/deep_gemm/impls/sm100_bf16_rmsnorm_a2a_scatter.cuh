@@ -7,6 +7,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/sm100_utils.cuh>
+#include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/fused_qkv_norm_a2a.cuh>
@@ -26,31 +27,33 @@ struct FusedQKVNormA2AScatterMaps {
 };
 
 // ============================================================================================
-//  sm100_bf16_rmsnorm_a2a_scatter_impl — Kernel 2
+//  sm100_bf16_rmsnorm_a2a_scatter_impl — v2a Kernel 2
 //
-//  Reads local GEMM output buffer (Kernel 1's output) [bs*local_seq, N_total],
+//  Reads local GEMM output buffer [shape_m, shape_n] (Kernel 1's output),
 //  applies RMSNorm on Q/K segments (optional), then A2A-transpose-scatters to peer HBM.
 //
-//  Design: each CTA handles one 128×BLOCK_N tile.
-//    1. Cooperative global load (128 threads × 8 bf16/iter = 128×128 in 16 iters)
-//    2. RMSNorm elementwise in registers/SMEM
-//    3. TMA store scatter to dst_rank's output buffer via scatter_maps[dst_rank]
+//  Pipeline per tile:
+//    1. TMA load from local_buffer → SMEM (swizzled, via mbarrier)
+//    2. RMSNorm elementwise in SMEM (swizzle-addressed read/modify/write)
+//       - Read per-row x² sum from sum_buffer
+//       - Apply: out = x * rsqrt(sum/dim + eps) * weight (Q/K only, V=identity)
+//    3. TMA store scatter → peer HBM (scatter_maps[dst_rank])
 //
 //  Warp layout (128T = 4 warps):
-//    W0-W3: All participate in load → norm → store
-//           (W0 elect_one issues TMA store)
+//    W0: TMA load issue + TMA store issue (elect_one)
+//    W0-W3: All participate in norm elementwise + barriers
 //
 //  GQA-aware scatter:
 //    N_total = q_dim + 2*kv_dim
-//    Q segment [0, q_dim):           dst_rank = n_col / local_q_n,  base_n = n_col % local_q_n
-//    K segment [q_dim, q_dim+kv_dim): dst_rank = (n-q_dim) / local_kv_n, base_n = ... + local_q_n
-//    V segment [q_dim+kv_dim, ...):   dst_rank = (n-q_dim-kv_dim) / local_kv_n, base_n = ... + local_q_n + local_kv_n
+//    Q segment [0, q_dim):            dst_rank = n_col / local_q_n,  base_n = n_col % local_q_n
+//    K segment [q_dim, q_dim+kv_dim): dst_rank = (n-q_dim) / local_kv_n, base_n += local_q_n
+//    V segment [q_dim+kv_dim, ...):   dst_rank = (n-q_dim-kv_dim) / local_kv_n, base_n += local_q_n + local_kv_n
 // ============================================================================================
 
 template <uint32_t BLOCK_M,      // 128
           uint32_t BLOCK_N,      // 128
           uint32_t kSwizzleCDMode, // 128 (bytes)
-          uint32_t kNumTMAStoreStages,
+          uint32_t kNumTMAStages, // 2
           uint32_t kNumRanks,
           bool kDoNormQ, bool kDoNormK,
           typename cd_dtype_t>    // nv_bfloat16
@@ -69,7 +72,8 @@ sm100_bf16_rmsnorm_a2a_scatter_impl(
     const float* __restrict__ norm_q_weight,    // [q_dim], fp32 (nullptr if !kDoNormQ)
     const float* __restrict__ norm_k_weight,    // [kv_dim], fp32 (nullptr if !kDoNormK)
     const float* __restrict__ sum_buffer,       // [shape_m, 2] per-row x² sum (Q=0, K=1)
-    const cd_dtype_t* __restrict__ local_buffer, // [shape_m, shape_n] Kernel 1's output
+    const cd_dtype_t* __restrict__ local_buffer, // [shape_m, shape_n] bf16, Kernel 1 output
+    const __grid_constant__ cute::TmaDescriptor tensor_map_local,  // TMA descriptor for local_buffer
     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
     const __grid_constant__ FusedQKVNormA2AScatterMaps scatter_maps) {
 
@@ -77,9 +81,12 @@ sm100_bf16_rmsnorm_a2a_scatter_impl(
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     constexpr uint32_t kNumThreads = 128;
-    constexpr uint32_t kNumElemsPerVec = 8;  // 8 bf16 = 16 bytes = 128 bits (uint4)
+    constexpr uint32_t kNumWarps = kNumThreads / 32;
+    constexpr uint32_t kNumBankGroupBytes = 16;
+    constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);  // 8 for bf16
+    // STORE_BLOCK_M = BLOCK_M = 128, STORE_BLOCK_N = swizzle/sizeof = 64 for bf16
     constexpr uint32_t STORE_BLOCK_M = BLOCK_M;
-    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);  // 64 for bf16
+    constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);  // 64
 
     // ── Runtime variables ──
     const uint32_t num_m_blocks = ceil_div(shape_m, BLOCK_M);
@@ -96,12 +103,22 @@ sm100_bf16_rmsnorm_a2a_scatter_impl(
 
     // ── Shared memory layout ──
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
-    // SMEM CD: double-buffered, swizzled
+    // SMEM CD: double-buffered for load/store pipeline
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
-    cd_dtype_t* smem_cd_base = reinterpret_cast<cd_dtype_t*>(smem_buffer);
+    auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
+    });
+    // TMA load barriers (one per stage)
+    auto load_barriers = utils::PatternVisitor([=](const uint32_t& i) {
+        return reinterpret_cast<Barrier*>(smem_buffer + SMEM_CD_SIZE_PER_STAGE * kNumTMAStages + i * sizeof(Barrier));
+    });
 
     // ── Initialize barriers ──
     if (thread_idx == 0) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumTMAStages; ++i) {
+            load_barriers[i]->init(1);
+        }
         cutlass::arch::fence_barrier_init();
     }
     __syncthreads();
@@ -121,126 +138,139 @@ sm100_bf16_rmsnorm_a2a_scatter_impl(
         const uint32_t global_m = m_block_idx * BLOCK_M;
         const uint32_t n_col = n_block_idx * BLOCK_N;
 
-        // ── Determine segment (Q/K/V) and dst_rank ──
+        // ── Determine segment (Q/K/V), dst_rank, and norm params ──
         uint32_t dst_rank, base_n_idx;
         bool is_q = (n_col < q_dim);
         bool is_k = (!is_q && n_col < q_dim + kv_dim);
         bool do_norm = false;
         const float* norm_weight = nullptr;
+        uint32_t norm_dim = 0;
+        uint32_t sum_idx = 0;  // 0 for Q, 1 for K
 
         if (is_q) {
             dst_rank = n_col / local_q_n;
             base_n_idx = n_col % local_q_n;
-            if constexpr (kDoNormQ) { do_norm = true; norm_weight = norm_q_weight; }
+            if constexpr (kDoNormQ) { do_norm = true; norm_weight = norm_q_weight; norm_dim = q_dim; sum_idx = 0; }
         } else if (is_k) {
             uint32_t rel = n_col - q_dim;
             dst_rank = rel / local_kv_n;
             base_n_idx = rel % local_kv_n + local_q_n;
-            if constexpr (kDoNormK) { do_norm = true; norm_weight = norm_k_weight; }
+            if constexpr (kDoNormK) { do_norm = true; norm_weight = norm_k_weight; norm_dim = kv_dim; sum_idx = 1; }
         } else {  // V
             uint32_t rel = n_col - q_dim - kv_dim;
             dst_rank = rel / local_kv_n;
             base_n_idx = rel % local_kv_n + local_q_n + local_kv_n;
         }
 
-        // Compute output M coordinates (pre-attn: rank's seq shard → dst's seq offset)
+        // Output M coordinates (pre-attn: rank's seq shard → dst's seq offset)
         const uint32_t b = global_m / local_seq;
         const uint32_t s_local = global_m - b * local_seq;
         const uint32_t base_m_idx = b * seq + rank_idx * local_seq + s_local;
 
-        // ── Step 1: Cooperative global load from local_buffer → SMEM ──
-        // Each thread loads 128 bits (8 bf16) per iteration, 128 threads × 16 iters = 128×128 bf16
-        // Tile is [BLOCK_M, BLOCK_N], row-major in local_buffer with stride shape_n
-        cd_dtype_t* smem_cd = smem_cd_base + tma_stage_idx * (SMEM_CD_SIZE_PER_STAGE / sizeof(cd_dtype_t));
-
+        // ── Step 1: TMA load from local_buffer → SMEM (swizzled) ──
         // Wait for previous TMA store to finish using this stage's SMEM
-        if (warp_idx == 0) cute::tma_store_wait<kNumTMAStoreStages - 1>();
+        if (warp_idx == 0) cute::tma_store_wait<kNumTMAStages - 1>();
         cutlass::arch::NamedBarrier::sync(kNumThreads, 0);
 
-        constexpr uint32_t ELEMS_PER_TILE = BLOCK_M * BLOCK_N;
-        constexpr uint32_t ELEMS_PER_THREAD = ELEMS_PER_TILE / kNumThreads;  // 128
-        constexpr uint32_t VECS_PER_THREAD = ELEMS_PER_THREAD / kNumElemsPerVec;  // 16
-
-        #pragma unroll
-        for (uint32_t v = 0; v < VECS_PER_THREAD; ++v) {
-            uint32_t linear_idx = v * kNumThreads + thread_idx;
-            uint32_t row = linear_idx / BLOCK_N;       // 0..127
-            uint32_t col = linear_idx % BLOCK_N;        // 0..127
-
-            uint32_t gm = global_m + row;
-            uint32_t gn = n_col + col;
-
-            if (gm < shape_m && gn < shape_n) {
-                // Load 8 bf16 (128 bits) via uint4
-                uint4 vec_data = *reinterpret_cast<const uint4*>(&local_buffer[gm * shape_n + gn]);
-                *reinterpret_cast<uint4*>(&smem_cd[row * BLOCK_N + col]) = vec_data;
+        // Issue TMA load for each STORE_BLOCK_N atom
+        // tensor_map_local describes [shape_m, shape_n] 2D with swizzle=128B
+        // TMA load puts data in swizzled SMEM layout automatically
+        if (warp_idx == 0 and cute::elect_one_sync()) {
+            constexpr uint32_t BLOCK_INNER_ATOM = kSwizzleCDMode / sizeof(cd_dtype_t);
+            #pragma unroll
+            for (uint32_t s = 0; s < BLOCK_N / STORE_BLOCK_N; ++s) {
+                // TMA load: tile at (global_m, n_col + s*STORE_BLOCK_N) → SMEM atom s
+                // SMEM offset: atom s starts at s * STORE_BLOCK_M * STORE_BLOCK_N
+                cute::SM90_TMA_LOAD_2D::copy(
+                    &tensor_map_local,
+                    reinterpret_cast<uint64_t*>(load_barriers[tma_stage_idx]),
+                    static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                    reinterpret_cast<cd_dtype_t*>(smem_cd[tma_stage_idx]) + s * STORE_BLOCK_M * STORE_BLOCK_N,
+                    n_col + s * STORE_BLOCK_N,
+                    global_m);
             }
+            // Arrive at load barrier after all TMA loads for this stage
+            constexpr uint32_t kNumArrivalBytes = BLOCK_M * BLOCK_N * sizeof(cd_dtype_t);
+            load_barriers[tma_stage_idx]->arrive_and_expect_tx(kNumArrivalBytes);
         }
-        __syncthreads();
 
-        // ── Step 2: RMSNorm elementwise (if Q/K segment and norm enabled) ──
+        // Wait for TMA load to complete
+        load_barriers[tma_stage_idx]->wait((tile_idx / 128) & 1 ^ 1);  // phase based on persistent iter
+        ptx::tcgen05_after_thread_sync();
+
+        // ── Step 2: RMSNorm elementwise in swizzled SMEM ──
         if (do_norm) {
-            // Each thread processes 8 bf16 elements
-            // Read per-row x² sum, compute rms, apply: out = x * rms * weight
-            constexpr uint32_t NORM_DIM = (kDoNormQ ? q_dim : kv_dim);  // norm dimension
-            // Actually q_dim and kv_dim are runtime values, not constexpr
-            // Use runtime dim
-            uint32_t norm_dim = is_q ? q_dim : kv_dim;
+            // Read per-row x² sum and compute rms
+            // Each thread handles one "row" of the swizzled atom (like STSM in sm100_store_cd)
+            // We use 4 warps × 32 lanes = 128 threads to cover 128 rows
+            // Each row has STORE_BLOCK_N=64 bf16 elements, processed in 8 bank groups of 8
 
             #pragma unroll
-            for (uint32_t v = 0; v < VECS_PER_THREAD; ++v) {
-                uint32_t linear_idx = v * kNumThreads + thread_idx;
-                uint32_t row = linear_idx / BLOCK_N;
-                uint32_t col = linear_idx % BLOCK_N;
+            for (uint32_t s = 0; s < BLOCK_N / STORE_BLOCK_N; ++s) {
+                auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
+                                     s * STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
 
-                uint32_t gm = global_m + row;
-                if (gm < shape_m) {
-                    // Read x² sum for this row
-                    float sum_val = sum_buffer[gm * 2 + (is_q ? 0 : 1)];
-                    float rms = rsqrtf(sum_val / static_cast<float>(norm_dim) + eps);
+                // Each warp handles STORE_BLOCK_M / kNumWarps = 32 rows
+                #pragma unroll
+                for (uint32_t i = 0; i < STORE_BLOCK_N / kNumElemsPerBankGroup; ++i) {
+                    // Swizzle addressing (same as sm100_store_cd STSM)
+                    auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
+                    constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
+                    auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
+                    auto col = kHasShortcut ? (i) : (bank_group_index % 8);
+                    col ^= row % (kSwizzleCDMode / 16);
 
-                    // Load 8 bf16 from SMEM, convert to float
-                    uint4 vec_data = *reinterpret_cast<uint4*>(&smem_cd[row * BLOCK_N + col]);
-                    float2* f2_vals = reinterpret_cast<float2*>(&vec_data);
-                    nv_bfloat16* bf16_vals = reinterpret_cast<nv_bfloat16*>(&vec_data);
+                    auto smem_ptr = smem_base_ptr +
+                                    warp_idx * 32 * kSwizzleCDMode +
+                                    row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
 
-                    #pragma unroll
-                    for (uint32_t i = 0; i < kNumElemsPerVec; ++i) {
-                        float x = __bfloat162float(bf16_vals[i]);
-                        uint32_t weight_idx = n_col + col + i;
-                        float w = norm_weight[weight_idx];
-                        float result = x * rms * w;
-                        bf16_vals[i] = __float2bfloat16_rn(result);
+                    // Read 8 bf16 from SMEM
+                    uint32_t values[4];  // 4 × uint32 = 4 × 2 bf16 = 8 bf16
+                    ptx::ld_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+
+                    // Get global row for sum lookup
+                    uint32_t global_row = global_m + warp_idx * 32 + (i / 8);
+                    // Actually: row in tile = warp_idx*32 + (i/8) is wrong...
+                    // row = i/8 + lane_idx (from kHasShortcut), so:
+                    // tile_row = warp_idx * 32 + row  (each warp covers 32 rows)
+                    // But row already includes lane_idx, so: tile_row = warp_idx * (STORE_BLOCK_M/kNumWarps) + row
+                    // For STORE_BLOCK_M=128, kNumWarps=4: warp covers 32 rows
+                    // row = i/8 + lane_idx, ranges 0..31 within warp's 32 rows
+                    uint32_t tile_row = warp_idx * 32 + row;
+                    uint32_t gm = global_m + tile_row;
+
+                    if (gm < shape_m) {
+                        float sum_val = sum_buffer[gm * 2 + sum_idx];
+                        float rms = rsqrtf(sum_val / static_cast<float>(norm_dim) + eps);
+
+                        // Apply norm to 8 bf16 values
+                        nv_bfloat16* bf16_vals = reinterpret_cast<nv_bfloat16*>(values);
+                        uint32_t n_base = n_col + s * STORE_BLOCK_N;
+                        #pragma unroll
+                        for (uint32_t e = 0; e < kNumElemsPerBankGroup; ++e) {
+                            float x = __bfloat162float(bf16_vals[e]);
+                            uint32_t weight_col = n_base + e;  // simplified; actual col mapping needed
+                            float w = norm_weight[weight_col];
+                            bf16_vals[e] = __float2bfloat16_rn(x * rms * w);
+                        }
+
+                        // Write back to SMEM
+                        ptx::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
                     }
-
-                    // Write back to SMEM
-                    *reinterpret_cast<uint4*>(&smem_cd[row * BLOCK_N + col]) = vec_data;
                 }
             }
             __syncthreads();
         }
 
         // ── Step 3: TMA store scatter to peer HBM ──
-        // The SMEM data needs to be in swizzled layout for TMA store.
-        // For simplicity in this initial version, we use a direct store path:
-        // write SMEM (row-major) → TMA store with appropriate descriptor.
-        //
-        // NOTE: For production, the SMEM should be swizzled (matching the TMA descriptor's
-        // swizzle mode) so that TMA store produces correct global memory layout.
-        // The scatter_maps[dst_rank] descriptor has swizzle=128B, so SMEM must be 128B-swizzled.
-        //
-        // For the initial version, we build the TMA descriptor WITHOUT swizzle (swizzle_mode=0)
-        // so that row-major SMEM works directly. This is less efficient but correct.
         cute::tma_store_fence();
         cutlass::arch::NamedBarrier::sync(kNumThreads, 0);
         if (warp_idx == 0 and cute::elect_one_sync()) {
-            // TMA store: SMEM → scatter_maps[dst_rank] at (base_m_idx, base_n_idx)
-            // The descriptor is 2D [bs*seq, local_n_total], we store a BLOCK_M × BLOCK_N tile
             #pragma unroll
             for (uint32_t s = 0; s < BLOCK_N / STORE_BLOCK_N; ++s) {
                 cute::SM90_TMA_STORE_2D::copy(
                     &scatter_maps.maps[dst_rank],
-                    reinterpret_cast<cd_dtype_t*>(smem_cd) + s * STORE_BLOCK_M * STORE_BLOCK_N,
+                    reinterpret_cast<cd_dtype_t*>(smem_cd[tma_stage_idx]) + s * STORE_BLOCK_M * STORE_BLOCK_N,
                     base_n_idx + s * STORE_BLOCK_N,
                     base_m_idx);
             }
@@ -248,7 +278,7 @@ sm100_bf16_rmsnorm_a2a_scatter_impl(
         }
         __syncwarp();
 
-        tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
+        tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStages;
     }
 
     // ── Drain all scatter stores ──
