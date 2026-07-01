@@ -41,20 +41,20 @@ class FusedVariantUlysses(UlyssesBase):
         self._wo_sharded = True  # Wo grad is local (no FSDP2 sync)
 
     def _create_buffers(self):
-        """Create symmetric buffers for GEMM+RS (forward) and AG+GEMM (backward)."""
-        dim = self.cfg.dim
-        local_m = self.local_m  # tokens per rank = bs * (seq // sp)
+        """Create symmetric buffers for GEMM+RS (forward) and AG+GEMM (backward).
 
-        # Forward: GEMM+RS sym buffer
-        #   hidden = N = dim (output cols)
-        #   num_max_tokens_per_rank = local_m (output rows per rank after RS)
+        NOTE: Cannot share a single buffer because GEMM+RS and AG+GEMM have
+        different layout structures (offsets don't align). RS's partial[r]
+        starts at offset 32 (after barrier), but AG's local_x starts at 32 and
+        slots_x starts at 32 + local_x_size — a 40MB offset mismatch.
+        See docs/SYM_BUF_SHARING_ANALYSIS.md for details.
+        """
+        dim = self.cfg.dim
+        local_m = self.local_m
+
         self.sym_post = get_symm_buffer_for_gemm_rs(
             self.group, local_m, dim, out_dtype=torch.bfloat16
         )
-
-        # Backward: AG+GEMM sym buffer
-        #   x = grad_y [local_m, dim] → AG → [full_m, dim]
-        #   k_dim = dim (the K dim of the GEMM, which is the gather dim)
         self.sym_post_bwd = get_symm_buffer_for_bf16_ag_gemm(
             self.group, local_m, dim
         )
@@ -65,7 +65,6 @@ class FusedVariantUlysses(UlyssesBase):
         self.sym_post_bwd = other.sym_post_bwd
 
     def destroy_buffers(self):
-        # Only the owner should destroy; others just clear references
         self.sym_post = None
         self.sym_post_bwd = None
 

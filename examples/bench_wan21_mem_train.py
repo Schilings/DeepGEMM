@@ -55,8 +55,12 @@ class MultiLayerModel(nn.Module):
         return x
 
     def destroy_buffers(self):
-        if self.layers and hasattr(self.layers[0], 'sym_post'):
-            # Only owner destroys
+        if self.layers and hasattr(self.layers[0], '_unified_buf') and self.layers[0]._unified_buf is not None:
+            self.layers[0]._unified_buf.destroy()
+            self.layers[0]._unified_buf = None
+            self.layers[0].sym_post = None
+            self.layers[0].sym_post_bwd = None
+        elif self.layers and hasattr(self.layers[0], 'sym_post'):
             if hasattr(self.layers[0], 'sym_post') and self.layers[0].sym_post is not None:
                 self.layers[0].sym_post.destroy()
                 self.layers[0].sym_post = None
@@ -68,10 +72,14 @@ class MultiLayerModel(nn.Module):
         """Total sym_buf allocation (not tracked by PyTorch allocator)."""
         total = 0
         owner = self.layers[0]
-        if hasattr(owner, 'sym_post') and owner.sym_post is not None:
-            total += owner.sym_post.buffer.numel()
-        if hasattr(owner, 'sym_post_bwd') and owner.sym_post_bwd is not None:
-            total += owner.sym_post_bwd.buffer.numel()
+        if hasattr(owner, '_unified_buf') and owner._unified_buf is not None:
+            # Unified: single shared buffer, don't double-count
+            total = owner._unified_buf.ag.buffer.numel()
+        else:
+            if hasattr(owner, 'sym_post') and owner.sym_post is not None:
+                total += owner.sym_post.buffer.numel()
+            if hasattr(owner, 'sym_post_bwd') and owner.sym_post_bwd is not None:
+                total += owner.sym_post_bwd.buffer.numel()
         return total
 
 
