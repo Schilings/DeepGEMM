@@ -149,28 +149,37 @@ def bf16_fused_qkv_norm_a2a_nt(
     group.barrier()
     torch.cuda.synchronize()
 
-    # Get output views
-    out = sym_buffer.get_out_view().clone()
-    rms = sym_buffer.get_rms_view().clone()
+    # Get output views (operate in-place on sym buffer, clone only at end)
+    out = sym_buffer.get_out_view()
+    rms = sym_buffer.get_rms_view().clone()  # small: [bs, seq, 2] fp32
 
-    # Apply bias if provided (on the scattered result, per-head-group slice)
-    if bias is not None:
-        local_bias = bias.view(num_ranks, -1)[group.rank()]
-        out = out + local_bias.to(out.dtype)
+    # Apply bias + norm in-place (minimal kernel launches)
+    local_q_n = (q_nheads // num_ranks) * head_dim
+    local_kv_n = (kv_nheads // num_ranks) * head_dim
 
-    # Apply norm if weights provided (elementwise: x * rms * weight)
     if do_norm_q:
-        local_q_n = (q_nheads // num_ranks) * head_dim
-        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[group.rank()]
-        out[:, :, :local_q_n] = (
-            out[:, :, :local_q_n].float() * rms[:, :, 0:1] * local_norm_q.to(out.device)
-        ).to(out.dtype)
-    if do_norm_k:
-        local_kv_n = (kv_nheads // num_ranks) * head_dim
-        local_q_n = (q_nheads // num_ranks) * head_dim
-        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[group.rank()]
-        out[:, :, local_q_n:local_q_n+local_kv_n] = (
-            out[:, :, local_q_n:local_q_n+local_kv_n].float() * rms[:, :, 1:2] * local_norm_k.to(out.device)
-        ).to(out.dtype)
+        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[group.rank()].to(out.dtype)
+        q_slice = out[:, :, :local_q_n]
+        if bias is not None:
+            q_slice.add_(bias[:q_dim].view(num_ranks, local_q_n)[group.rank()].to(out.dtype))
+        q_slice.mul_(rms[:, :, 0:1].to(out.dtype))
+        q_slice.mul_(local_norm_q)
+    elif bias is not None:
+        out[:, :, :local_q_n].add_(bias[:q_dim].view(num_ranks, local_q_n)[group.rank()].to(out.dtype))
 
-    return out, rms
+    if do_norm_k:
+        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[group.rank()].to(out.dtype)
+        k_slice = out[:, :, local_q_n:local_q_n+local_kv_n]
+        if bias is not None:
+            k_slice.add_(bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
+        k_slice.mul_(rms[:, :, 1:2].to(out.dtype))
+        k_slice.mul_(local_norm_k)
+    elif bias is not None:
+        out[:, :, local_q_n:local_q_n+local_kv_n].add_(
+            bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
+
+    if bias is not None:
+        out[:, :, local_q_n+local_kv_n:].add_(
+            bias[q_dim+kv_dim:].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
+
+    return out.clone(), rms
