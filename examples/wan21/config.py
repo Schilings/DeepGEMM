@@ -17,7 +17,7 @@ class Wan21Config:
     ffn_dim: int = 13824         # FFN intermediate (14B=13824, 1.3B=8192)
     num_layers: int = 40         # transformer layers
     qk_norm: bool = True         # QK RMSNorm
-    cross_attn_norm: bool = True
+    cross_attn_norm: bool = True    # official 14B: True (norm3 has weight+bias)
     eps: float = 1e-6
     causal: bool = False          # Wan2.1 uses non-causal self-attn
 
