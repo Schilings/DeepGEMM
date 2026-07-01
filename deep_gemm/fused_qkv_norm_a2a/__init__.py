@@ -149,12 +149,6 @@ def bf16_fused_qkv_norm_a2a_nt(
     group.barrier()
     torch.cuda.synchronize()
 
-    # Debug: check sum_buffer
-    if group.rank() == 0:
-        print(f"  DEBUG sum_buf[0,:2]={sum_buffer[0,:2].tolist()}")
-        print(f"  DEBUG sum_buf[1024,:2]={sum_buffer[1024,:2].tolist()}")
-        print(f"  DEBUG rms[0,0,:2]={sym_buffer.get_rms_view()[0,0,:2].tolist()}")
-
     # Get output views
     out = sym_buffer.get_out_view().clone()
     rms = sym_buffer.get_rms_view().clone()

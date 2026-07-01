@@ -250,9 +250,10 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
                         values[4], values[5], values[6], values[7]);
                     cutlass::arch::fence_view_async_tmem_load();
                     // ── pre_cast hook: 在 cast 前访问 fp32 values（如 x² partial sum）──
+                    // row in tile = epilogue_warp_idx * 32 + (i/8 + lane_idx)
                     epilogue_type_t::pre_cast<kNumElemsPerBankGroup>(
                         reinterpret_cast<float*>(values),
-                        base_m_idx + w * STORE_BLOCK_M + (i / 8 + lane_idx),
+                        base_m_idx + w * STORE_BLOCK_M + epilogue_warp_idx * 32 + (i / 8 + lane_idx),
                         n_idx + i * kNumElemsPerBankGroup,
                         epi_ctx);
                     // 将相邻两个 FP32 值 cast 为 BF16 后 pack 成一个 uint32_t 写入 SMEM

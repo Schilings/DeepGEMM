@@ -38,7 +38,6 @@ class FusedVariantUlysses(UlyssesBase):
         Wo = self.model.o.weight  # [dim, dim] = [out, in]
         Wo_i = Wo[:, rank * local_hidden:(rank + 1) * local_hidden].contiguous()  # [dim, local_hidden]
         self.Wo_r_local = nn.Parameter(Wo_i.clone(), requires_grad=True)
-        self.Wo_r_local_t = nn.Parameter(self.Wo_r_local.data.t().contiguous(), requires_grad=True)
         self._wo_sharded = True  # Wo grad is local (no FSDP2 sync)
 
     def _create_buffers(self):

@@ -174,10 +174,10 @@ class GemmRSFunction(torch.autograd.Function):
         grad_attn = torch.empty((full_m, local_hidden), dtype=torch.bfloat16, device=grad_y.device)
         bf16_ag_gemm_nt(grad_attn, weight_t, ctx.sym_buffer_bwd, local_m)
 
-        # Weight grad: grad_Wo_r = grad_y_full.t() @ attn  ([dim, full_m] @ [full_m, local_hidden])
-        gy_list = [torch.empty_like(grad_y) for _ in range(sp)]
-        dist.all_gather(gy_list, grad_y, group=group)
-        grad_y_full = torch.cat(gy_list, dim=0)
+        # Weight grad: reuse gathered grad_y from sym_buf slots (already populated by AG+GEMM comm kernel)
+        # The comm kernel copied all ranks' grad_y into local slots via P2P cudaMemcpyAsync.
+        # slots_x layout: [sp, max_m_per_rank, hidden] — slot r = rank r's grad_y
+        grad_y_full = ctx.sym_buffer_bwd.slots_x[:full_m, :local_N]
         grad_weight = torch.matmul(grad_y_full.t(), attn)
 
         return grad_attn, grad_weight, None, None, None

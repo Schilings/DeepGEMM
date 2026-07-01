@@ -120,7 +120,7 @@ def run(rank, ng, port, num_layers, seq, strategies):
         for layer in model.layers:
             ignored |= set(layer.model.parameters())
             if strat_name == 'fused_var':
-                ignored |= {layer.Wo_r_local, layer.Wo_r_local_t}
+                ignored |= {layer.Wo_r_local}
         apply_fsdp2(model, group, reshard_after_forward=False, ignored_params=ignored)
 
         # Count trainable params

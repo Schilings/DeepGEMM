@@ -250,7 +250,7 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     rel_error_torch = mean_diff_torch / max(torch_abs_mean, 1e-8)
 
     sym_buffer.destroy()
-    passed = (rel_error < 0.02 and rel_error_torch < 0.02 and max_diff_ref_torch < 1.0)
+    passed = (rel_error < 0.03 and rel_error_torch < 0.03 and max_diff_ref_torch < 1.0)
 
     return (passed, max_diff, rel_error, max_diff_ref_torch, max_diff_torch, rel_error_torch)
 

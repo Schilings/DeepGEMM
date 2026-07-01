@@ -73,7 +73,7 @@ def run(rank, ng, port, strategies):
 
             ignored = set(strat.model.parameters())
             if strat_name == 'fused_var':
-                ignored |= {strat.Wo_r_local, strat.Wo_r_local_t}
+                ignored |= {strat.Wo_r_local}
             apply_fsdp2(strat, group, reshard_after_forward=False, ignored_params=ignored)
 
             # Measure sym buffer size

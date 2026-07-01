@@ -114,7 +114,7 @@ def run(rank, ng, port, iters, verify, strategies):
             # Apply FSDP2: shard Wqkv Parameter; ignore model params (we use Wqkv not nn.Linear)
             ignored = set(strat.model.parameters())
             if strat_name == 'fused_var':
-                ignored |= {strat.Wo_r_local, strat.Wo_r_local_t}
+                ignored |= {strat.Wo_r_local}
             try:
                 apply_fsdp2(strat, group, reshard_after_forward=True, ignored_params=ignored)
             except Exception as e:
