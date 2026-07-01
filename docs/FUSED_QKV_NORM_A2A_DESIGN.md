@@ -19,49 +19,85 @@ RMSNorm 公式：`y = x * rsqrt(mean(x²) + eps) * weight`，是**两 pass**：
 
 ---
 
-## 2. 方案：两阶段 kernel 融合
+## 2. 方案：两个版本并行对比
 
-### 2.1 整体架构
+同时实现两个版本，用 benchmark 数据决定哪个更有潜力：
+
+- **v2a（双 kernel）**：Kernel1(GEMM+本地写+x²sum) → Kernel2(norm+scatter)
+  - 已有 CUDA 骨架：`sm100_bf16_rmsnorm_a2a_scatter.cuh`
+  - 优点：每个 kernel 职责单一，易调试/调优；Kernel2 可独立调 tile/SM 配置
+  - 缺点：1 次额外 kernel launch（~5us）+ D 在 HBM 的写→读（两 kernel 间）
+
+- **v2b（单 kernel）**：persistent 两阶段 + kernel 内 grid_sync
+  - 复用 `comm::grid_sync` / `comm::nvlink_barrier`
+  - 优点：省 launch 开销；与基座 `bf16_gemm_a2a_transpose_nt` 同构
+  - 缺点：warp 角色切换（GEMM→norm/scatter）实现复杂；SMEM/TMEM 生命周期管理更难
+
+两版本共用：layout / host TMA descriptor / Python API / test / bench
+
+### 2.1 为什么单 kernel 可行（v2b）
+
+基座 `bf16_gemm_a2a_transpose_nt` 是单 kernel——GEMM epilogue 直接 P2P TMA scatter，无需跨 tile 信息。
+本算子加了 RMSNorm，是**两 pass**（先 `sum(x²)` 全行 reduce，再 `x * rsqrt * weight`），单个 tile 看不到整行，
+所以需要在 kernel 内部做 **grid sync**（复用现有 `comm::grid_sync` / `comm::nvlink_barrier`）。
+
+单 kernel 方案省掉：
+- kernel launch 开销（~5us）
+- D 的 HBM 写→读（虽然单 kernel 仍需写本地 HBM 再读，因为 TMEM/SMEM 放不下整行，但省了 kernel 间的额外同步）
+
+### 2.2 整体架构（单 kernel，两阶段 persistent）
 
 ```
-Kernel 1: sm100_bf16_gemm_rmsnorm_local
-  GEMM(x @ Wqkv^T) → TMEM accumulator
-  Epilogue:
-    TMEM → SMEM (cast FP32→BF16)
-    → TMA store to LOCAL buffer (NOT peer scatter)
-    + x² partial sum → atomic add to per-row sum buffer [bs*local_seq, 2]  (Q/K 各一列)
-  nvlink_barrier (grid sync: 所有 tile 完成)
+sm100_bf16_fused_qkv_norm_a2a_impl（单 kernel，256T = 8 warp，与 GEMM-RS/A2A 同构）:
 
-Kernel 2: sm100_bf16_rmsnorm_a2a_scatter
-  for each tile (m_block, n_block):
-    TMA load from local buffer → SMEM
-    RMSNorm: if n_block ∈ Q-range → rms = rsqrt(sum_q/dim + eps), y = x * rms * norm_q_w
-             if n_block ∈ K-range → rms = rsqrt(sum_k/dim + eps), y = x * rms * norm_k_w
-             if n_block ∈ V-range → no norm (identity)
-    TMA store scatter → peer HBM (scatter_maps[dst_rank])
-  nvlink_barrier (所有 scatter 全局可见)
+  ── 阶段 1: GEMM + 写本地 HBM + x² sum ──
+  起始 nvlink_barrier（tag 71: 保证上轮 peer 读完我的 buffer）
+  W0: TMA Load A+B
+  W1: MMA Issue
+  W2: Reserved / TMEM Allocator
+  W4-W7: Epilogue —— TMEM→SMEM→TMA store 到**本地 HBM**
+                        + x² partial sum → atomic add 到 sum_buffer[row, q_or_k_idx]
+                        （仅 Q/K 段，V 段不做 sum）
+
+  ── grid_sync（kernel 内部，所有 tile 完成）──
+  comm::grid_sync / comm::nvlink_barrier（保证所有 CTA 的本地写 + x² sum 完成）
+
+  ── 阶段 2: Norm + A2A scatter ──
+  W0-W7: 重读本地 HBM tile → SMEM
+         RMSNorm elementwise（if Q/K 段 && norm enabled）
+         TMA store scatter → peer HBM（scatter_maps[dst_rank]）
+  ptx::tma_store_wait<0>  ── drain 所有 push
+  结束 nvlink_barrier（tag 72: 保证所有 scatter 全局可见）
 ```
 
-### 2.2 为什么不用单 kernel
+### 2.3 为什么不能在 GEMM epilogue 里直接 scatter（像基座那样）
 
-单 kernel（persistent 两阶段）理论最优，但：
-1. kernel 内 grid sync + warp 角色切换（GEMM→norm/scatter）实现复杂
-2. 难以调试正确性
-3. 两 kernel 方案的 kernel 2 极轻（纯 data movement + elementwise），launch 开销 < 5us
+基座的 epilogue 是 `TMEM → SMEM → TMA store to peer`，一步到位。
+本算子需要在 `TMEM → SMEM` 后先做 RMSNorm（需要全行 x² sum），才能 scatter。
+而 RMSNorm 的 x² sum 需要**所有 N-tile 完成**后才有——所以必须有 grid sync 把两阶段隔开。
 
-### 2.3 与现有算子的关系
+### 2.4 x² sum 的计算（参考 sm100_tf32_hc_prenorm_gemm）
 
-| 维度 | `bf16_gemm_a2a_transpose_nt` | Kernel 1 (gemm_rmsnorm_local) | Kernel 2 (rmsnorm_a2a_scatter) |
-|------|------|------|------|
-| GEMM | ✓ | ✓ | ✗ |
-| Epilogue 目标 | peer HBM (P2P scatter) | **本地 buffer** | peer HBM (P2P scatter) |
-| x² sum | ✗ | **✓ (atomic add)** | ✗ |
-| RMSNorm | ✗ | ✗ | **✓** |
-| A2A scatter | ✓ (in epilogue) | ✗ | **✓** |
-| NVLink barrier | init + final | final (grid sync) | init + final |
+`sm100_tf32_hc_prenorm_gemm` 用专门的 cast-and-reduce warps（W4-W7 之外的额外 warps）
+在 GEMM 流水线中同时做 bf16→fp32 cast + x² reduce。我们的方案：
+- epilogue warps（W4-W7）在 STSM 阶段（TMEM→SMEM）拿到 fp32 的 GEMM 结果
+- 在写 SMEM 的同时，计算 `values[i] * values[i]` 的 partial sum
+- 对 Q 段的 tile，atomic add 到 `sum_buffer[global_m, 0]`
+- 对 K 段的 tile，atomic add 到 `sum_buffer[global_m, 1]`
+- V 段不做 sum
 
-Kernel 1 = `bf16_gemm_a2a_transpose_nt` 去掉 scatter + 加本地写 + 加 x² sum
-Kernel 2 = `bf16_gemm_a2a_transpose_nt` 的 epilogue 独立化 + 加 RMSNorm
+### 2.5 与现有算子的关系
+
+| 维度 | `bf16_gemm_a2a_transpose_nt` | 本 Fused QKV+Norm+A2A |
+|------|------|------|
+| kernel 数 | 1 | 1（两阶段 persistent + grid sync） |
+| GEMM | ✓ | ✓ |
+| Epilogue 目标 | peer HBM (P2P scatter) | **本地 HBM**（阶段1）→ peer HBM（阶段2） |
+| x² sum | ✗ | **✓ (atomic add in 阶段1 epilogue)** |
+| RMSNorm | ✗ | **✓ (阶段2 elementwise)** |
+| A2A scatter | ✓ (in epilogue) | ✓ (阶段2，grid sync 后) |
+| Grid sync | ✗ | **✓ (阶段1→2 之间)** |
+| NVLink barrier | init + final | init + grid_sync + final |
 
 ---
 
