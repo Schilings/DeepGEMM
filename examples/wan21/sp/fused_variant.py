@@ -1,10 +1,10 @@
-"""Fused Variant Ulysses: Megatron-style TP Wo row-split.
+"""Fused Variant Ulysses: Q/K/V separate → A2A → attn → Wo GEMM+RS (column-split Wo).
 
-POST forward: attn_i @ Wo_i^T → partial sum → AllReduce (g operator) → Y + bias
-  - g forward: AllReduce (reduce partial sums from all ranks)
-  - g backward: Identity (grad flows directly, no comm)
+Wo column-split (in Y=XW, W row-split): Wo_i [dim, local_hidden] per rank.
+Attention output [full_m, local_hidden] @ Wo_i^T → [full_m, dim] partial → RS → [local_m, dim].
 
-This matches Megatron-LM RowParallelLinear with input_is_parallel=True.
+This uses reduce-scatter (not AllReduce) — matches our bf16_gemm_rs_nt operator.
+The RS replaces the POST A2A (scatter seq) + full Wo GEMM in serial/fused_std.
 """
 
 import torch
@@ -15,47 +15,51 @@ from .base import UlyssesBase
 from .serial import NCCLAllToAll
 
 
-class AllReduce(torch.autograd.Function):
-    """AllReduce with autograd: forward=AllReduce, backward=Identity (Megatron g operator)."""
+class ReduceScatter(torch.autograd.Function):
+    """Reduce-scatter with autograd: forward=RS, backward=AllGather."""
 
     @staticmethod
     def forward(ctx, x, group):
+        """x [full_m, dim] → RS → [local_m, dim] (each rank gets 1/sp of the sum)."""
         ctx.group = group
-        # Non-in-place: create output, all_reduce into it
-        out = x.clone()
-        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=group)
+        sp = group.size()
+        full_m, dim = x.shape
+        local_m = full_m // sp
+        out = torch.empty(local_m, dim, dtype=x.dtype, device=x.device)
+        dist.reduce_scatter_tensor(out, x, op=dist.ReduceOp.SUM, group=group)
         return out
 
     @staticmethod
-    def backward(ctx, grad):
-        # Identity: grad flows directly (AllReduce in forward makes all ranks identical)
-        return grad, None
+    def backward(ctx, grad_out):
+        """Backward = AllGather: [local_m, dim] → [full_m, dim]."""
+        sp = ctx.group.size()
+        full_list = [torch.empty_like(grad_out) for _ in range(sp)]
+        dist.all_gather(full_list, grad_out, group=ctx.group)
+        return torch.cat(full_list, dim=0), None
 
 
 class FusedVariantUlysses(UlyssesBase):
-    """Q/K/V separate + Wo row-split with AllReduce (Megatron TP style)."""
+    """Q/K/V separate + Wo column-split + GEMM+RS (Ulysses variant)."""
 
     def __init__(self, config, sp_config):
         super().__init__(config, sp_config)
 
     def _build_weights(self):
-        """Standard [Q_all, K_all, V_all] order + Wo column-split (Megatron RowParallel)."""
+        """Standard [Q_all, K_all, V_all] + Wo column-split (for GEMM+RS)."""
         Wq = self.model.q.weight
         Wk = self.model.k.weight
         Wv = self.model.v.weight
         self.Wqkv = nn.Parameter(torch.cat([Wq, Wk, Wv], dim=0).clone(), requires_grad=True)
         self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
-        # Wo column-split (Megatron RowParallelLinear): Wo_i = Wo[:, i*dim/N:(i+1)*dim/N] = [dim, dim/N]
-        # input attn_i [lm, dim/N] (local_hidden), Y_i = attn_i @ Wo_i^T = [lm, dim] (partial) → AllReduce
-        local_hidden = self.local_nh * self.head_dim  # dim / sp
+        # Wo column-split: Wo_i = Wo[:, i*local_hidden:(i+1)*local_hidden] = [dim, local_hidden]
+        # Y = attn [full_m, local_hidden] @ Wo_i^T [dim, local_hidden].T = [full_m, dim] (partial) → RS
+        local_hidden = self.local_nh * self.head_dim
         rank = self.group.rank()
         Wo = self.model.o.weight  # [dim, dim] = [out, in]
         Wo_i = Wo[:, rank * local_hidden:(rank + 1) * local_hidden].contiguous()  # [dim, local_hidden]
         self.Wo_r_local = nn.Parameter(Wo_i.clone(), requires_grad=True)
         self.Wo_r_local_t = nn.Parameter(self.Wo_r_local.data.t().contiguous(), requires_grad=True)
         self._wo_sharded = True  # Wo grad is local (no FSDP2 sync)
-        self._wo_rank = rank
-        self._local_hidden = local_hidden
 
     def _pre_forward(self, x_local, llseq):
         """PRE: GEMM → split Q/K/V → norm → A2A scatter heads → gather seq."""
@@ -79,18 +83,19 @@ class FusedVariantUlysses(UlyssesBase):
         return torch.cat([q, k, v], dim=2).reshape(lbs, lseq, -1)
 
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
-        """POST: A2A scatter seq → Wo full GEMM (same as serial for correctness).
+        """POST: Wo column-split GEMM → RS → + bias.
 
-        TODO: switch to Megatron RowParallel (Wo column-split + AllReduce) when
-        AllReduce autograd Function is fixed (backward=Identity issue).
+        o [lbs, lseq, local_nh, hd] → flatten [full_m, local_hidden]
+        → Y_i = attn @ Wo_i^T = [full_m, dim] (partial) → RS → [local_m, dim] → + bias
         """
-        sp = self.sp_size
-        hd = self.head_dim
-        hidden = self.cfg.dim
-        lm = lbs * llseq
-        x_bhsd = o.transpose(1, 2)
-        send = x_bhsd.view(lbs, self.local_nh, sp, llseq, hd).permute(2, 0, 3, 1, 4).contiguous()
-        recv = NCCLAllToAll.apply(send, self.group)
-        gathered = recv.permute(1, 2, 0, 3, 4).reshape(lm, hidden)
-        return torch.matmul(gathered, self.model.o.weight.t()) + self.model.o.bias
+        full_m = lbs * lseq  # full seq
+        local_hidden = self.local_hidden
+        # Flatten attention output
+        attn_local = o.reshape(full_m, local_hidden).contiguous()
+        # Wo column-split GEMM: Y_i = attn @ Wo_i^T = [full_m, local_hidden] @ [dim, local_hidden].T
+        # = [full_m, local_hidden] @ [local_hidden, dim] = [full_m, dim] (PARTIAL SUM)
+        y_partial = torch.matmul(attn_local, self.Wo_r_local.t())
+        # Reduce-scatter: sum partial sums across ranks + scatter seq → [local_m, dim]
+        y = ReduceScatter.apply(y_partial, self.group)
+        # Add bias (after RS, each rank has local_m tokens)
         return y + self.model.o.bias
