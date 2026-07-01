@@ -219,11 +219,11 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     # Compare torch baseline vs ground truth (should be very close, bf16 differences only)
     max_diff_ref_torch = (out_torch.float() - ref.float()).abs().max().item()
 
-    # Fused API (Phase 2 v1: Python-orchestrated GEMM + norm + NCCL A2A)
+    # Fused API (single kernel: GEMM + x²sum + scatter + rms scatter)
     import deep_gemm
     sym_buffer = deep_gemm.get_symm_buffer_for_fused_qkv_norm_a2a(
         group, bs, seq, q_nheads, kv_nheads, head_dim)
-    out_fused = deep_gemm.bf16_fused_qkv_norm_a2a_transpose_nt(
+    out_fused, rms_fused = deep_gemm.bf16_fused_qkv_norm_a2a_nt(
         a, b, sym_buffer, local_seq,
         q_nheads, kv_nheads, head_dim,
         eps=eps,
@@ -233,6 +233,11 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     )
     torch.cuda.synchronize(local_rank)
     dist.barrier()
+
+    if rank_idx == 0 and norm_enabled:
+        print(f"  DEBUG rms[0,:3,0]={rms_fused[0,:3,0].tolist()} sum={rms_fused.abs().sum().item():.4f}")
+        print(f"  DEBUG out[0,0,:3]={out_fused[0,0,:3].tolist()}")
+        print(f"  DEBUG ref[0,0,:3]={ref[0,0,:3].tolist()}")
 
     max_diff = (out_fused.float() - ref.float()).abs().max().item()
     mean_diff = (out_fused.float() - ref.float()).abs().mean().item()

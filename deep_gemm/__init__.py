@@ -138,7 +138,7 @@ from .gemm_a2a_transpose import (
 from .fused_qkv_norm_a2a import (
     FusedQKVNormA2ASymmBuffer,
     get_symm_buffer_for_fused_qkv_norm_a2a,
-    bf16_fused_qkv_norm_a2a_transpose_nt,
+    bf16_fused_qkv_norm_a2a_nt,
 )
 
 

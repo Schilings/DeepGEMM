@@ -14,20 +14,22 @@
 #include <deep_gemm/layout/fused_qkv_norm_a2a.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
+#include "../heuristics/gemm_rs_compute.hpp"
+
 namespace deep_gemm::fused_qkv_norm_a2a {
 
-// Scatter maps for QKV (GQA-aware): one descriptor per dst_rank, targeting
-// dst's output buffer as 2D [bs*seq, local_n_total] with NO swizzle (simpler, Phase 2 v1).
 struct FusedQKVNormA2AScatterMaps {
     CUtensorMap maps[8];
 };
 
-// Build a non-swizzled 2D TMA descriptor for the scatter target (dst's output buffer).
-static CUtensorMap make_scatter_tma_2d_desc_noswizzle(
+static CUtensorMap make_scatter_tma_2d_desc(
         void* gmem_ptr, const at::ScalarType& dtype, const int& elem_size,
         int gmem_inner_dim, int gmem_outer_dim,
         int smem_inner_dim, int smem_outer_dim,
-        const int& gmem_outer_stride) {
+        const int& gmem_outer_stride,
+        const int& swizzle_mode, const int& swizzle_base = 0) {
+    if (swizzle_mode != 0)
+        smem_inner_dim = swizzle_mode / elem_size;
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim),
                                       static_cast<cuuint64_t>(gmem_outer_dim)};
@@ -38,156 +40,104 @@ static CUtensorMap make_scatter_tma_2d_desc_noswizzle(
     DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(dtype, false, true),
         2, gmem_ptr, gmem_dims, gmem_strides, smem_dims, elem_strides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return tensor_map;
 }
 
-// Build a non-swizzled 2D TMA descriptor for loading from local buffer.
-static CUtensorMap make_local_load_tma_2d_desc(
-        void* gmem_ptr, const at::ScalarType& dtype, const int& elem_size,
-        int gmem_inner_dim, int gmem_outer_dim,
-        int smem_inner_dim, int smem_outer_dim,
-        const int& gmem_outer_stride) {
-    return make_scatter_tma_2d_desc_noswizzle(gmem_ptr, dtype, elem_size,
-                                               gmem_inner_dim, gmem_outer_dim,
-                                               smem_inner_dim, smem_outer_dim,
-                                               gmem_outer_stride);
-}
+// Runtime class for JIT compilation (same pattern as SM100BF16GemmA2ATransposeRuntime)
+class SM100BF16FusedQKVNormA2ARuntime final : public LaunchRuntime<SM100BF16FusedQKVNormA2ARuntime> {
+public:
+    struct Args {
+        int m, n, k;
+        int bs, seq, local_seq;
+        int q_dim, kv_dim, local_q_n, local_kv_n;
+        int num_ranks;
+        float eps;
+        bool do_norm_q, do_norm_k;
+        at::ScalarType cd_dtype;
+        at::ScalarType comm_dtype;
+        GemmRSComputeConfig config;
 
-// ════════════════════════════════════════════════════════════════
-//  Kernel 2: RMSNorm + A2A-transpose-scatter
-//  Reads local GEMM output, applies RMSNorm (optional on Q/K), scatters to peers.
-// ════════════════════════════════════════════════════════════════
+        float* sum_buffer;
+        layout::SymBuffer<> sym_buffer_ptrs;
+        CUtensorMap tensor_map_a;
+        CUtensorMap tensor_map_b;
+        FusedQKVNormA2AScatterMaps scatter_maps;
+        LaunchArgs launch_args;
+    };
 
-static void sm100_bf16_rmsnorm_a2a_scatter(
-    const torch::Tensor& local_buffer,    // [bs*local_seq, N_total] bf16 (Kernel 1 output)
-    const torch::Tensor& sym_buffer,      // symmetric output buffer
-    const std::vector<int64_t>& sym_buffer_ptrs,
-    const int& rank_idx,
-    const int& bs,
-    const int& local_seq,
-    const int& q_dim,
-    const int& kv_dim,
-    const int& q_nheads,
-    const int& kv_nheads,
-    const int& head_dim,
-    const float& eps,
-    const c10::optional<torch::Tensor>& norm_q_weight,  // [q_dim] fp32, or None
-    const c10::optional<torch::Tensor>& norm_k_weight,  // [kv_dim] fp32, or None
-    const torch::Tensor& sum_buffer) {                  // [bs*local_seq, 2] fp32
-
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
-    const auto num_sms = device_runtime->get_num_sms();
-
-    const int local_m = bs * local_seq;
-    const int n_total = q_dim + 2 * kv_dim;  // [Q | K | V]
-    const int seq = local_seq * num_ranks;
-
-    const int local_q_nheads = q_nheads / num_ranks;
-    const int local_kv_nheads = kv_nheads / num_ranks;
-    const int local_q_n = local_q_nheads * head_dim;
-    const int local_kv_n = local_kv_nheads * head_dim;
-    const int local_n_total = local_q_n + 2 * local_kv_n;
-
-    // Assert alignment
-    DG_HOST_ASSERT(local_seq % 128 == 0);  // BLOCK_M alignment
-    DG_HOST_ASSERT(q_dim % 128 == 0);      // Q segment divisible by BLOCK_N
-    DG_HOST_ASSERT(kv_dim % 128 == 0);     // K/V segment divisible by BLOCK_N
-    DG_HOST_ASSERT(local_q_n % 128 == 0 || local_q_n == 0);
-    DG_HOST_ASSERT(local_kv_n % 128 == 0 || local_kv_n == 0);
-
-    // Determine norm flags
-    const bool do_norm_q = norm_q_weight.has_value();
-    const bool do_norm_k = norm_k_weight.has_value();
-    if (do_norm_q) {
-        DG_HOST_ASSERT(norm_q_weight.value().scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(norm_q_weight.value().numel() == q_dim);
-    }
-    if (do_norm_k) {
-        DG_HOST_ASSERT(norm_k_weight.value().scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(norm_k_weight.value().numel() == kv_dim);
-    }
-
-    // ── Build scatter_maps: one 2D TMA descriptor per dst_rank ──
-    // Target: dst's output buffer [bs*seq, local_n_total], no swizzle, row-major
-    const int elem_size = 2;  // bf16
-    const int64_t out_offset = static_cast<int64_t>(layout::FusedQKVNormA2AWorkspace::kNumBarrierSignalBytes);
-
-    FusedQKVNormA2AScatterMaps scatter_maps{};
-    for (int d = 0; d < num_ranks; ++d) {
-        auto* out_ptr = reinterpret_cast<char*>(static_cast<uintptr_t>(sym_buffer_ptrs[d])) + out_offset;
-        // 2D descriptor: inner=local_n_total, outer=bs*seq, stride=local_n_total, no swizzle
-        // smem dims match tile: BLOCK_N=128, BLOCK_M=128
-        scatter_maps.maps[d] = make_scatter_tma_2d_desc_noswizzle(
-            reinterpret_cast<void*>(out_ptr), torch::kBFloat16, elem_size,
-            local_n_total, bs * seq,
-            128, 128,  // smem_inner, smem_outer (tile size)
-            local_n_total);
-    }
-
-    // ── Build local load TMA descriptor ──
-    // local_buffer: [local_m, n_total], row-major, stride=n_total
-    CUtensorMap tensor_map_local = make_local_load_tma_2d_desc(
-        local_buffer.data_ptr(), torch::kBFloat16, elem_size,
-        n_total, local_m,
-        128, 128,  // smem tile dims
-        n_total);
-
-    // ── Launch Kernel 2 ──
-    // For Phase 2 v1, use NVRTC JIT (not pre-compiled)
-    // The kernel is launched with 128 threads, num_sms blocks (persistent)
-    const int block_m = 128, block_n = 128;
-    const int num_m_blocks = (local_m + block_m - 1) / block_m;
-    const int num_n_blocks = (n_total + block_n - 1) / block_n;
-    const int num_tiles = num_m_blocks * num_n_blocks;
-    const int grid_size = std::min(num_tiles, num_sms);
-
-    // Build kernel name based on template params (norm flags)
-    std::string norm_q_str = do_norm_q ? "true" : "false";
-    std::string norm_k_str = do_norm_k ? "true" : "false";
-
-    // JIT compile and launch
-    auto code = fmt::format(R"(
-#include <deep_gemm/impls/sm100_bf16_rmsnorm_a2a_scatter.cuh>
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_bf16_fused_qkv_norm_a2a.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_bf16_rmsnorm_a2a_scatter_impl<
-        128, 128, 128, 2, {}, {}, {}, cutlass::bfloat16_t>);
+    auto ptr = reinterpret_cast<void*>(&sm100_bf16_fused_qkv_norm_a2a_impl<
+        {}, {}, {},
+        {},
+        {}, {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}
+    >);
 }};
-)", num_ranks, norm_q_str, norm_k_str);
+)", args.config.block_m, args.config.block_n, args.config.block_k,
+    args.config.num_stages,
+    args.config.swizzle_a_mode, args.config.swizzle_b_mode, args.config.swizzle_cd_mode,
+    args.config.num_multicast, args.config.is_multicast_on_a ? "true" : "false",
+    args.config.swap_ab ? "true" : "false", args.config.with_accumulation ? "true" : "false",
+    args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
+    args.launch_args.grid_dim.first, args.num_ranks,
+    args.do_norm_q ? "true" : "false",
+    args.do_norm_k ? "true" : "false",
+    to_string(args.cd_dtype),
+    to_string(args.comm_dtype));
+    }
 
-    // For now, use direct CUDA launch via the compiled kernel
-    // Note: In the actual implementation, this goes through the JIT compiler
-    // For Phase 2 v1, we'll use a simpler approach via torch extension
-
-    // Actually, let's use the JIT compiler infrastructure
-    auto runtime = compiler->build("sm100_bf16_rmsnorm_a2a_scatter", code);
-
-    // Launch parameters
-    const int num_threads = 128;
-    const int smem_size = 128 * 128 * 2 * 2 + 256;  // 2 stages × 128×128 bf16 + barriers
-
-    // Launch via the runtime
-    // (This is simplified — the actual LaunchRuntime handles grid/thread config)
-    // For now, we'll call the kernel directly via CUDA
-    // ... (actual launch code omitted — needs LaunchRuntime integration)
-
-    // Placeholder: the actual kernel launch will be done via the JIT runtime
-    // similar to SM100BF16GemmA2ATransposeRuntime
-}
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        uint32_t shape_m = static_cast<uint32_t>(args.m);
+        uint32_t shape_n = static_cast<uint32_t>(args.n);
+        uint32_t shape_k = static_cast<uint32_t>(args.k);
+        uint32_t bs = static_cast<uint32_t>(args.bs);
+        uint32_t seq = static_cast<uint32_t>(args.seq);
+        uint32_t local_seq = static_cast<uint32_t>(args.local_seq);
+        uint32_t q_dim = static_cast<uint32_t>(args.q_dim);
+        uint32_t kv_dim = static_cast<uint32_t>(args.kv_dim);
+        uint32_t local_q_n = static_cast<uint32_t>(args.local_q_n);
+        uint32_t local_kv_n = static_cast<uint32_t>(args.local_kv_n);
+        float eps = args.eps;
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            shape_m, shape_n, shape_k,
+            bs, seq, local_seq,
+            q_dim, kv_dim, local_q_n, local_kv_n,
+            eps,
+            args.sum_buffer,
+            args.tensor_map_a,
+            args.tensor_map_b,
+            args.sym_buffer_ptrs,
+            args.scatter_maps));
+    }
+};
 
 // ════════════════════════════════════════════════════════════════
-//  Full operator: Kernel 1 (GEMM + local write + x² sum) + Kernel 2 (norm + scatter)
+//  Entry point: single-kernel GEMM + x²sum + scatter + rms scatter
+//
+//  a: [bs*local_seq, K] bf16 (local seq shard, full hidden)
+//  b: [N, K] bf16, NT layout, N = q_dim + 2*kv_dim
+//  sym_buffer: symmetric buffer (holds rms region + output region)
+//  sum_buffer: [bs*local_seq, 2] fp32 (local, for x² partial sum)
 // ════════════════════════════════════════════════════════════════
-
-static void bf16_fused_qkv_norm_a2a_transpose_nt(
-    const torch::Tensor& a,                    // [bs*local_seq, K] bf16
-    const torch::Tensor& b,                    // [N_total, K] bf16, NT layout
+static void sm100_bf16_fused_qkv_norm_a2a_nt(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs,
+    const torch::Tensor& sum_buffer,
     const int& rank_idx,
     const int& bs,
     const int& local_seq,
@@ -195,43 +145,96 @@ static void bf16_fused_qkv_norm_a2a_transpose_nt(
     const int& kv_nheads,
     const int& head_dim,
     const float& eps,
-    const c10::optional<torch::Tensor>& norm_q_weight,
-    const c10::optional<torch::Tensor>& norm_k_weight,
-    const c10::optional<torch::Tensor>& bias) {
+    const bool& do_norm_q,
+    const bool& do_norm_k) {
 
 #if DG_TENSORMAP_COMPATIBLE
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 10);
+    DG_HOST_ASSERT(sym_buffer_ptrs.size() > 1);
 
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const int local_m = bs * local_seq;
     const int q_dim = q_nheads * head_dim;
     const int kv_dim = kv_nheads * head_dim;
     const int n_total = q_dim + 2 * kv_dim;
+    const int seq = local_seq * num_ranks;
+    const int local_q_n = (q_nheads / num_ranks) * head_dim;
+    const int local_kv_n = (kv_nheads / num_ranks) * head_dim;
+    const int local_n_total = local_q_n + 2 * local_kv_n;
 
-    // ── Step 1: GEMM + bias → local_buffer + x² sum ──
-    // Allocate local buffer and sum buffer
-    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(a.device());
-    auto opts_fp32 = torch::TensorOptions().dtype(torch::kFloat).device(a.device());
+    // Alignment checks
+    DG_HOST_ASSERT(local_seq % 128 == 0);
+    DG_HOST_ASSERT(q_dim % 128 == 0);
+    DG_HOST_ASSERT(kv_dim % 128 == 0);
+    DG_HOST_ASSERT(local_q_n % 128 == 0);
+    DG_HOST_ASSERT(local_kv_n % 128 == 0);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(a.size(0) == local_m and a.size(1) == b.size(1));
+    DG_HOST_ASSERT(b.size(0) == n_total);
 
-    torch::Tensor local_buffer = torch::empty({local_m, n_total}, opts_bf16);
-    torch::Tensor sum_buffer = torch::zeros({local_m, 2}, opts_fp32);
+    // Compute config (reuse GEMM-RS heuristic with num_ranks=1)
+    const auto num_sms = device_runtime->get_num_sms();
+    auto config = get_gemm_rs_compute_config(local_m, n_total, static_cast<int>(a.size(1)),
+                                              num_sms, 2, 1);
 
-    // GEMM: d = a @ b^T
-    // For Phase 2 v1, use deep_gemm.bf16_gemm_nt (called from Python)
-    // The actual fused kernel will replace this
-    // (This host function is the C++ entry point; Python wrapper handles the GEMM call)
+    // Build TMA descriptors for A and B
+    const auto tensor_map_a = make_tma_2d_desc(a,
+        static_cast<int>(a.size(1)), local_m,
+        config.block_k, config.load_block_m,
+        static_cast<int>(a.stride(-2)), config.swizzle_a_mode);
+    const auto tensor_map_b = make_tma_2d_desc(b,
+        static_cast<int>(b.size(1)), n_total,
+        config.block_k, config.load_block_n,
+        static_cast<int>(b.stride(-2)), config.swizzle_b_mode);
 
-    // ... (Kernel 1 launch — GEMM with local write + x² sum)
-    // ... (Kernel 2 launch — norm + scatter)
+    // Build scatter_maps: one per dst_rank, targeting dst's OUTPUT region
+    // (after rms region in sym buffer)
+    const int elem_size = 2;  // bf16
+    const auto workspace = layout::FusedQKVNormA2AWorkspace(
+        nullptr, num_ranks, bs, seq, local_n_total, elem_size);
+    const int64_t out_offset = static_cast<int64_t>(
+        layout::FusedQKVNormA2AWorkspace::kNumBarrierSignalBytes + workspace.get_rms_region_bytes());
 
-    // For Phase 2 v1, the actual CUDA kernel launches are deferred to the Python wrapper
-    // which orchestrates: bf16_gemm_nt + custom norm_sum kernel + rmsnorm_a2a_scatter kernel
+    FusedQKVNormA2AScatterMaps scatter_maps{};
+    for (int d = 0; d < num_ranks; ++d) {
+        auto* out_ptr = reinterpret_cast<char*>(static_cast<uintptr_t>(sym_buffer_ptrs[d])) + out_offset;
+        scatter_maps.maps[d] = make_scatter_tma_2d_desc(
+            reinterpret_cast<void*>(out_ptr), torch::kBFloat16, elem_size,
+            local_n_total, bs * seq,
+            config.swizzle_cd_mode / elem_size, config.block_m,
+            local_n_total,
+            config.swizzle_cd_mode);
+    }
 
-    sm100_bf16_rmsnorm_a2a_scatter(
-        local_buffer, sym_buffer, sym_buffer_ptrs, rank_idx,
-        bs, local_seq, q_dim, kv_dim, q_nheads, kv_nheads, head_dim,
-        eps, norm_q_weight, norm_k_weight, sum_buffer);
+    // Launch args
+    const int total_threads = config.num_non_epilogue_threads + config.num_epilogue_threads;
+    const SM100BF16FusedQKVNormA2ARuntime::Args args = {
+        .m = local_m, .n = n_total, .k = static_cast<int>(a.size(1)),
+        .bs = bs, .seq = seq, .local_seq = local_seq,
+        .q_dim = q_dim, .kv_dim = kv_dim, .local_q_n = local_q_n, .local_kv_n = local_kv_n,
+        .num_ranks = num_ranks,
+        .eps = eps,
+        .do_norm_q = do_norm_q, .do_norm_k = do_norm_k,
+        .cd_dtype = torch::kBFloat16,
+        .comm_dtype = torch::kBFloat16,
+        .config = config,
+        .sum_buffer = reinterpret_cast<float*>(sum_buffer.data_ptr()),
+        .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .scatter_maps = scatter_maps,
+        .launch_args = LaunchArgs(num_sms, total_threads, config.smem_size, config.num_multicast)
+    };
+
+    // Zero sum_buffer before kernel launch
+    // sum_buffer is [bs*seq, 2] (indexed by output M row, which can be up to bs*seq-1)
+    AT_CUDA_CHECK(cudaMemsetAsync(sum_buffer.data_ptr(), 0, sum_buffer.nbytes(),
+                                   at::cuda::getCurrentCUDAStream()));
+
+    const auto code = SM100BF16FusedQKVNormA2ARuntime::generate(args);
+    const auto runtime = compiler->build("sm100_bf16_fused_qkv_norm_a2a_nt", code);
+    SM100BF16FusedQKVNormA2ARuntime::launch(runtime, args);
 #else
     DG_HOST_UNREACHABLE("Fused QKV+Norm+A2A requires TensorMap support");
 #endif
@@ -239,8 +242,14 @@ static void bf16_fused_qkv_norm_a2a_transpose_nt(
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
-    // APIs will be registered as we implement them
-    // m.def("bf16_fused_qkv_norm_a2a_transpose_nt", &bf16_fused_qkv_norm_a2a_transpose_nt, ...);
+    m.def("sm100_bf16_fused_qkv_norm_a2a_nt", &sm100_bf16_fused_qkv_norm_a2a_nt,
+          pybind11::arg("a"), pybind11::arg("b"),
+          pybind11::arg("sym_buffer"), pybind11::arg("sym_buffer_ptrs"),
+          pybind11::arg("sum_buffer"),
+          pybind11::arg("rank_idx"),
+          pybind11::arg("bs"), pybind11::arg("local_seq"),
+          pybind11::arg("q_nheads"), pybind11::arg("kv_nheads"), pybind11::arg("head_dim"),
+          pybind11::arg("eps"), pybind11::arg("do_norm_q"), pybind11::arg("do_norm_k"));
 #endif
 }
 

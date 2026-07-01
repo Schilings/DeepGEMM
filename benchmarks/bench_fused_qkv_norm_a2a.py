@@ -153,7 +153,7 @@ def run_bench(local_rank, num_local_ranks, iters=30):
         sym_buffer = deep_gemm.get_symm_buffer_for_fused_qkv_norm_a2a(
             group, bs, seq, q_nheads, kv_nheads, head_dim)
         def v2b_fn():
-            deep_gemm.bf16_fused_qkv_norm_a2a_transpose_nt(
+            deep_gemm.bf16_fused_qkv_norm_a2a_nt(
                 x, b, sym_buffer, local_seq,
                 q_nheads, kv_nheads, head_dim,
                 eps=eps, norm_q_weight=norm_q, norm_k_weight=norm_k, bias=bias)

@@ -180,10 +180,12 @@ sm100_bf16_fused_qkv_norm_a2a_impl(const uint32_t shape_m,
 
     // ── Build epilogue context for EpilogueX2Sum ──
     using epilogue_type_t = epilogue::transform::EpilogueX2Sum;
-    typename epilogue_type_t::Context epi_ctx{
-        .sum_buffer = sum_buffer,
-        .q_dim = q_dim,
-        .kv_dim = kv_dim,
+    typename epilogue_type_t::Context epi_ctx_base{
+        .sum_buffer = sum_buffer,  // [local_m, 2], indexed by GEMM M row
+        .q_dim = q_dim,             // GEMM-space Q segment boundary
+        .kv_dim = kv_dim,           // GEMM-space K segment width
+        .gemm_m_offset = 0,         // set per-tile
+        .gemm_n_offset = 0,         // set per-tile
     };
 
     // ── Pipeline state ──
@@ -337,6 +339,18 @@ sm100_bf16_fused_qkv_norm_a2a_impl(const uint32_t shape_m,
             }
             const uint32_t base_m_idx = b * seq + rank_idx * local_seq + s_local;
 
+            // Set per-tile ctx: gemm_n_offset converts dst N → GEMM N
+            // gemm_n = dst_n + gemm_n_offset, where gemm_n_offset = n_col (GEMM N) - base_n_idx (dst N)
+            // For Q segment: gemm_n_offset = dst_rank * local_q_n
+            // For K segment: gemm_n_offset = q_dim + dst_rank * local_kv_n - local_q_n
+            // For V segment: gemm_n_offset = q_dim + kv_dim + dst_rank * local_kv_n - local_q_n - local_kv_n
+            // Simpler: gemm_n_offset = n_col - base_n_idx (GEMM N minus dst N)
+            int32_t gemm_n_offset = static_cast<int32_t>(n_col) - static_cast<int32_t>(base_n_idx);
+            int32_t gemm_m_offset = static_cast<int32_t>(global_m) - static_cast<int32_t>(base_m_idx);
+            typename epilogue_type_t::Context epi_ctx = epi_ctx_base;
+            epi_ctx.gemm_n_offset = gemm_n_offset;
+            epi_ctx.gemm_m_offset = gemm_m_offset;
+
             // Use EpilogueX2Sum instead of EpilogueIdentity — this is the ONLY change
             // from bf16_gemm_a2a_transpose_nt's epilogue (plus GQA-aware scatter index).
             epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
@@ -348,7 +362,7 @@ sm100_bf16_fused_qkv_norm_a2a_impl(const uint32_t shape_m,
              epilogue_warp_idx, lane_idx,
              tmem_empty_barriers[accum_stage_idx],
              scatter_maps.maps[dst_rank],
-             epi_ctx);  // ← pass x²sum context
+             epi_ctx);  // ← pass x²sum context with per-tile gemm_n_offset
         }
         ptx::tma_store_wait<0>();
         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
@@ -375,43 +389,40 @@ sm100_bf16_fused_qkv_norm_a2a_impl(const uint32_t shape_m,
     //  Uses direct global stores (P2P via NVLink) — no TMA needed for this tiny data.
     // ════════════════════════════════════════════════════════════════
     if (blockIdx.x == 0) {
-        // Each thread handles a few rows
+        // Iterate over this rank's GEMM rows (0..local_m-1)
+        // sum_buffer is indexed by GEMM M row
         const uint32_t local_m = bs * local_seq;
         const uint32_t rows_per_thread = (local_m + kNumThreads - 1) / kNumThreads;
 
         for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            uint32_t row = r * kNumThreads + thread_idx;
-            if (row >= local_m) break;
+            uint32_t gemm_row = r * kNumThreads + thread_idx;
+            if (gemm_row >= local_m) break;
 
-            // Compute rms
+            // Compute rms from sum_buffer (indexed by GEMM row)
             float rms_q_val = 0.f, rms_k_val = 0.f;
             if constexpr (kDoNormQ) {
-                float sum_q = sum_buffer[row * 2 + 0];
+                float sum_q = sum_buffer[gemm_row * 2 + 0];
                 rms_q_val = rsqrtf(sum_q / static_cast<float>(q_dim) + eps);
             }
             if constexpr (kDoNormK) {
-                float sum_k = sum_buffer[row * 2 + 1];
+                float sum_k = sum_buffer[gemm_row * 2 + 1];
                 rms_k_val = rsqrtf(sum_k / static_cast<float>(kv_dim) + eps);
             }
 
-            // Compute output row index: b*seq + rank_idx*local_seq + s_local
-            // This is where this rank's data lands in each peer's rms region
-            uint32_t b = row / local_seq;
-            uint32_t s_local = row - b * local_seq;
+            // Compute output row: b*seq + rank*local_seq + s_local
+            uint32_t b = gemm_row / local_seq;
+            uint32_t s_local = gemm_row - b * local_seq;
             uint32_t out_row = b * seq + rank_idx * local_seq + s_local;
 
-            // Scatter rms to all peers' rms regions
-            // rms region is at sym_buffer offset 32, [bs*seq, 2] float32
+            // Scatter rms to all peers' rms regions at out_row
             for (uint32_t d = 0; d < kNumRanks; ++d) {
                 float* peer_rms_ptr = sym_buffer.template map<float*>(
                     workspace.get_rms_ptr<float>(), d);
-                // Write rms_q and rms_k to peer's rms region at out_row
                 peer_rms_ptr[out_row * 2 + 0] = rms_q_val;
                 peer_rms_ptr[out_row * 2 + 1] = rms_k_val;
             }
         }
         __syncthreads();
-        // Ensure rms stores are visible before the next barrier
         __threadfence_system();
     }
 

@@ -61,27 +61,29 @@ struct EpilogueHeadSplits: EpilogueIdentity {
 // ════════════════════════════════════════════════════════════════
 struct EpilogueX2Sum: EpilogueIdentity {
     struct Context {
-        float* sum_buffer;  // [shape_m, 2]
-        uint32_t q_dim;                // Q 段结束
-        uint32_t kv_dim;               // K 段宽度（K 段 = [q_dim, q_dim+kv_dim)）
+        float* sum_buffer;   // [local_m, 2] fp32 (Q=0, K=1), indexed by GEMM M row
+        uint32_t q_dim, kv_dim;       // GEMM-space segment boundaries
+        int32_t gemm_m_offset;        // gemm_m = out_m + gemm_m_offset (per-tile)
+        int32_t gemm_n_offset;        // gemm_n = out_n + gemm_n_offset (per-tile)
     };
 
     template <uint32_t kNumElems>
     CUTLASS_DEVICE static void pre_cast(float* values,
-                                         const uint32_t& global_m,
-                                         const uint32_t& n_col,
+                                         const uint32_t& out_m,   // output M row
+                                         const uint32_t& n_col,    // output N col (post-scatter)
                                          const Context& ctx) {
-        // 只对 Q/K 段做 sum（V 段跳过）
-        const bool is_q = (n_col < ctx.q_dim);
-        const bool is_k = (!is_q && n_col < ctx.q_dim + ctx.kv_dim);
+        // Convert output coords → GEMM coords
+        uint32_t gemm_m = static_cast<uint32_t>(static_cast<int32_t>(out_m) + ctx.gemm_m_offset);
+        uint32_t gemm_n = static_cast<uint32_t>(static_cast<int32_t>(n_col) + ctx.gemm_n_offset);
+        const bool is_q = (gemm_n < ctx.q_dim);
+        const bool is_k = (!is_q && gemm_n < ctx.q_dim + ctx.kv_dim);
         if (is_q || is_k) {
             const uint32_t sum_idx = is_q ? 0 : 1;
             float sq_sum = 0.f;
             #pragma unroll
             for (uint32_t i = 0; i < kNumElems; ++i)
                 sq_sum += values[i] * values[i];
-            // atomic add 到 per-row sum（Q/K 分开）
-            atomicAdd(&ctx.sum_buffer[global_m * 2 + sum_idx], sq_sum);
+            atomicAdd(&ctx.sum_buffer[gemm_m * 2 + sum_idx], sq_sum);
         }
     }
 };
