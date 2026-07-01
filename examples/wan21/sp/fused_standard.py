@@ -10,19 +10,19 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
+from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
+
 from .base import UlyssesBase
 from ..autograd_ops import GemmA2ATransposeFunction, A2ATransposeGemmFunction
 
 
 class FusedStandardUlysses(UlyssesBase):
     def _create_buffers(self):
-        from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
-        from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
         self.sym_pre = get_symm_buffer_for_gemm_a2a_transpose(
             self.group, self.bs, self.seq, self.cfg.n_qkv)
         self.sym_post = get_symm_buffer_for_a2a_transpose_gemm(
             self.group, self.bs, self.cfg.num_heads, self.seq, self.head_dim)
-        # PRE backward (A2A+GEMM dual) reuses the same sym buffer type as POST forward
         assert (3 * self.cfg.num_heads) % self.sp_size == 0, '3*num_heads must divide sp_size'
         self.sym_pre_bwd = get_symm_buffer_for_a2a_transpose_gemm(
             self.group, self.bs, 3 * self.cfg.num_heads, self.seq, self.head_dim)

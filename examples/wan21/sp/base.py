@@ -53,15 +53,12 @@ class UlyssesBase(nn.Module):
         self._create_buffers()
 
     def _build_weights(self):
-        Wq = self.model.q_proj.weight
-        Wk = self.model.k_proj.weight
-        Wv = self.model.v_proj.weight
-        Wo = self.model.o_proj.weight
-        # Register Wqkv as nn.Parameter (not buffer) so FSDP2 can shard/sync it
-        Wqkv = build_wqkv_rankmajor(Wq, Wk, Wv, self.sp_size, self.local_nh, self.head_dim)
+        # Model now has fused qkv_proj [3*dim, dim] — reorder to rank-major for SP
+        Wqkv_weight = self.model.qkv_proj.weight  # [3*dim, dim] (Q,K,V concatenated)
+        Wqkv = build_wqkv_rankmajor(Wqkv_weight, self.sp_size, self.local_nh, self.head_dim)
         self.Wqkv = nn.Parameter(Wqkv.clone(), requires_grad=True)
         self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
-        self.Wo = Wo  # model.o_proj.weight, still managed by FSDP2 via model
+        self.Wo = self.model.o_proj.weight  # [dim, dim], managed by FSDP2 via model
         self.Wo_t = Wo.t().contiguous()
 
     def _create_buffers(self):

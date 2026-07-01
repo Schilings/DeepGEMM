@@ -12,27 +12,24 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
+from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs
+from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm
+from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
+
 from .base import UlyssesBase
 from ..autograd_ops import GemmA2ATransposeFunction, GemmRSFunction
 
 
 class FusedVariantUlysses(UlyssesBase):
     def _create_buffers(self):
-        from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
-        from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs
-        from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm
-        from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
         n_qkv = self.cfg.n_qkv
         local_N = self.cfg.dim // self.sp_size
         local_m = self.local_m
-        # PRE forward: GEMM+A2A
         self.sym_pre = get_symm_buffer_for_gemm_a2a_transpose(
             self.group, self.bs, self.seq, n_qkv)
-        # POST forward: GEMM+RS
         self.sym_gemm_rs = get_symm_buffer_for_gemm_rs(self.group, local_m, local_N)
-        # POST backward: AG+GEMM (dual, shares buffer type)
         self.sym_ag_gemm = get_symm_buffer_for_bf16_ag_gemm(self.group, local_m, local_N)
-        # PRE backward: A2A+GEMM (dual of GEMM+A2A forward); QKV = 3*num_heads "heads"
         assert (3 * self.cfg.num_heads) % self.sp_size == 0, '3*num_heads must divide sp_size'
         self.sym_pre_bwd = get_symm_buffer_for_a2a_transpose_gemm(
             self.group, self.bs, 3 * self.cfg.num_heads, self.seq, self.head_dim)

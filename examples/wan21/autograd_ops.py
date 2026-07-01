@@ -11,19 +11,19 @@ Dual relationships (forward ↔ backward):
   A2A+GEMM (post-attn fwd) ↔  GEMM+A2A (post-attn bwd)  [scatter heads]
   GEMM+RS  (post-attn var) ↔  AG+GEMM  (post-attn bwd)  [gather tokens]
 
-Weight gradients: PyTorch autograd computes them automatically from the GEMM's
-input gradient chain (since weights are nn.Parameter leaf nodes with requires_grad).
+Weight gradients: manually computed in backward (standard matmul, no overlap).
 The fused kernel only computes the activation gradient; the weight grad is a
-standard matmul that autograd derives from the forward GEMM's backward.
-
-NOTE on weight grads: The fused comm-GEMM kernels write the output directly (not
-via a standard GEMM that autograd can differentiate). So for weight grads we must
-manually compute them in the Function's backward (standard matmul, no overlap).
-The fused kernel's epilogue communication only applies to the activation path.
+standard matmul that the Function's backward computes explicitly.
 """
 
 import torch
 import torch.distributed as dist
+
+import deep_gemm
+from deep_gemm import bf16_gemm_a2a_transpose_nt
+from deep_gemm.a2a_transpose_gemm import bf16_a2a_transpose_gemm_nt, bf16_a2a_transpose_gemm_nt_fused
+from deep_gemm.gemm_rs import bf16_gemm_rs_nt
+from deep_gemm.ag_gemm import bf16_ag_gemm_nt
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -38,20 +38,6 @@ class GemmA2ATransposeFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x_local, weight, sym_buffer, sym_buffer_bwd, local_seq, n_qkv, sp_size, group, layout_info):
-        """x_local [local_m, K] @ weight[N, K]^T → A2A-scatter → qkv [bs, seq, local_n].
-
-        Args:
-            x_local: [local_m, K] bf16, requires_grad=True
-            weight: [N, K] bf16 (Wqkv, NT layout), nn.Parameter
-            sym_buffer: GemmA2ATransposeSymmBuffer (for forward GEMM+A2A)
-            sym_buffer_bwd: BF16A2ATransposeGemmSymmBuffer (for backward A2A+GEMM)
-            local_seq: this rank's seq length
-            n_qkv: full N = 3 * nheads * head_dim
-            sp_size: SP degree
-            group: process group
-            layout_info: dict with bs, lseq, lbs, llseq for backward reshaping
-        """
-        from deep_gemm import bf16_gemm_a2a_transpose_nt
         ctx.sym_buffer = sym_buffer
         ctx.sym_buffer_bwd = sym_buffer_bwd
         ctx.local_seq = local_seq
@@ -66,26 +52,21 @@ class GemmA2ATransposeFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_qkv):
-        """grad_qkv → A2A-gather(heads) → grad_local → grad_X = grad_local @ Wqkv, grad_Wqkv = grad_local^T @ x."""
-        from deep_gemm.a2a_transpose_gemm import bf16_a2a_transpose_gemm_nt
         x_local, weight = ctx.saved_tensors
         li = ctx.layout_info
         lbs = li['lbs']; lseq = li['lseq']; llseq = li['llseq']; lm = li['lm']
         local_nh_qkv = 3 * (li['nheads'] // ctx.sp_size)
         head_dim = li['head_dim']
-        # grad_qkv [lbs, lseq, local_nqkv] → BHSD [lbs, 3*local_nh, lseq, hd]
         gqkv_bhsd = grad_qkv.view(lbs, lseq, local_nh_qkv, head_dim).transpose(1, 2).contiguous()
         ctx.sym_buffer_bwd.x.copy_(gqkv_bhsd)
         grad_X = torch.empty((lm, li['hidden']), dtype=torch.bfloat16, device=grad_qkv.device)
         bf16_a2a_transpose_gemm_nt(grad_X, weight.t(), ctx.sym_buffer_bwd)
-        # Weight grad: grad_Wqkv = grad_local^T @ x_local
         grad_local = ctx.sym_buffer_bwd.gathered[:lm, :ctx.n_qkv]
         grad_weight = torch.matmul(grad_local.t(), x_local)
         return grad_X, grad_weight, None, None, None, None, None, None, None
 
 
 def gemm_a2a_transpose(x_local, weight, sym_buffer, sym_buffer_bwd, local_seq, n_qkv, sp_size, group, layout_info):
-    """Functional wrapper for GemmA2ATransposeFunction."""
     return GemmA2ATransposeFunction.apply(x_local, weight, sym_buffer, sym_buffer_bwd, local_seq, n_qkv, sp_size, group, layout_info)
 
 
@@ -101,15 +82,6 @@ class A2ATransposeGemmFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, o, weight, sym_buffer, layout_info):
-        """o [bs, seq, local_nh, hd] → A2A-transpose → gathered → @ weight^T → y [local_m, N].
-
-        Args:
-            o: attention output [bs, seq, local_nh, hd] bf16, requires_grad=True
-            weight: Wo [N, hidden] bf16, nn.Parameter (NT layout)
-            sym_buffer: BF16A2ATransposeGemmSymmBuffer
-            layout_info: dict with bs, seq, local_nh, hd, local_m, hidden, sp_size, group
-        """
-        from deep_gemm.a2a_transpose_gemm import bf16_a2a_transpose_gemm_nt_fused
         ctx.sym_buffer = sym_buffer
         ctx.layout_info = layout_info
         ctx.save_for_backward(o, weight)
@@ -122,21 +94,17 @@ class A2ATransposeGemmFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        """grad_y → grad_y @ Wo → A2A-inv → grad_o. grad_Wo = grad_y^T @ gathered."""
         o, weight = ctx.saved_tensors
         li = ctx.layout_info
         sp = li['sp_size']; hd = li['hd']; hidden = li['hidden']
         lbs = li['lbs']; lseq = li['lseq']; llseq = li['llseq']; lm = li['local_m']
         local_nh = li['local_nh']
         group = li['group']
-        # grad_gathered = grad_y @ Wo (standard matmul, autograd-compatible)
         grad_gathered = torch.matmul(grad_y, weight)
-        # A2A-inverse: [lm, hidden] → [lbs, llseq, sp, local_nh, hd] → permute → A2A → reshape
         send_bwd = grad_gathered.view(lbs, llseq, sp, local_nh, hd).permute(2, 0, 1, 3, 4).contiguous()
         recv_bwd = torch.empty_like(send_bwd)
         dist.all_to_all_single(recv_bwd, send_bwd, group=group)
         grad_o = recv_bwd.permute(1, 2, 0, 3, 4).reshape(lbs, lseq, local_nh, hd)
-        # Weight grad: grad_Wo = grad_y^T @ gathered (need to recompute gathered from o)
         x_bhsd = o.transpose(1, 2)
         send = x_bhsd.view(lbs, local_nh, sp, llseq, hd).permute(2, 0, 3, 1, 4).contiguous()
         recv = torch.empty_like(send)
@@ -147,7 +115,6 @@ class A2ATransposeGemmFunction(torch.autograd.Function):
 
 
 def a2a_transpose_gemm(o, weight, sym_buffer, layout_info):
-    """Functional wrapper for A2ATransposeGemmFunction."""
     return A2ATransposeGemmFunction.apply(o, weight, sym_buffer, layout_info)
 
 
@@ -163,16 +130,6 @@ class GemmRSFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
-        """attn [local_m, local_hidden] @ weight[local_N, local_hidden]^T → RS → y [local_m, local_N].
-
-        Args:
-            attn: [local_m, local_hidden] bf16, requires_grad=True
-            weight: Wo_r_local [local_N, local_hidden] bf16, nn.Parameter (NT layout)
-            sym_buffer: GemmRSSymmBuffer (for forward GEMM+RS)
-            sym_buffer_bwd: BF16AGGemmSymmBuffer (for backward AG+GEMM)
-            layout_info: dict with local_m, local_N, local_hidden, full_m, sp_size, group, bs, seq
-        """
-        from deep_gemm.gemm_rs import bf16_gemm_rs_nt
         ctx.sym_buffer = sym_buffer
         ctx.sym_buffer_bwd = sym_buffer_bwd
         ctx.layout_info = layout_info
@@ -185,17 +142,13 @@ class GemmRSFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y):
-        """grad_y → AG → grad_y_full → @ Wo_r → grad_attn. grad_Wo_r = grad_y_full^T @ attn."""
-        from deep_gemm.ag_gemm import bf16_ag_gemm_nt
         attn, weight = ctx.saved_tensors
         li = ctx.layout_info
         sp = li['sp_size']; local_N = li['local_N']; local_hidden = li['local_hidden']
         full_m = li['full_m']; local_m = li['local_m']; group = li['group']
-        # Fused AG+GEMM: grad_y → all-gather → @ Wo_r^T → grad_attn
         ctx.sym_buffer_bwd.x[:local_m, :local_N].copy_(grad_y)
         grad_attn = torch.empty((full_m, local_hidden), dtype=torch.bfloat16, device=grad_y.device)
         bf16_ag_gemm_nt(grad_attn, weight, ctx.sym_buffer_bwd, local_m)
-        # Weight grad: grad_Wo_r = grad_y_full^T @ attn
         gy_list = [torch.empty_like(grad_y) for _ in range(sp)]
         dist.all_gather(gy_list, grad_y, group=group)
         grad_y_full = torch.cat(gy_list, dim=0)
@@ -204,5 +157,4 @@ class GemmRSFunction(torch.autograd.Function):
 
 
 def gemm_rs(attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
-    """Functional wrapper for GemmRSFunction."""
     return GemmRSFunction.apply(attn, weight, sym_buffer, sym_buffer_bwd, layout_info)
