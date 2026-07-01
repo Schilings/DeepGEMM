@@ -155,26 +155,28 @@ def bf16_fused_qkv_norm_a2a_nt(
     rms = sym_buffer.get_rms_view().clone()  # small: [bs, seq, 2] fp32
 
     # Apply bias + norm in-place (minimal kernel launches)
+    # Strategy: precompute rms*weight, then single fused add+mul per segment
     local_q_n = (q_nheads // num_ranks) * head_dim
     local_kv_n = (kv_nheads // num_ranks) * head_dim
 
     if do_norm_q:
-        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[group.rank()].to(out.dtype)
+        # Precompute rms_q * norm_q_weight (broadcast over seq)
+        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[group.rank()]
+        rms_q_scaled = rms[:, :, 0:1] * local_norm_q.float()  # [bs, seq, 1] * [local_q_n]
         q_slice = out[:, :, :local_q_n]
         if bias is not None:
             q_slice.add_(bias[:q_dim].view(num_ranks, local_q_n)[group.rank()].to(out.dtype))
-        q_slice.mul_(rms[:, :, 0:1].to(out.dtype))
-        q_slice.mul_(local_norm_q)
+        q_slice.mul_(rms_q_scaled.to(out.dtype))  # [bs, seq, local_q_n]
     elif bias is not None:
         out[:, :, :local_q_n].add_(bias[:q_dim].view(num_ranks, local_q_n)[group.rank()].to(out.dtype))
 
     if do_norm_k:
-        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[group.rank()].to(out.dtype)
+        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[group.rank()]
+        rms_k_scaled = rms[:, :, 1:2] * local_norm_k.float()
         k_slice = out[:, :, local_q_n:local_q_n+local_kv_n]
         if bias is not None:
             k_slice.add_(bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
-        k_slice.mul_(rms[:, :, 1:2].to(out.dtype))
-        k_slice.mul_(local_norm_k)
+        k_slice.mul_(rms_k_scaled.to(out.dtype))
     elif bias is not None:
         out[:, :, local_q_n:local_q_n+local_kv_n].add_(
             bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
