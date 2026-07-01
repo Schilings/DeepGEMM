@@ -9,21 +9,22 @@ namespace deep_gemm::layout {
 //
 // Layout (per rank, symmetric):
 //   [0 .. 32)            barrier/signal region (kNumBarrierSignalBytes)
-//   [32 .. 32+OUT)       output region `out`: 2D [bs*seq, local_n_total], row-major
-//                        local_n_total = local_q_n + 2*local_kv_n (GQA-aware)
+//   [32 .. 32+RMS)       rms region: [bs*seq, 2] float32 (Q rms + K rms, per-row)
+//   [32+RMS .. 32+RMS+OUT) output region `out`: 2D [bs*seq, local_n_total], bf16
 //
-// Additionally, non-symmetric local buffers are allocated separately by the host:
-//   - local_buffer [bs*local_seq, N_total] (bf16) — Kernel 1's GEMM output
-//   - sum_buffer   [bs*local_seq, 2]        (fp32) — per-row x² sum (Q=idx0, K=idx1)
+// Additionally, non-symmetric local buffer:
+//   - sum_buffer [bs*local_seq, 2] (fp32) — per-row x² partial sum (filled by pre_cast)
+//     This is LOCAL only (not symmetric), allocated by host.
 struct FusedQKVNormA2AWorkspace {
     void* base;
     uint32_t num_ranks;
     uint32_t bs;
     uint32_t seq;
-    uint32_t local_n_total;   // local_q_n + 2*local_kv_n
-    uint32_t elem_size;       // 2 (bf16) or 4 (fp32)
+    uint32_t local_n_total;
+    uint32_t elem_size;
 
     static constexpr uint64_t kNumBarrierSignalBytes = 32;
+    static constexpr uint64_t kRMSBytesBase = 0;  // computed at runtime (bs*seq*2*4)
 
     CUTLASS_HOST_DEVICE
     FusedQKVNormA2AWorkspace(void* base,
@@ -37,6 +38,11 @@ struct FusedQKVNormA2AWorkspace {
         DG_UNIFIED_ASSERT(elem_size == 2 or elem_size == 4);
     }
 
+    // RMS region: [bs*seq, 2] float32, right after barrier region
+    CUTLASS_HOST_DEVICE uint64_t get_rms_region_bytes() const {
+        return static_cast<uint64_t>(bs) * seq * 2 * sizeof(float);
+    }
+
     CUTLASS_HOST_DEVICE uint64_t get_num_output_bytes() const {
         return static_cast<uint64_t>(bs) * seq * local_n_total * elem_size;
     }
@@ -44,6 +50,7 @@ struct FusedQKVNormA2AWorkspace {
     CUTLASS_HOST_DEVICE uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
+        num_bytes += get_rms_region_bytes();   // rms region (new)
         num_bytes += get_num_output_bytes();
         return math::align<uint64_t>(num_bytes, 16);
     }
@@ -62,10 +69,16 @@ struct FusedQKVNormA2AWorkspace {
         return math::advance_ptr<int>(base, 5 * sizeof(uint32_t) + phase * sizeof(int));
     }
 
-    // -- Output region base pointer --
+    // -- RMS region: [bs*seq, 2] float32, at offset 32 --
+    template <typename dtype_t = float>
+    CUTLASS_HOST_DEVICE dtype_t* get_rms_ptr() const {
+        return math::advance_ptr<dtype_t>(base, kNumBarrierSignalBytes);
+    }
+
+    // -- Output region: after rms region --
     template <typename dtype_t = void>
     CUTLASS_HOST_DEVICE dtype_t* get_output_ptr() const {
-        return math::advance_ptr<dtype_t>(base, kNumBarrierSignalBytes);
+        return math::advance_ptr<dtype_t>(base, kNumBarrierSignalBytes + get_rms_region_bytes());
     }
 };
 

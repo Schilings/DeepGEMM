@@ -26,29 +26,27 @@ namespace deep_gemm {
 using namespace deep_gemm::sm100;
 using namespace deep_gemm::math;
 
+// Host-side mirror of scatter maps for QKV (GQA-aware).
+struct FusedQKVNormA2AScatterMaps {
+    cute::TmaDescriptor maps[8];
+};
+
 // ============================================================================================
-//  sm100_bf16_fused_qkv_norm_a2a_impl — v2b SINGLE kernel
+//  sm100_bf16_fused_qkv_norm_a2a_impl — Single kernel, norm-deferred
 //
-//  Two-phase persistent kernel:
-//    Phase 1: GEMM → local HBM write + x² partial sum (atomic add to sum_buffer)
-//    grid_sync (kernel-internal, via comm::nvlink_barrier)
-//    Phase 2: reread local HBM → RMSNorm → P2P TMA scatter to peer
+//  Based on bf16_gemm_a2a_transpose_nt with these changes:
+//    1. Epilogue uses EpilogueX2Sum (pre_cast computes x² partial sum + atomic add)
+//    2. GQA-aware scatter: Q/K/V segments scatter independently
+//    3. After final barrier: compute rms + scatter rms to peers (fused in epilogue)
 //
-//  Warp layout Phase 1 (256T = 8 warps, same as GEMM-RS/A2A):
-//    W0: TMA Load A+B
-//    W1: MMA Issue
-//    W2: Reserved / TMEM Allocator
-//    W4-W7: Epilogue → TMEM→SMEM→TMA store to LOCAL HBM + x² atomic add
+//  Data flow:
+//    GEMM → epilogue: TMEM→SMEM→(pre_cast: x²sum)→cast→TMA scatter x to peer
+//    nvlink_barrier (all tiles done, sum_buffer complete)
+//    rms = rsqrt(sum/dim + eps) → scatter rms to peer's rms region (P2P store)
+//    nvlink_barrier (rms globally visible)
 //
-//  Warp layout Phase 2 (reuse same warps, now doing norm+scatter):
-//    W0: TMA load from local HBM + TMA store issue
-//    W0-W7: RMSNorm elementwise + barriers
-//
-//  SMEM is reused: Phase 1 SMEM_CD (for GEMM epilogue STSM) → Phase 2 SMEM_CD (for norm load/store)
-//  TMEM is deallocated after Phase 1, freeing registers for Phase 2.
-//
-//  GQA-aware: Q/K/V segments scatter independently.
-//  Norm optional: kDoNormQ/kDoNormK template flags (compile-time, no runtime branch).
+//  Peer side (separate lightweight kernel or Python):
+//    out = x * rms * weight (elementwise norm)
 // ============================================================================================
 
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -63,39 +61,28 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           typename cd_dtype_t,
           typename comm_dtype_t = cd_dtype_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
-sm100_bf16_fused_qkv_norm_a2a_impl(
-    const uint32_t shape_m,    // bs * local_seq
-    const uint32_t shape_n,    // N_total = q_dim + 2*kv_dim
-    const uint32_t shape_k,
-    const uint32_t bs,
-    const uint32_t seq,
-    const uint32_t local_seq,
-    const uint32_t q_dim,
-    const uint32_t kv_dim,
-    const uint32_t local_q_n,
-    const uint32_t local_kv_n,
-    const float eps,
-    const float* __restrict__ norm_q_weight,
-    const float* __restrict__ norm_k_weight,
-    const float* __restrict__ sum_buffer,         // [shape_m, 2] fp32
-    cd_dtype_t* __restrict__ local_buffer,         // [shape_m, shape_n] bf16 (Phase 1 output / Phase 2 input)
-    const __grid_constant__ cute::TmaDescriptor tensor_map_a,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-    const __grid_constant__ cute::TmaDescriptor tensor_map_local,  // for Phase 2 TMA load
-    const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
-    const __grid_constant__ FusedQKVNormA2AScatterMaps scatter_maps) {
-
+sm100_bf16_fused_qkv_norm_a2a_impl(const uint32_t shape_m,
+                                    const uint32_t shape_n,
+                                    const uint32_t shape_k,
+                                    const uint32_t bs,
+                                    const uint32_t seq,
+                                    const uint32_t local_seq,
+                                    const uint32_t q_dim,
+                                    const uint32_t kv_dim,
+                                    const uint32_t local_q_n,
+                                    const uint32_t local_kv_n,
+                                    const float eps,
+                                    float* __restrict__ sum_buffer,  // [shape_m, 2] local
+                                    const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+                                    const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+                                    const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                                    const __grid_constant__ FusedQKVNormA2AScatterMaps scatter_maps) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 2, cute::TMEM::Allocator2Sm, cute::TMEM::Allocator1Sm>;
     using ab_dtype_t = cutlass::bfloat16_t;
 
-    // ════════════════════════════════════════════════════════════════
-    //  Phase 1: GEMM → local HBM + x² sum
-    // ════════════════════════════════════════════════════════════════
-    // (Copied from sm100_bf16_gemm_a2a_transpose_impl, but epilogue writes to LOCAL
-    //  buffer instead of peer scatter, and adds x² atomic add for Q/K segments)
-
+    // ── Constants (identical to GEMM-A2A-transpose) ──
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
     constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N;
@@ -137,20 +124,19 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
     const uint32_t rank_idx = sym_buffer.rank_idx;
+    const uint32_t local_n_total = local_q_n + 2 * local_kv_n;
 
     const auto workspace = layout::FusedQKVNormA2AWorkspace(
-        sym_buffer.get_base_ptr(), kNumRanks, bs, seq,
-        local_q_n + 2 * local_kv_n, sizeof(comm_dtype_t));
+        sym_buffer.get_base_ptr(), kNumRanks, bs, seq, local_n_total, sizeof(comm_dtype_t));
 
     kNumMulticast > 1 ? cute::cluster_sync() : void();
 
-    // Prefetch TMA descriptors
     if (warp_idx == kLoadWarpIdx) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
     }
 
-    // ── Shared memory layout ──
+    // ── Shared memory layout (same as GEMM-A2A-transpose) ──
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
@@ -168,7 +154,7 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
     auto tmem_empty_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumStages * 2 + kNumEpilogueStages + i; });
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 2 + kNumEpilogueStages * 2);
 
-    // Initialize barriers
+    // ── Initialize barriers ──
     if (warp_idx == kMMAWarpIdx and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++i) {
@@ -192,7 +178,15 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
         workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
         [&]() { __syncthreads(); }, true, true);
 
-    // ── Phase 1: GEMM pipeline ──
+    // ── Build epilogue context for EpilogueX2Sum ──
+    using epilogue_type_t = epilogue::transform::EpilogueX2Sum;
+    typename epilogue_type_t::Context epi_ctx{
+        .sum_buffer = sum_buffer,
+        .q_dim = q_dim,
+        .kv_dim = kv_dim,
+    };
+
+    // ── Pipeline state ──
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
         ++k_block_idx;
@@ -200,6 +194,7 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
         phase ^= stage_idx == 0;
     };
 
+    // GQA-aware block scheduler
     auto get_next_block = [&](uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx, uint32_t& iter_idx) {
         const uint32_t m_blocks_per_cluster = kNumMulticast;
         const uint32_t num_m_pairs = ceil_div(num_m_blocks, m_blocks_per_cluster);
@@ -213,7 +208,9 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
         return true;
     };
 
-    // W0: TMA Load
+    // ════════════════════════════════════════════════════════════════
+    //  W0: TMA Load A+B (identical to GEMM-A2A-transpose)
+    // ════════════════════════════════════════════════════════════════
     if (warp_idx == kLoadWarpIdx and cute::elect_one_sync()) {
         uint32_t block_idx = cluster_idx, iter_idx = 0, m_block_idx, n_block_idx;
         while (get_next_block(block_idx, m_block_idx, n_block_idx, iter_idx)) {
@@ -240,7 +237,10 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
             }
         }
     }
-    // W1: MMA Issue
+
+    // ════════════════════════════════════════════════════════════════
+    //  W1: MMA Issue (identical to GEMM-A2A-transpose)
+    // ════════════════════════════════════════════════════════════════
     else if (warp_idx == kMMAWarpIdx and is_leader_cta) {
         auto instr_desc = cute::UMMA::make_instr_desc<ab_dtype_t, ab_dtype_t, float,
                                                       UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
@@ -296,10 +296,12 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
             }
         }
     }
-    // W2: Reserved
+
     else if (warp_idx == kReservedWarpIdx) {}
 
-    // W4-W7: Epilogue → LOCAL HBM write + x² atomic add
+    // ════════════════════════════════════════════════════════════════
+    //  W4-W7: Epilogue with EpilogueX2Sum + GQA-aware scatter
+    // ════════════════════════════════════════════════════════════════
     else if (warp_idx >= kEpilogueWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumEpiRegisters>();
         const auto epilogue_warp_idx = warp_idx - kEpilogueWarpStart;
@@ -312,148 +314,116 @@ sm100_bf16_fused_qkv_norm_a2a_impl(
             ptx::tcgen05_after_thread_sync();
 
             const uint32_t global_m = m_block_idx * BLOCK_M;
+            const uint32_t b = global_m / local_seq;
+            const uint32_t s_local = global_m - b * local_seq;
             const uint32_t n_col = n_block_idx * BLOCK_N;
 
-            // Write to LOCAL buffer (not peer scatter)
-            // Use sm100_store_cd with a LOCAL TMA descriptor (tensor_map_local)
-            // But sm100_store_cd expects a TmaDescriptor, so we need to build one for local_buffer
-            // For simplicity, we use a direct store via TMA to local_buffer
-            // (The local TMA descriptor is built by host and passed as tensor_map_local)
-            //
-            // Actually, for Phase 1 we need to write to local_buffer[global_m, n_col].
-            // We can reuse sm100_store_cd but with a local 2D TMA descriptor.
-            // The TMA descriptor for local_buffer should be [shape_m, shape_n] with swizzle.
+            // GQA-aware: determine dst_rank and base_n_idx based on Q/K/V segment
+            uint32_t dst_rank, base_n_idx;
+            if (n_col < q_dim) {
+                // Q segment
+                dst_rank = n_col / local_q_n;
+                base_n_idx = n_col % local_q_n;
+            } else if (n_col < q_dim + kv_dim) {
+                // K segment
+                uint32_t rel = n_col - q_dim;
+                dst_rank = rel / local_kv_n;
+                base_n_idx = rel % local_kv_n + local_q_n;
+            } else {
+                // V segment
+                uint32_t rel = n_col - q_dim - kv_dim;
+                dst_rank = rel / local_kv_n;
+                base_n_idx = rel % local_kv_n + local_q_n + local_kv_n;
+            }
+            const uint32_t base_m_idx = b * seq + rank_idx * local_seq + s_local;
 
+            // Use EpilogueX2Sum instead of EpilogueIdentity — this is the ONLY change
+            // from bf16_gemm_a2a_transpose_nt's epilogue (plus GQA-aware scatter index).
             epilogue::sm100_store_cd<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
                 kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
                 GemmType::Normal, false,
-                comm_dtype_t, epilogue::transform::EpilogueIdentity>
+                comm_dtype_t, epilogue::transform::EpilogueX2Sum>
             (smem_cd, tma_stage_idx, accum_stage_idx * UMMA_N,
-             global_m, n_col, 0,  // base_m, base_n, batch
+             base_m_idx, base_n_idx, 0,
              epilogue_warp_idx, lane_idx,
              tmem_empty_barriers[accum_stage_idx],
-             tensor_map_local);  // ← write to LOCAL buffer instead of scatter_maps
-
-            // x² atomic add (for Q/K segments only)
-            // The STSM in sm100_store_cd already put fp32 values in registers before casting to bf16.
-            // We need to intercept those values to compute x² sum.
-            // This requires modifying sm100_store_cd or adding a post-epilogue pass.
-            //
-            // For v2b initial version, we skip the fused x² sum and instead compute it
-            // in a separate lightweight kernel. This simplifies the single-kernel implementation.
-            // The x² sum kernel reads local_buffer and reduces — adding one more HBM read but
-            // keeping the main kernel simpler.
+             scatter_maps.maps[dst_rank],
+             epi_ctx);  // ← pass x²sum context
         }
         ptx::tma_store_wait<0>();
         cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
     }
 
-    // ── Grid sync (Phase 1 → Phase 2) ──
+    // ════════════════════════════════════════════════════════════════
+    //  Final barrier: all tiles done, sum_buffer complete
+    // ════════════════════════════════════════════════════════════════
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
-    constexpr uint32_t kGridSyncTag = 73;
-    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 1, kGridSyncTag>(
-        workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
-        [&]() { __syncthreads(); }, true, true);
-
-    // ── Deallocate TMEM (Phase 1 done) ──
-    if (warp_idx == kLoadWarpIdx)
-        Allocator().free(0, kNumTmemCols);
-
-    // ════════════════════════════════════════════════════════════════
-    //  Phase 2: Norm + A2A scatter (reuse sm100_bf16_rmsnorm_a2a_scatter logic)
-    // ════════════════════════════════════════════════════════════════
-    // All warps participate in Phase 2.
-    // For v2b initial version, Phase 2 logic is identical to v2a Kernel 2.
-    // (We call the same TMA load → norm → TMA scatter pipeline)
-    //
-    // NOTE: For the initial v2b, we reuse the Phase 1 loop structure but with
-    // norm+scatter epilogue. A more optimized version would reorganize warps.
-
-    // Phase 2 persistent loop (same tile scheduling as Phase 1 but different epilogue)
-    {
-        constexpr uint32_t kNumThreadsPhase2 = kNumThreads;
-        constexpr uint32_t STORE_BLOCK_N_P2 = kSwizzleCDMode / sizeof(comm_dtype_t);
-        constexpr uint32_t kNumElemsPerBankGroup = 16 / sizeof(comm_dtype_t);
-
-        uint32_t tma_stage_idx_p2 = 0;
-        uint32_t num_m_blocks_p2 = num_m_blocks;
-        uint32_t num_n_blocks_p2 = num_n_blocks;
-        uint32_t num_total_tiles_p2 = num_m_blocks_p2 * num_n_blocks_p2;
-
-        for (uint32_t tile_idx = blockIdx.x; tile_idx < num_total_tiles_p2; tile_idx += kNumSMs) {
-            const uint32_t m_block_idx = tile_idx / num_n_blocks_p2;
-            const uint32_t n_block_idx = tile_idx % num_n_blocks_p2;
-            const uint32_t global_m = m_block_idx * BLOCK_M;
-            const uint32_t n_col = n_block_idx * BLOCK_N;
-
-            // Determine segment + dst_rank (GQA-aware)
-            uint32_t dst_rank, base_n_idx;
-            bool is_q = (n_col < q_dim);
-            bool is_k = (!is_q && n_col < q_dim + kv_dim);
-            bool do_norm = false;
-            const float* norm_weight = nullptr;
-            uint32_t norm_dim = 0, sum_idx = 0;
-
-            if (is_q) {
-                dst_rank = n_col / local_q_n;
-                base_n_idx = n_col % local_q_n;
-                if constexpr (kDoNormQ) { do_norm = true; norm_weight = norm_q_weight; norm_dim = q_dim; sum_idx = 0; }
-            } else if (is_k) {
-                uint32_t rel = n_col - q_dim;
-                dst_rank = rel / local_kv_n;
-                base_n_idx = rel % local_kv_n + local_q_n;
-                if constexpr (kDoNormK) { do_norm = true; norm_weight = norm_k_weight; norm_dim = kv_dim; sum_idx = 1; }
-            } else {
-                uint32_t rel = n_col - q_dim - kv_dim;
-                dst_rank = rel / local_kv_n;
-                base_n_idx = rel % local_kv_n + local_q_n + local_kv_n;
-            }
-
-            const uint32_t b = global_m / local_seq;
-            const uint32_t s_local = global_m - b * local_seq;
-            const uint32_t base_m_idx = b * seq + rank_idx * local_seq + s_local;
-
-            // TMA load from local_buffer → SMEM (using tensor_map_local)
-            if (warp_idx == 0 and cute::elect_one_sync()) {
-                cute::tma_store_wait<kNumTMAStoreStages - 1>();
-                // Issue TMA load
-                // (simplified — uses cooperative global load for now)
-            }
-            cutlass::arch::NamedBarrier::sync(kNumThreadsPhase2, 0);
-
-            // Norm (simplified — cooperative global load + norm + store)
-            // For v2b initial: use same logic as v2a Kernel 2
-            // ...
-
-            // TMA store scatter to peer
-            cute::tma_store_fence();
-            cutlass::arch::NamedBarrier::sync(kNumThreadsPhase2, 0);
-            if (warp_idx == 0 and cute::elect_one_sync()) {
-                #pragma unroll
-                for (uint32_t s = 0; s < BLOCK_N / STORE_BLOCK_N_P2; ++s) {
-                    cute::SM90_TMA_STORE_2D::copy(
-                        &scatter_maps.maps[dst_rank],
-                        reinterpret_cast<cd_dtype_t*>(smem_cd[tma_stage_idx_p2]),
-                        base_n_idx + s * STORE_BLOCK_N_P2,
-                        base_m_idx);
-                }
-                cute::tma_store_arrive();
-            }
-            __syncwarp();
-            tma_stage_idx_p2 = (tma_stage_idx_p2 + 1) % kNumTMAStoreStages;
-        }
-
-        ptx::tma_store_wait<0>();
-        cutlass::arch::NamedBarrier::sync(kNumThreadsPhase2, 0);
-    }
-
-    // ── Final NVLink barrier ──
-    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
     constexpr uint32_t kFinalBarrierTag = 72;
     comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 0, kFinalBarrierTag>(
         workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
         [&]() { __syncthreads(); }, true, true);
+
+    // ════════════════════════════════════════════════════════════════
+    //  Post-barrier: compute rms + scatter rms to peers (fused in epilogue)
+    //
+    //  rms_q[row] = rsqrt(sum_buffer[row, 0] / q_dim + eps)
+    //  rms_k[row] = rsqrt(sum_buffer[row, 1] / kv_dim + eps)
+    //  Then scatter rms to each peer's rms region at the right seq offset.
+    //
+    //  Only SM 0 participates (lightweight, data is tiny: bs*local_seq*2 floats).
+    //  Uses direct global stores (P2P via NVLink) — no TMA needed for this tiny data.
+    // ════════════════════════════════════════════════════════════════
+    if (blockIdx.x == 0) {
+        // Each thread handles a few rows
+        const uint32_t local_m = bs * local_seq;
+        const uint32_t rows_per_thread = (local_m + kNumThreads - 1) / kNumThreads;
+
+        for (uint32_t r = 0; r < rows_per_thread; ++r) {
+            uint32_t row = r * kNumThreads + thread_idx;
+            if (row >= local_m) break;
+
+            // Compute rms
+            float rms_q_val = 0.f, rms_k_val = 0.f;
+            if constexpr (kDoNormQ) {
+                float sum_q = sum_buffer[row * 2 + 0];
+                rms_q_val = rsqrtf(sum_q / static_cast<float>(q_dim) + eps);
+            }
+            if constexpr (kDoNormK) {
+                float sum_k = sum_buffer[row * 2 + 1];
+                rms_k_val = rsqrtf(sum_k / static_cast<float>(kv_dim) + eps);
+            }
+
+            // Compute output row index: b*seq + rank_idx*local_seq + s_local
+            // This is where this rank's data lands in each peer's rms region
+            uint32_t b = row / local_seq;
+            uint32_t s_local = row - b * local_seq;
+            uint32_t out_row = b * seq + rank_idx * local_seq + s_local;
+
+            // Scatter rms to all peers' rms regions
+            // rms region is at sym_buffer offset 32, [bs*seq, 2] float32
+            for (uint32_t d = 0; d < kNumRanks; ++d) {
+                float* peer_rms_ptr = sym_buffer.template map<float*>(
+                    workspace.get_rms_ptr<float>(), d);
+                // Write rms_q and rms_k to peer's rms region at out_row
+                peer_rms_ptr[out_row * 2 + 0] = rms_q_val;
+                peer_rms_ptr[out_row * 2 + 1] = rms_k_val;
+            }
+        }
+        __syncthreads();
+        // Ensure rms stores are visible before the next barrier
+        __threadfence_system();
+    }
+
+    // Second barrier: rms globally visible
+    constexpr uint32_t kRmsBarrierTag = 73;
+    comm::nvlink_barrier<kNumRanks, kNumSMs, kNumThreads, 1, kRmsBarrierTag>(
+        workspace, sym_buffer, static_cast<uint32_t>(blockIdx.x), thread_idx,
+        [&]() { __syncthreads(); }, true, true);
+
+    // Deallocate TMEM
+    if (warp_idx == kLoadWarpIdx)
+        Allocator().free(0, kNumTmemCols);
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
