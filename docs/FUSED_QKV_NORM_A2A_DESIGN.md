@@ -3,6 +3,26 @@
 > 需求文档：`docs/FUSED_QKV_NORM_A2A.md`
 > 基座算子：`bf16_gemm_a2a_transpose_nt`（GEMM + A2A-transpose，单 kernel，SM100）
 > 目标硬件：SM100 / B300（单机 NVLink 域 ≤8 卡）
+> **性能**：geo **1.61x** vs serial（8 卡 B300）
+> **正确性**：8 卡 20/20 PASS（MHA/GQA × norm on/off）
+
+---
+
+## 0. 核心设计：Norm 推迟
+
+RMSNorm 的 `y = x * rsqrt(mean(x²) + eps) * weight` 是两 pass，但可以拆成：
+1. **Pass 1（GEMM kernel 内）**：算 `sum(x²)` → `rms = rsqrt(sum/dim + eps)`
+2. **Pass 2（对端）**：`out = x * rms * weight`（纯 elementwise，可融进后续算子）
+
+这样 GEMM kernel 和基座几乎一样——epilogue 多了 `pre_cast` hook 算 x²sum + scatter rms，
+**不需要 grid sync、不需要两阶段、不需要 norm kernel**。
+
+**RMSNorm 设计说明**：
+- **V 不做 norm**（只 Q/K 做，符合 Wan2.1 官方实现）
+- **Q 和 K 分开做 RMSNorm**（各自独立算 `sum(x²)` 和 `rms`，不合并）
+- RMSNorm 跨 full dim（如 Q 段的 `q_dim=5120` 所有 head 一起算 mean(x²)）
+- norm 可选（`norm_q_weight=None` 跳过 Q 的 norm，`norm_k_weight=None` 跳过 K 的 norm）
+- 返回 `(out, rms)`：out 是未 norm 的 QKV，rms 是 `[bs, seq, 2]` 标量，对端自己乘
 
 ---
 

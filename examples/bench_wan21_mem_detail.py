@@ -61,14 +61,14 @@ def run(rank, ng, port, num_layers, seq):
 
         g = torch.Generator(device=dev).manual_seed(42)
         with torch.no_grad():
-            for layer in model.layers:
+            for i, layer in enumerate(model.layers):
                 for p in layer.model.parameters():
                     p.data = torch.randn(p.shape, dtype=p.dtype, device=dev, generator=g) / math.sqrt(dim)
                 layer.model = layer.model.to(torch.bfloat16)
-                layer.setup_shape(bs, seq, nh, hd)
-                if strat_name == 'fused_var' and len(model.layers) > 1 and i > 0:
+                if strat_name == 'fused_var' and i > 0:
                     layer._skip_buffer_creation = True
-                    layer.setup_shape(bs, seq, nh, hd)
+                layer.setup_shape(bs, seq, nh, hd)
+                if strat_name == 'fused_var' and i > 0:
                     layer.share_buffers_from(model.layers[0])
 
         # FSDP2

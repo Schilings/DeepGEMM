@@ -47,8 +47,23 @@
 - **下一步**：Phase 2 v2 — 实现 CUDA kernel（sm100_bf16_rmsnorm_a2a_scatter），
   用 P2P TMA scatter 代替 NCCL A2A
 
-### 参考算子
+### AKO4ALL 迭代历史（iter 1-8）
 
-- `sm100_tf32_hc_prenorm_gemm`：GEMM + sqr_sum reduce 模式（cast-and-reduce warps）
-- `bf16_gemm_a2a_transpose_nt`：GEMM + A2A scatter epilogue（P2P TMA push）
-- `flux/src/gemm_a2a_transpose`：Hopper pull-based 参考（per-tile flag）
+| Iter | 改动 | geo vs serial | 备注 |
+|---|---|---:|---|
+| baseline | Python NCCL（v2b norm 推迟，2 次 A2A） | 0.751x | 两次 NCCL A2A 太贵 |
+| 1 | in-place `add_`+`mul_`（避免 temp tensor） | ~1.0x | |
+| 2 | fused elementwise `x*rms*weight`（单 pass） | ~0.3x | 回退：多 slice+cast 更慢 |
+| **3** | **去掉冗余 `torch.cuda.synchronize()`** | **1.43x** | **关键突破**：每步 sync 是 stream stall |
+| 4-5 | 预计算 `rms*weight` | ~1.4x | marginal |
+| **6** | **去掉 `out.clone()`** | **1.60x** | **关键突破**：省 full HBM copy |
+| 7 | 预计算 bias slices | ~1.5x | marginal |
+| 8 | `addcmul` fused bias+mul | 1.40x | 回退：语义不对 |
+
+**最终：geo 1.61x vs serial**（8 卡 B300，iters=30）
+
+### 关键 bug 修复
+
+1. **`pre_cast` warp 偏移缺失**：`sm100_store_cd` 传给 `pre_cast` 的 `global_m` 没加 `epilogue_warp_idx * 32`，导致 4 个 epilogue warp 对同一行做 atomic add（sum 是正确值的 4 倍）
+2. **坐标转换**：`pre_cast` 拿到的是输出坐标（scatter dst），需要转成 GEMM 坐标做段判断（Q/K/V）。通过 `epi_ctx.gemm_m_offset` / `gemm_n_offset` per-tile 设置
+3. **sum_buffer 索引**：用 GEMM M 坐标索引（`0..local_m-1`），不是输出坐标（可达 `bs*seq-1`）
