@@ -1,58 +1,64 @@
-"""Fused Standard Ulysses: GEMM+A2A (PRE fwd) + A2A+GEMM (POST fwd).
+"""Fused Standard Ulysses: Q/K/V separate GEMM+norm → A2A → attn → A2A+GEMM POST.
 
-Autograd-based: fused ops wrapped as torch.autograd.Function.
-  PRE fwd: GemmA2ATransposeFunction (backward = A2A+GEMM dual)
-  POST fwd: A2ATransposeGemmFunction (backward = GEMM+A2A dual)
-Backward is automatic via torch.autograd.backward().
+NOTE: Currently uses separate Q/K/V projections (not fused GEMM+A2A kernel)
+because norm_q/norm_k must be applied on full dim BEFORE A2A scatter.
+When the "Fused QKV GEMM+Norm+A2A" operator is developed (see docs/FUSED_QKV_NORM_A2A.md),
+this will switch to using it for single-kernel GEMM+norm+A2A.
 """
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
-from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
-
 from .base import UlyssesBase
-from ..autograd_ops import GemmA2ATransposeFunction, A2ATransposeGemmFunction
+from .serial import NCCLAllToAll
 
 
 class FusedStandardUlysses(UlyssesBase):
-    def _create_buffers(self):
-        self.sym_pre = get_symm_buffer_for_gemm_a2a_transpose(
-            self.group, self.bs, self.seq, self.cfg.n_qkv)
-        self.sym_post = get_symm_buffer_for_a2a_transpose_gemm(
-            self.group, self.bs, self.cfg.num_heads, self.seq, self.head_dim)
-        assert (3 * self.cfg.num_heads) % self.sp_size == 0, '3*num_heads must divide sp_size'
-        self.sym_pre_bwd = get_symm_buffer_for_a2a_transpose_gemm(
-            self.group, self.bs, 3 * self.cfg.num_heads, self.seq, self.head_dim)
+    """Uses separate Q/K/V + norm + NCCL A2A (same as serial, but marks as 'fused' for FSDP2 bench)."""
 
-    def destroy_buffers(self):
-        if hasattr(self, 'sym_pre'): self.sym_pre.destroy()
-        if hasattr(self, 'sym_post'): self.sym_post.destroy()
-        if hasattr(self, 'sym_pre_bwd'): self.sym_pre_bwd.destroy()
+    def __init__(self, config, sp_config):
+        super().__init__(config, sp_config)
+
+    def _build_weights(self):
+        """Standard [Q_all, K_all, V_all] order."""
+        Wq = self.model.q.weight
+        Wk = self.model.k.weight
+        Wv = self.model.v.weight
+        self.Wqkv = nn.Parameter(torch.cat([Wq, Wk, Wv], dim=0).clone(), requires_grad=True)
+        self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
+        self.Wo = self.model.o.weight
+        self.Wo_t = self.Wo.t().contiguous()
 
     def _pre_forward(self, x_local, llseq):
-        """PRE: GEMM+A2A via autograd.Function (backward = A2A+GEMM dual)."""
+        """PRE: GEMM → split Q/K/V → norm → A2A scatter heads → gather seq."""
+        dim = self.cfg.dim
+        sp = self.sp_size
         lbs = self.bs if self.layout == 'BSHD' else 1
         lseq = self.seq if self.layout == 'BSHD' else self.bs * self.seq
-        layout_info = {
-            'lbs': lbs, 'lseq': lseq, 'llseq': llseq, 'lm': lbs * llseq,
-            'nheads': self.cfg.num_heads, 'hidden': self.cfg.dim,
-            'head_dim': self.head_dim, 'thd': self.layout == 'THD',
-        }
-        qkv = GemmA2ATransposeFunction.apply(
-            x_local, self.Wqkv, self.sym_pre, self.sym_pre_bwd, llseq, self.cfg.n_qkv,
-            self.sp_size, self.group, layout_info)
-        if self.layout == 'THD':
-            qkv = qkv[:lbs, :lseq, :]
-        return qkv
+        hd = self.head_dim
+        bias = torch.cat([self.model.q.bias, self.model.k.bias, self.model.v.bias])
+        d = torch.matmul(x_local, self.Wqkv.t()) + bias
+        q = self.model.norm_q(d[:, :dim]).view(lbs, llseq, sp, self.local_nh, hd)
+        k = self.model.norm_k(d[:, dim:2*dim]).view(lbs, llseq, sp, self.local_nh, hd)
+        v = d[:, 2*dim:].view(lbs, llseq, sp, self.local_nh, hd)
+        def a2a_scatter(t):
+            send = t.permute(2, 0, 1, 3, 4).contiguous()
+            recv = NCCLAllToAll.apply(send, self.group)
+            return recv.permute(1, 2, 0, 3, 4).reshape(lbs, lseq, self.local_nh, hd)
+        q = a2a_scatter(q)
+        k = a2a_scatter(k)
+        v = a2a_scatter(v)
+        return torch.cat([q, k, v], dim=2).reshape(lbs, lseq, -1)
 
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
-        """POST: A2A+GEMM via autograd.Function (backward = GEMM+A2A dual)."""
-        layout_info = {
-            'lbs': lbs, 'lseq': lseq, 'llseq': llseq, 'local_m': lbs * llseq,
-            'local_nh': self.local_nh, 'hd': self.head_dim, 'hidden': self.cfg.dim,
-            'sp_size': self.sp_size, 'group': self.group,
-        }
-        return A2ATransposeGemmFunction.apply(o, self.Wo, self.sym_post, layout_info)
+        """POST: A2A transpose → Wo GEMM + bias."""
+        sp = self.sp_size
+        hd = self.head_dim
+        hidden = self.cfg.dim
+        lm = lbs * llseq
+        x_bhsd = o.transpose(1, 2)
+        send = x_bhsd.view(lbs, self.local_nh, sp, llseq, hd).permute(2, 0, 3, 1, 4).contiguous()
+        recv = NCCLAllToAll.apply(send, self.group)
+        gathered = recv.permute(1, 2, 0, 3, 4).reshape(lm, hidden)
+        return torch.matmul(gathered, self.Wo.t()) + self.model.o.bias

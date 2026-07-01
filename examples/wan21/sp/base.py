@@ -71,13 +71,12 @@ class UlyssesBase(nn.Module):
         pass
 
     def _attn_forward(self, qkv, grid, lbs, lseq):
-        """Attention via FA4 — autograd-compatible (FA4 supports backward)."""
+        """Attention via FA4 — qkv already normed + A2A'd by _pre_forward."""
         ln = self.local_n
-        q = qkv[:, :, :ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous()
-        k = qkv[:, :, ln:2*ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous()
-        v = qkv[:, :, 2*ln:3*ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous()
-        q = self.model.norm_q(q.reshape(-1, self.cfg.dim)).view(lbs, lseq, self.local_nh, self.head_dim)
-        k = self.model.norm_k(k.reshape(-1, self.cfg.dim)).view(lbs, lseq, self.local_nh, self.head_dim)
+        nh, hd = self.local_nh, self.head_dim
+        q = qkv[:, :, :ln].view(lbs, lseq, nh, hd).contiguous()
+        k = qkv[:, :, ln:2*ln].view(lbs, lseq, nh, hd).contiguous()
+        v = qkv[:, :, 2*ln:3*ln].view(lbs, lseq, nh, hd).contiguous()
         q = rope_apply(q, grid, self.model.freqs).to(torch.bfloat16)
         k = rope_apply(k, grid, self.model.freqs).to(torch.bfloat16)
         from flash_attn.cute import flash_attn_func

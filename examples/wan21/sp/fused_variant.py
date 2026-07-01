@@ -1,92 +1,75 @@
-"""Fused Variant Ulysses: GEMM+A2A (PRE fwd) + GEMM+RS (POST fwd).
+"""Fused Variant Ulysses: Q/K/V separate GEMM+norm → A2A → attn → Wo GEMM (row-split POST).
 
-Autograd-based: fused ops wrapped as torch.autograd.Function.
-  PRE fwd: GemmA2ATransposeFunction (backward = A2A+GEMM dual)
-  POST fwd: GemmRSFunction (backward = AG+GEMM dual)
-Backward is automatic via torch.autograd.backward().
+Wo is row-split (N-sharded) → weight grad is local, no FSDP2 sync needed.
 
-Wo is row-split (N-sharded) → _wo_sharded=True, FSDP2 ignores it (grad is local).
+NOTE: Currently uses separate Q/K/V + NCCL A2A (not fused kernel) for correctness.
+When "Fused QKV GEMM+Norm+A2A" operator is developed, PRE will switch to it.
 """
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
-from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs
-from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm
-from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
-
 from .base import UlyssesBase
-from ..autograd_ops import GemmA2ATransposeFunction, GemmRSFunction
+from .serial import NCCLAllToAll
 
 
 class FusedVariantUlysses(UlyssesBase):
-    def _create_buffers(self):
-        n_qkv = self.cfg.n_qkv
+    """Q/K/V separate + Wo row-split (N-sharded output)."""
+
+    def __init__(self, config, sp_config):
+        super().__init__(config, sp_config)
+
+    def _build_weights(self):
+        """Standard [Q_all, K_all, V_all] order + Wo row-split (N-sharded)."""
+        Wq = self.model.q.weight
+        Wk = self.model.k.weight
+        Wv = self.model.v.weight
+        self.Wqkv = nn.Parameter(torch.cat([Wq, Wk, Wv], dim=0).clone(), requires_grad=True)
+        self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
+        # Wo row-split: each rank gets [local_N, dim] slice of Wo [dim, dim]
         local_N = self.cfg.dim // self.sp_size
-        local_m = self.local_m
-        self.sym_pre = get_symm_buffer_for_gemm_a2a_transpose(
-            self.group, self.bs, self.seq, n_qkv)
-        self.sym_gemm_rs = get_symm_buffer_for_gemm_rs(self.group, local_m, local_N)
-        self.sym_ag_gemm = get_symm_buffer_for_bf16_ag_gemm(self.group, local_m, local_N)
-        assert (3 * self.cfg.num_heads) % self.sp_size == 0, '3*num_heads must divide sp_size'
-        self.sym_pre_bwd = get_symm_buffer_for_a2a_transpose_gemm(
-            self.group, self.bs, 3 * self.cfg.num_heads, self.seq, self.head_dim)
-        # Wo row-split per rank — nn.Parameter for FSDP2 (ignored, grad is local)
         rank = self.group.rank()
-        Wo = self.model.o.weight
-        Wo_r = Wo[
-            rank * local_N:(rank + 1) * local_N,
-            rank * self.local_hidden:(rank + 1) * self.local_hidden].contiguous()
+        Wo = self.model.o.weight  # [dim, dim]
+        Wo_r = Wo[rank * local_N:(rank + 1) * local_N, :].contiguous()  # [local_N, dim]
         self.Wo_r_local = nn.Parameter(Wo_r.clone(), requires_grad=True)
         self.Wo_r_local_t = nn.Parameter(self.Wo_r_local.data.t().contiguous(), requires_grad=True)
-        self._wo_sharded = True  # Wo is row-split → weight grad is local, no FSDP2 sync
-
-    def destroy_buffers(self):
-        if hasattr(self, 'sym_pre'): self.sym_pre.destroy()
-        if hasattr(self, 'sym_gemm_rs'):
-            self.sym_gemm_rs.handle = None; self.sym_gemm_rs.buffer = None; self.sym_gemm_rs.group = None
-        if hasattr(self, 'sym_ag_gemm'):
-            self.sym_ag_gemm.handle = None; self.sym_ag_gemm.buffer = None; self.sym_ag_gemm.group = None
-        if hasattr(self, 'sym_pre_bwd'): self.sym_pre_bwd.destroy()
+        self._wo_sharded = True
+        self._wo_rank = rank
 
     def _pre_forward(self, x_local, llseq):
-        """PRE: GEMM+A2A via autograd.Function (backward = A2A+GEMM dual)."""
+        """PRE: GEMM → split Q/K/V → norm → A2A scatter heads → gather seq."""
+        dim = self.cfg.dim
+        sp = self.sp_size
         lbs = self.bs if self.layout == 'BSHD' else 1
         lseq = self.seq if self.layout == 'BSHD' else self.bs * self.seq
-        layout_info = {
-            'lbs': lbs, 'lseq': lseq, 'llseq': llseq, 'lm': lbs * llseq,
-            'nheads': self.cfg.num_heads, 'hidden': self.cfg.dim,
-            'head_dim': self.head_dim, 'thd': self.layout == 'THD',
-        }
-        qkv = GemmA2ATransposeFunction.apply(
-            x_local, self.Wqkv, self.sym_pre, self.sym_pre_bwd, llseq, self.cfg.n_qkv,
-            self.sp_size, self.group, layout_info)
-        if self.layout == 'THD':
-            qkv = qkv[:lbs, :lseq, :]
-        return qkv
+        hd = self.head_dim
+        bias = torch.cat([self.model.q.bias, self.model.k.bias, self.model.v.bias])
+        d = torch.matmul(x_local, self.Wqkv.t()) + bias
+        q = self.model.norm_q(d[:, :dim]).view(lbs, llseq, sp, self.local_nh, hd)
+        k = self.model.norm_k(d[:, dim:2*dim]).view(lbs, llseq, sp, self.local_nh, hd)
+        v = d[:, 2*dim:].view(lbs, llseq, sp, self.local_nh, hd)
+        def a2a_scatter(t):
+            send = t.permute(2, 0, 1, 3, 4).contiguous()
+            recv = NCCLAllToAll.apply(send, self.group)
+            return recv.permute(1, 2, 0, 3, 4).reshape(lbs, lseq, self.local_nh, hd)
+        q = a2a_scatter(q)
+        k = a2a_scatter(k)
+        v = a2a_scatter(v)
+        return torch.cat([q, k, v], dim=2).reshape(lbs, lseq, -1)
 
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
-        """POST: GEMM+RS via autograd.Function (backward = AG+GEMM dual)."""
-        local_N = self.cfg.dim // self.sp_size
+        """POST: A2A transpose (scatter seq, gather heads) → Wo row-split GEMM."""
+        sp = self.sp_size
+        hd = self.head_dim
+        hidden = self.cfg.dim
+        local_N = hidden // sp
         local_hidden = self.local_hidden
-        local_m = lbs * llseq
-        full_m = self.bs * self.seq
-        # o [bs, seq, local_nh, hd] → flatten to [local_m, local_hidden] for GEMM
-        # But o has full seq on each rank (after PRE A2A scattered heads, gathered seq)
-        # Wait: after PRE, each rank has [bs, seq, local_nh, hd] — seq is FULL, local_nh is local
-        # POST GEMM+RS: attn_local[local_m, local_hidden] @ Wo_r^T → RS → y[local_m, local_N]
-        # local_m = bs * local_seq (this rank's seq shard), but o has full seq...
-        # Actually in Ulysses: after PRE (scatter heads, gather seq), each rank has FULL seq
-        # but only LOCAL heads. POST does GEMM on local heads then RS to scatter seq back.
-        # attn_local = o reshaped: [bs*seq, local_hidden] but we need [local_m, local_hidden]
-        # where local_m = bs * local_seq. This is because RS will scatter the seq dimension.
-        attn_local = o.reshape(self.bs * self.seq, local_hidden).contiguous()
-        layout_info = {
-            'local_m': self.bs * (self.seq // self.sp_size),  # tokens per rank after RS
-            'local_N': local_N, 'local_hidden': local_hidden,
-            'full_m': full_m, 'sp_size': self.sp_size, 'group': self.group,
-            'bs': self.bs, 'seq': self.seq,
-        }
-        return GemmRSFunction.apply(attn_local, self.Wo_r_local, self.sym_gemm_rs, self.sym_ag_gemm, layout_info)
+        lm = lbs * llseq
+        # o [lbs, lseq, local_nh, hd] → A2A → gathered [lm, hidden]
+        x_bhsd = o.transpose(1, 2)
+        send = x_bhsd.view(lbs, self.local_nh, sp, llseq, hd).permute(2, 0, 3, 1, 4).contiguous()
+        recv = NCCLAllToAll.apply(send, self.group)
+        gathered = recv.permute(1, 2, 0, 3, 4).reshape(lm, hidden)
+        # Wo_r_local [local_N, dim] → y = gathered @ Wo_r^T = [lm, local_N]
+        return torch.matmul(gathered, self.Wo_r_local.t()) + self.model.o.bias[self._wo_rank * local_N:(self._wo_rank + 1) * local_N]
