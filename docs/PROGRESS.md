@@ -30,19 +30,20 @@
 | **fused_std** | `bf16_gemm_a2a_transpose_nt` | `bf16_a2a_transpose_gemm_nt_fused` | serial A2A-inv + matmul | **`bf16_a2a_transpose_gemm_nt`** (M0, Wqkv_t) |
 | **fused_var** | `bf16_gemm_a2a_transpose_nt` | `bf16_gemm_rs_nt` (Wo 行拆分) | **`bf16_ag_gemm_nt`** (AG+GEMM) | **`bf16_a2a_transpose_gemm_nt`** (M0, Wqkv_t) |
 
-8 GPU B300 结果（FWD+BWD 含梯度同步, us）：
+8 GPU B300 结果（FWD+BWD+SYNC, us；SYNC=FSDP2 风格 reduce-scatter）：
 
 | Shape | serial | fused_std | fused_var | 加速比 |
 |-------|--------|-----------|-----------|--------|
-| 1x8K | 5536 | 7434 | **4919** | 1.13x |
-| 1x32K | 18856 | 19583 | **17584** | 1.07x |
-| 1x74K | 75089 | 74511 | **72405** | 1.04x |
-| 1x168K | 342220 | 340807 | **336413** | 1.02x |
-| 1x64K | 59184 | 58593 | **56614** | 1.05x |
-| 1x148K | 269284 | 266886 | **263104** | 1.02x |
+| 1x8K | 5235 | 6503 | **4790** | 1.09x |
+| 1x32K | 18495 | 19436 | **17344** | 1.07x |
+| 1x74K | 75029 | 74013 | **72007** | 1.04x |
+| 1x168K | 342293 | 340631 | **334881** | 1.02x |
+| 1x64K | 58994 | 58062 | **56353** | 1.05x |
+| 1x148K | 269424 | 266182 | **264714** | 1.02x |
 
-- **fused_var 全面最优**：所有 shape FWD+BWD（含梯度同步）都最快
-- **梯度同步**：Wqkv 总是 all-reduce；Wo 对 serial/fused_std all-reduce，fused_var 行切分**不同步**（省掉一次 all-reduce）
+- **fused_var 全面最优**：所有 shape FWD+BWD+SYNC 都最快
+- **梯度同步**：FSDP2 风格 reduce-scatter（Wqkv 总是；Wo 对 serial/fused_std，**fused_var 跳过**因 Wo 行切分）
+- **SYNC 开销**：fused_var 的 SYNC 比 serial/fused_std 少 ~30-38%（省掉 Wo 的 reduce-scatter）
 - **正确性**：2卡 1x8K/1x168K/1x148K serial+fused_std verify → FWD rel~0.0019, BWD grad_X~0.0016, grad_W~0.0030 → PASS
 - **后续优化**：BWD PRE 已改用融合 A2A+GEMM (M0, Wqkv_t NT)，正确性验证通过(gX_rel=0.0016)但加速不显著(comm 数据量小)；attention 是长序列瓶颈可考虑 SP+CP
 

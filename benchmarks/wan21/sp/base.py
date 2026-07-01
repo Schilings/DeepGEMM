@@ -136,9 +136,5 @@ class UlyssesBase(nn.Module):
             grad_v.reshape(lbs, lseq, ln)], dim=-1)
         grad_X, grad_Wqkv = self._pre_backward(
             grad_qkv, lbs=lbs, lseq=lseq, llseq=llseq, lm=lm, x_local=x_local)
-        # Gradient sync: Wqkv is always replicated → all-reduce.
-        # Wo: replicated for serial/fused_std → all-reduce; row-sharded for fused_var → no sync.
-        dist.all_reduce(grad_Wqkv, op=dist.ReduceOp.SUM, group=self.group)
-        if not getattr(self, '_wo_sharded', False):
-            dist.all_reduce(grad_Wo, op=dist.ReduceOp.SUM, group=self.group)
+        # Gradient sync is handled externally via FSDP2/DTensor (see bench)
         return grad_X, grad_Wqkv, grad_Wo
