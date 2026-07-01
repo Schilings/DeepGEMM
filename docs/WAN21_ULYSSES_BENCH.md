@@ -33,14 +33,14 @@ benchmarks/verify_wan21_attn.py      — 2卡快速正确性验证
 - FWD PRE: `bf16_gemm_a2a_transpose_nt` (GEMM+A2A，融合 kernel)
 - FWD POST: `bf16_a2a_transpose_gemm_nt_fused` (A2A+GEMM，融合 kernel)
 - BWD POST: 对偶 GEMM+A2A (serial A2A-inverse + matmul)
-- BWD PRE: 对偶 A2A+GEMM (serial A2A-inverse + matmul)
+- BWD PRE: 对偶 A2A+GEMM (`bf16_a2a_transpose_gemm_nt`, M0, 用 `Wqkv_t` 做 NT)
 - 权重梯度: serial matmul (融合算子只算激活梯度)
 
 ### 3. fused_var (融合变体 Ulysses)
 - FWD PRE: `bf16_gemm_a2a_transpose_nt` (GEMM+A2A)
 - FWD POST: `bf16_gemm_rs_nt` (GEMM+RS，Wo 行拆分)
 - BWD POST: `bf16_ag_gemm_nt` (AG+GEMM，GEMM+RS 的对偶)
-- BWD PRE: serial A2A-inverse + matmul
+- BWD PRE: 对偶 A2A+GEMM (`bf16_a2a_transpose_gemm_nt`, M0, 用 `Wqkv_t` 做 NT)
 - 输出 N-sharded (每 rank 持有 N/sp 维度，省显存)
 
 ## 对偶关系
@@ -129,4 +129,4 @@ DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python benchmarks/bench_wan21_strategies.py 2
 2. **长序列 attention 占比大** — 1080p 的 ATTN 占 FWD 的 80%，e2e 加速被稀释
 3. **fused_std 在小 shape 反而慢** — 融合算子固定开销在 1x8K 不划算
 4. **batch=2 对 fused 有利** — 更大 GEMM 更好 overlap comm
-5. **BWD 的 PRE 部分仍串行** — A2A-inverse 尚未用融合算子，是后续优化方向
+5. **BWD 的 PRE 部分已改用融合 A2A+GEMM 算子**（`bf16_a2a_transpose_gemm_nt`, M0, 用 `Wqkv_t` 做 NT）— 正确性验证通过（gX_rel=0.0016 vs serial NCCL），但因 PRE BWD 的 comm 数据量小（QKV 每 rank ~2MB），M0 对 BWD 整体加速不显著（±1%，大 shape 略快、小 shape 略慢）。BWD 主要被 FA4 backward 和 weight grad（串行 matmul）主导。

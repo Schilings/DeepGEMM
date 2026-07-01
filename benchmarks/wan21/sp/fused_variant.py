@@ -17,6 +17,7 @@ class FusedVariantUlysses(UlyssesBase):
         from deep_gemm import get_symm_buffer_for_gemm_a2a_transpose
         from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs
         from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm
+        from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
         n_qkv = self.cfg.n_qkv
         local_N = self.cfg.dim // self.sp_size
         local_m = self.local_m
@@ -31,6 +32,10 @@ class FusedVariantUlysses(UlyssesBase):
         # d = A_gathered @ B^T = [full_m, local_hidden]
         # hidden = local_N (the gather input feature width)
         self.sym_ag_gemm = get_symm_buffer_for_bf16_ag_gemm(self.group, local_m, local_N)
+        # PRE backward: A2A+GEMM (dual of GEMM+A2A forward); QKV = 3*num_heads "heads"
+        assert (3 * self.cfg.num_heads) % self.sp_size == 0, '3*num_heads must divide sp_size'
+        self.sym_pre_bwd = get_symm_buffer_for_a2a_transpose_gemm(
+            self.group, self.bs, 3 * self.cfg.num_heads, self.seq, self.head_dim)
         # Wo row-split per rank
         rank = self.group.rank()
         Wo = self.model.o_proj.weight
@@ -45,6 +50,7 @@ class FusedVariantUlysses(UlyssesBase):
             self.sym_gemm_rs.handle = None; self.sym_gemm_rs.buffer = None; self.sym_gemm_rs.group = None
         if hasattr(self, 'sym_ag_gemm'):
             self.sym_ag_gemm.handle = None; self.sym_ag_gemm.buffer = None; self.sym_ag_gemm.group = None
+        if hasattr(self, 'sym_pre_bwd'): self.sym_pre_bwd.destroy()
 
     def _pre_forward(self, x_local, llseq):
         from deep_gemm import bf16_gemm_a2a_transpose_nt
@@ -102,12 +108,25 @@ class FusedVariantUlysses(UlyssesBase):
         return grad_attn, grad_Wo_r_local
 
     def _pre_backward(self, grad_qkv, lbs, lseq, llseq, lm, x_local, **kw):
-        """PRE BWD: A2A-inv (serial) + GEMM (serial for weight grad)."""
-        sp = self.sp_size; lnq = self.local_nqkv; n_qkv = self.cfg.n_qkv
-        send = grad_qkv.view(lbs, llseq, sp, lnq).permute(2, 0, 1, 3).contiguous()
-        recv = torch.empty_like(send)
-        dist.all_to_all_single(recv, send, group=self.group)
-        grad_local = recv.permute(1, 2, 0, 3).reshape(lm, n_qkv)
-        grad_X = torch.matmul(grad_local, self.Wqkv)
+        """PRE BWD: A2A+GEMM fused (dual of GEMM+A2A forward).
+
+        Forward was: x_local → GEMM(x, Wqkv^T) → A2A-scatter(heads) → qkv
+        Backward:    grad_qkv → A2A-gather(heads) → grad_local[lm, n_qkv]
+                     → GEMM(grad_local @ Wqkv_t^T) → grad_X
+        Reuses the POST-forward A2A+GEMM kernel (bf16_a2a_transpose_gemm_nt, M0):
+        A2A-inv gathers QKV heads (3*local_nh per rank) into grad_local, then the
+        NT GEMM with Wqkv_t (=[hidden, n_qkv]) yields grad_X = grad_local @ Wqkv.
+        Weight grad grad_Wqkv = grad_local^T @ x_local (serial, reuses gathered).
+        """
+        from deep_gemm.a2a_transpose_gemm import bf16_a2a_transpose_gemm_nt
+        n_qkv = self.cfg.n_qkv
+        local_nh_qkv = 3 * self.local_nh
+        # grad_qkv [lbs, lseq, local_nqkv] → BSHD [lbs, lseq, 3*local_nh, hd] → BHSD [lbs, 3*local_nh, lseq, hd]
+        gqkv_bhsd = grad_qkv.view(lbs, lseq, local_nh_qkv, self.head_dim).transpose(1, 2).contiguous()
+        self.sym_pre_bwd.x.copy_(gqkv_bhsd)
+        grad_X = torch.empty((lm, self.cfg.dim), dtype=torch.bfloat16, device=grad_qkv.device)
+        bf16_a2a_transpose_gemm_nt(grad_X, self.Wqkv_t, self.sym_pre_bwd)
+        # Weight grad (serial): grad_Wqkv = grad_local^T @ x_local (grad_local = gathered)
+        grad_local = self.sym_pre_bwd.gathered[:lm, :n_qkv]
         grad_Wqkv = torch.matmul(grad_local.t(), x_local)
         return grad_X, grad_Wqkv

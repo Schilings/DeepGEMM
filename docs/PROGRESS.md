@@ -27,8 +27,8 @@
 | 策略 | PRE | POST | BWD POST | BWD PRE |
 |------|-----|------|----------|---------|
 | **serial** (baseline) | matmul + NCCL A2A | NCCL A2A + matmul | serial A2A-inv + matmul | serial A2A-inv + matmul |
-| **fused_std** | `bf16_gemm_a2a_transpose_nt` | `bf16_a2a_transpose_gemm_nt_fused` | serial A2A-inv + matmul | serial A2A-inv + matmul |
-| **fused_var** | `bf16_gemm_a2a_transpose_nt` | `bf16_gemm_rs_nt` (Wo 行拆分) | **`bf16_ag_gemm_nt`** (AG+GEMM) | serial A2A-inv + matmul |
+| **fused_std** | `bf16_gemm_a2a_transpose_nt` | `bf16_a2a_transpose_gemm_nt_fused` | serial A2A-inv + matmul | **`bf16_a2a_transpose_gemm_nt`** (M0, Wqkv_t) |
+| **fused_var** | `bf16_gemm_a2a_transpose_nt` | `bf16_gemm_rs_nt` (Wo 行拆分) | **`bf16_ag_gemm_nt`** (AG+GEMM) | **`bf16_a2a_transpose_gemm_nt`** (M0, Wqkv_t) |
 
 8 GPU B300 结果（FWD+BWD, us）：
 
@@ -43,7 +43,7 @@
 
 - **fused_var 全面最优**：所有 shape FWD+BWD 都最快
 - **正确性**：2卡 1x8K serial verify → FWD rel=0.0019, BWD grad_X=0.0016, grad_W=0.0034 → PASS
-- **后续优化**：BWD PRE 的 A2A-inverse 尚未用融合算子；attention 是长序列瓶颈可考虑 SP+CP
+- **后续优化**：BWD PRE 已改用融合 A2A+GEMM (M0, Wqkv_t NT)，正确性验证通过(gX_rel=0.0016)但加速不显著(comm 数据量小)；attention 是长序列瓶颈可考虑 SP+CP
 
 ---
 

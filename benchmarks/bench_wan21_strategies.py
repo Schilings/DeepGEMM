@@ -149,12 +149,19 @@ def run(rank, ng, port, iters, verify, strategies):
 
             fwd_rel = bX_rel = bW_rel = -1.0; status = 'SKIP'
             if do_verify:
-                with torch.no_grad():
-                    y = strat.forward(X_local, grid, llseq)
-                y_full = gather_to_rank0(y, group, ng)
-                if rank == 0 and ref_out is not None:
-                    fwd_rel = rel_diff(y_full.reshape(-1, hidden)[:ref_out.reshape(-1,hidden).shape[0]],
-                                       ref_out.reshape(-1, hidden))
+                # fwd verify: serial has full [lm, hidden] output; fused_var is N-sharded (skip fwd rel)
+                if strat_name != 'fused_var':
+                    if hasattr(strat, 'sym_post') and hasattr(strat.sym_post, 'reset_barriers'):
+                        strat.sym_post.reset_barriers(); dist.barrier(group)
+                    with torch.no_grad():
+                        y = strat.forward(X_local, grid, llseq)
+                    y_full = gather_to_rank0(y, group, ng)
+                    if rank == 0 and ref_out is not None:
+                        fwd_rel = rel_diff(y_full.reshape(-1, hidden)[:ref_out.reshape(-1,hidden).shape[0]],
+                                           ref_out.reshape(-1, hidden))
+                # bwd verify: grad_X (validates PRE BWD fused op) + weight grad
+                if hasattr(strat, 'sym_post') and hasattr(strat.sym_post, 'reset_barriers'):
+                    strat.sym_post.reset_barriers(); dist.barrier(group)
                 y_test = strat.forward(X_local, grid, llseq)
                 gX, gWqkv, gWo = strat.backward(grad_y_local, X_local, grid, llseq)
                 dist.all_reduce(gWqkv, op=dist.ReduceOp.SUM, group=group)
