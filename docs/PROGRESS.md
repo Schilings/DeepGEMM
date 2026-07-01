@@ -15,6 +15,7 @@
 | **GEMM-A2A-transpose**（Ulysses **pre-attn**，GEMM+A2A）| `bf16_gemm_a2a_transpose_nt` | 8卡 geo vs sep **1.42x** / vs torch-native **1.54x**；4卡 vs sep **1.44x** / vs torch **1.55x**；fused 平均 ~1190 TFLOPS | **{2,4,8} 全 PASS**，max_diff/rel/consist **恒 0.0**（纯排列，逐元素等于精确参考；torch `matmul+all_to_all` 亦 0.0）| `main`（单 kernel，抄 GEMM-RS 改 N 切分+删 reduce+转置散射）| `GEMM_A2A_TRANSPOSE_DESIGN.md` / `GEMM_A2A_TRANSPOSE_ITERATION.md` |
 | **A2A-GEMM**（旧 token-A2A，**语义错误**）| `bf16_a2a_gemm_nt` | — | ⚠️ **3/6 FAIL** + 语义错位（token(M)-A2A，非 Ulysses）→ 已被上面的 transpose 版取代 | `main`（保留未删）| `A2A_GEMM_ITERATION.md` / `A2A_GEMM_DESIGN.md`（旧）|
 | **AG-GEMM** | `bf16_ag_gemm_nt` | geo **~1.13x**（8 卡）| PASS | `main`（仅 PDL 默认开启被保留）| `AG_GEMM_ITERATION.md` / `AG_GEMM_FLUX_REFERENCE.md` |
+| **Fused QKV+Norm+A2A** | `bf16_fused_qkv_norm_a2a_transpose_nt` | Phase 2 v1：~parity（Python 编排）；待 CUDA 融合 | 8卡 20/20 PASS（MHA/GQA × norm on/off）| `feat/fused-qkv-norm-a2a` | `FUSED_QKV_NORM_A2A_DESIGN.md` / `FUSED_QKV_NORM_A2A_ITERATION.md` |
 
 ---
 
