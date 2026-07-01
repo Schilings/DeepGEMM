@@ -50,7 +50,7 @@ def rope_apply(q: torch.Tensor, grid_sizes: torch.Tensor,
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
         x_i = torch.view_as_complex(
-            q[i, :seq_len].to(torch.float32).reshape(seq_len, H, -1, 2))
+            q[i, :seq_len].to(torch.float64).reshape(seq_len, H, -1, 2))
         freqs_i = torch.cat([
             freqs_parts[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs_parts[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -60,7 +60,7 @@ def rope_apply(q: torch.Tensor, grid_sizes: torch.Tensor,
         if S > seq_len:
             x_i = torch.cat([x_i, q[i, seq_len:].float()])
         output.append(x_i)
-    return torch.stack(output).to(q.dtype)
+    return torch.stack(output).float()
 
 
 def rope_inverse(grad_q: torch.Tensor, grid_sizes: torch.Tensor,

@@ -92,6 +92,7 @@ def run(rank, ng, port, iters, verify, strategies):
                 for p in strat.model.parameters():
                     p.data = torch.randn(p.shape, dtype=p.dtype, device=dev, generator=g) / math.sqrt(dim)
             try:
+                strat.model = strat.model.to(torch.bfloat16)
                 strat.setup_shape(bs, seq, nheads, head_dim)
             except Exception as e:
                 if rank == 0: print(f"  {label:<12} {strat_name:<12} SKIP (setup: {e})")
@@ -100,7 +101,7 @@ def run(rank, ng, port, iters, verify, strategies):
             # Build reference BEFORE FSDP2 (it converts params to DTensor)
             if do_verify and rank == 0 and ref_out is None:
                 ref_m = WanSelfAttention(model_cfg.dim, model_cfg.num_heads, model_cfg.head_dim,
-                                         qk_norm=model_cfg.qk_norm, eps=model_cfg.eps).to(dev)
+                                         qk_norm=model_cfg.qk_norm, eps=model_cfg.eps).to(dev).to(torch.bfloat16)
                 ref_m.load_state_dict(strat.model.state_dict())
                 Xr = X_full.clone().requires_grad_(True)
                 yr = ref_m(Xr, grid, ref_m.freqs)

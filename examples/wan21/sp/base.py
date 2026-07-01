@@ -78,8 +78,8 @@ class UlyssesBase(nn.Module):
         v = qkv[:, :, 2*ln:3*ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous()
         q = self.model.norm_q(q.reshape(-1, self.cfg.dim)).view(lbs, lseq, self.local_nh, self.head_dim)
         k = self.model.norm_k(k.reshape(-1, self.cfg.dim)).view(lbs, lseq, self.local_nh, self.head_dim)
-        q = rope_apply(q, grid, self.model.freqs)
-        k = rope_apply(k, grid, self.model.freqs)
+        q = rope_apply(q, grid, self.model.freqs).to(torch.bfloat16)
+        k = rope_apply(k, grid, self.model.freqs).to(torch.bfloat16)
         from flash_attn.cute import flash_attn_func
         o = flash_attn_func(q, k, v, softmax_scale=self.scale, causal=self.cfg.causal)
         return o[0] if isinstance(o, tuple) else o
