@@ -9,29 +9,31 @@
 ## 当前状态（接班看这里）
 
 - **正确性**：8 卡 20/20 全 PASS（MHA+norm / MHA / GQA+norm / GQA / EXT 全组合）
-  - norm 启用时 rel_err ~0.00006-0.00024（RMSNorm fp32 计算引入的 bf16 round）
-  - norm 关闭时 rel_err == 0.0（纯 GEMM + A2A）
-  - vs torch baseline diff == 0.0（同一数学路径）
-- **性能**（Phase 2 v1，Python 编排 GEMM + norm + NCCL A2A）：
-  - 8 卡 benchmark：fused vs serial ~parity（0.84x-1.85x，大部分 ~1.0x）
-  - **预期**：Phase 2 v2 CUDA 融合（P2P TMA scatter 代替 NCCL）将带来 ~1.3-1.5x
+- **架构改动**：扩展 `epilogue::transform` 接口，加 `pre_cast` hook（向后兼容，现有算子零影响）
+  - `EpilogueIdentity::pre_cast` = no-op
+  - `EpilogueX2Sum::pre_cast` = 在 STSM cast 前算 x² partial sum + atomic add
+- **v2b norm 推迟方案**（Python 编排）：正确性 PASS，但性能 0.751x（两次 NCCL A2A 太贵）
+- **关键结论**：Python 编排的 norm 推迟没有优势，必须 CUDA 融合才能加速
 - **分支**：`feat/fused-qkv-norm-a2a`
 
-### 8 卡 benchmark（us，iters=20）
+### 8 卡 benchmark（us，iters=20）：serial vs v2b(norm 推迟)
 
-| Shape (bs,lseq,qh,kvh,hd,K) | Serial | Fused | Speedup |
+| Shape | Serial | v2b | v2b/serial |
 |---|---:|---:|---:|
-| 1,1024,40,8,128,5120 | 2416.5 | 2401.5 | 1.01x |
-| 1,2048,40,8,128,5120 | 2393.2 | 2434.8 | 0.98x |
-| 1,4096,40,8,128,5120 | 2422.8 | 2887.5 | 0.84x |
-| 1,8192,40,8,128,5120 | 4264.4 | 4954.1 | 0.86x |
-| 1,1024,32,32,128,4096 | 2379.1 | 1287.5 | 1.85x |
-| 1,2048,64,64,128,8192 | 4033.6 | 4663.4 | 0.86x |
-| 1,4096,32,32,128,5120 | 4023.3 | 4268.3 | 0.94x |
-| 2,1024,40,8,128,5120 | 2400.5 | 1778.3 | 1.35x |
+| 1,1024,40,8,128,5120 | 1136.2 | 1479.0 | 0.77x |
+| 1,2048,40,8,128,5120 | 1068.1 | 1249.0 | 0.86x |
+| 1,4096,40,8,128,5120 | 2114.2 | 3171.4 | 0.67x |
+| 1,8192,40,8,128,5120 | 2954.1 | 3749.0 | 0.79x |
+| 1,1024,32,32,128,4096 | 680.4 | 951.3 | 0.72x |
+| 1,2048,64,64,128,8192 | 3530.1 | 3194.1 | 1.11x |
+| 1,4096,32,32,128,5120 | 1897.2 | 2930.1 | 0.65x |
+| 2,1024,40,8,128,5120 | 1475.5 | 2577.8 | 0.57x |
 
-> 注：Phase 2 v1 的 fused 和 serial 底层都走 NCCL A2A + torch matmul，性能 ~parity。
-> 真正加速来自 Phase 2 v2：用 P2P TMA scatter kernel 代替 NCCL（参考 bf16_gemm_a2a_transpose_nt 的 1.42x 加速比）。
+**Geo-mean: 0.751x**（v2b 慢于 serial，因两次 NCCL A2A）
+
+> 结论：norm 推迟方案正确，但 Python 编排下额外 A2A 开销 > 节省的 norm 开销。
+> 下一步：CUDA 融合——在 GEMM epilogue 里用 `pre_cast` 算 x²sum + P2P TMA scatter，
+> rms 用单独轻量 kernel 或融进 epilogue，避免第二次 NCCL A2A。
 
 ---
 

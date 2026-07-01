@@ -169,49 +169,83 @@ def bf16_fused_qkv_norm_a2a_transpose_nt(
     assert a.shape[1] == b.shape[1]  # K matches
     assert local_seq % 128 == 0, 'local_seq must be 128-aligned'
 
-    # Phase 2 v1: Use separate GEMM + norm + A2A (orchestrated in Python)
-    # This will be replaced by fused CUDA kernels in Phase 2 v2
+    # ════════════════════════════════════════════════════════════════
+    #  v2b: Norm-deferred approach
+    #  1. GEMM → local buffer (with bias)
+    #  2. Compute x² sum per row (Q/K) → rms = rsqrt(sum/dim + eps)
+    #  3. A2A scatter: x (un-normed) + rms (scalar per row) to peers
+    #  4. Peer applies: out = x * rms * weight (elementwise, deferred norm)
+    # ════════════════════════════════════════════════════════════════
 
-    # Step 1: GEMM → local buffer
+    # Step 1: GEMM → local buffer (with bias)
     d_local = torch.matmul(a, b.t())  # [local_m, n_total]
     if bias is not None:
         d_local = d_local + bias
 
-    # Step 2: Split Q/K/V and apply RMSNorm (optional)
-    q = d_local[:, :q_dim]
-    k = d_local[:, q_dim:q_dim + kv_dim]
-    v = d_local[:, q_dim + kv_dim:]
+    # Step 2: Compute x² sum → rms (precomputed rsqrt, sent to peers)
+    # rms_q[row] = rsqrt(sum(d_local[row, :q_dim]²) / q_dim + eps)
+    # rms_k[row] = rsqrt(sum(d_local[row, q_dim:q_dim+kv_dim]²) / kv_dim + eps)
+    do_norm_q = norm_q_weight is not None
+    do_norm_k = norm_k_weight is not None
 
-    if norm_q_weight is not None:
-        qf = q.float()
-        rms = torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + eps)
-        q = (qf * rms * norm_q_weight.to(qf.device)).to(q.dtype)
+    rms_q = None
+    rms_k = None
+    if do_norm_q:
+        qf = d_local[:, :q_dim].float()
+        rms_q = torch.rsqrt(qf.pow(2).sum(-1) / q_dim + eps)  # [local_m]
+    if do_norm_k:
+        kf = d_local[:, q_dim:q_dim + kv_dim].float()
+        rms_k = torch.rsqrt(kf.pow(2).sum(-1) / kv_dim + eps)  # [local_m]
 
-    if norm_k_weight is not None:
-        kf = k.float()
-        rms = torch.rsqrt(kf.pow(2).mean(-1, keepdim=True) + eps)
-        k = (kf * rms * norm_k_weight.to(kf.device)).to(k.dtype)
-
-    # Reassemble
-    d_normed = torch.cat([q, k, v], dim=-1)  # [local_m, n_total]
-
-    # Step 3: A2A-transpose scatter using NCCL (Phase 2 v1)
-    # This will be replaced by the fused P2P scatter kernel
+    # Step 3: A2A scatter (x un-normed + rms)
     local_q_n = (q_nheads // num_ranks) * head_dim
     local_kv_n = (kv_nheads // num_ranks) * head_dim
     local_n = local_q_n + 2 * local_kv_n
 
-    # Reshape for A2A: [num_ranks, bs, local_seq, local_n]
-    q_view = d_normed[:, :q_dim].view(bs, local_seq, num_ranks, local_q_n)
-    k_view = d_normed[:, q_dim:q_dim+kv_dim].view(bs, local_seq, num_ranks, local_kv_n)
-    v_view = d_normed[:, q_dim+kv_dim:].view(bs, local_seq, num_ranks, local_kv_n)
+    # Scatter x (un-normed) by head groups
+    q_view = d_local[:, :q_dim].view(bs, local_seq, num_ranks, local_q_n)
+    k_view = d_local[:, q_dim:q_dim+kv_dim].view(bs, local_seq, num_ranks, local_kv_n)
+    v_view = d_local[:, q_dim+kv_dim:].view(bs, local_seq, num_ranks, local_kv_n)
 
     send = torch.cat([q_view, k_view, v_view], dim=-1).permute(2, 0, 1, 3).contiguous()
     recv = torch.empty_like(send)
     dist.all_to_all_single(recv, send, group=sym_buffer.group)
-    out = recv.permute(1, 0, 2, 3).reshape(bs, seq, local_n).contiguous()
+    scattered_x = recv.permute(1, 0, 2, 3).reshape(bs, seq, local_n).contiguous()
+    # scattered_x layout: [bs, seq, local_q_n | local_kv_n | local_kv_n] (un-normed)
 
-    # Copy to sym_buffer's output region (for API compatibility)
+    # Scatter rms (tiny: [bs*local_seq, 2] → split by seq)
+    # rms is per-src-rank-row, need to send each rank's rms to the right dst
+    # Actually rms is per-row in the src's seq shard → dst gets it at the right seq offset
+    if do_norm_q or do_norm_k:
+        rms_send = torch.stack([rms_q if do_norm_q else torch.zeros(local_m, device=a.device, dtype=torch.float32),
+                                rms_k if do_norm_k else torch.zeros(local_m, device=a.device, dtype=torch.float32)], dim=-1)
+        # [bs, local_seq, 2] → [num_ranks, bs, local_seq, 2] for A2A
+        rms_send = rms_send.view(bs, local_seq, 2).unsqueeze(0).expand(num_ranks, -1, -1, -1).contiguous()
+        rms_recv = torch.empty_like(rms_send)
+        dist.all_to_all_single(rms_recv, rms_send, group=sym_buffer.group)
+        # [num_ranks, bs, local_seq, 2] → [bs, seq, 2]
+        rms_gathered = rms_recv.permute(1, 0, 2, 3).reshape(bs, seq, 2).contiguous()
+
+    # Step 4: Apply deferred norm on the receiving side
+    out = scattered_x
+    if do_norm_q:
+        # Q segment: [bs, seq, local_q_n]
+        q_out = out[:, :, :local_q_n].float()
+        rms_q_recv = rms_gathered[:, :, 0:1]  # [bs, seq, 1]
+        # norm weight: this rank's head group of Q
+        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[sym_buffer.group.rank()]
+        q_out = (q_out * rms_q_recv * local_norm_q.to(q_out.device)).to(out.dtype)
+        out[:, :, :local_q_n] = q_out
+    if do_norm_k:
+        # K segment: [bs, seq, local_kv_n]
+        k_out = out[:, :, local_q_n:local_q_n+local_kv_n].float()
+        rms_k_recv = rms_gathered[:, :, 1:2]
+        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[sym_buffer.group.rank()]
+        k_out = (k_out * rms_k_recv * local_norm_k.to(k_out.device)).to(out.dtype)
+        out[:, :, local_q_n:local_q_n+local_kv_n] = k_out
+    # V segment: no norm
+
+    # Copy to sym_buffer's output region
     out_view = sym_buffer.get_out_view()
     out_view.copy_(out)
 

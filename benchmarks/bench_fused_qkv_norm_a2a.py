@@ -103,13 +103,17 @@ def run_bench(local_rank, num_local_ranks, iters=30):
     eps = 1e-6
 
     if rank_idx == 0:
-        print(f"\n{'='*130}")
+        print(f"\n{'='*140}")
         print(f"  Fused QKV GEMM + RMSNorm + A2A-transpose Benchmark: {num_ranks} GPUs")
-        print(f"  Phase 2 v1: Python-orchestrated (serial vs fused)")
-        print(f"{'='*130}\n")
-        print(f"{'Shape (bs,lseq,qh,kvh,hd,K)':<32} | {'Mode':<8} | "
-              f"{'Serial (us)':>12} {'Fused (us)':>12} {'Speedup':>8} | {'Status'}")
-        print(f"{'-'*32} | {'-'*8} | {'-'*12} {'-'*12} {'-'*8} | {'-'*8}")
+        print(f"  serial (GEMM→norm→A2A) vs v2b (norm-deferred: GEMM→scatter→peer norm)")
+        print(f"{'='*140}\n")
+        print(f"{'Shape (bs,lseq,qh,kvh,hd,K)':<32} | "
+              f"{'Serial':>10} {'v2b':>10} {'v2b/serial':>10} | {'Status'}")
+        print(f"{'-'*32} | {'-'*10} {'-'*10} {'-'*10} | {'-'*8}")
+
+    geo_serial = 1.0
+    geo_v2b = 1.0
+    num_shapes = 0
 
     for bs, local_seq, q_nheads, kv_nheads, head_dim, k_dim in SHAPES_FOCUS:
         if q_nheads % num_ranks != 0 or kv_nheads % num_ranks != 0:
@@ -139,38 +143,39 @@ def run_bench(local_rank, num_local_ranks, iters=30):
 
         dist.barrier()
 
-        # Serial baseline
+        # Serial baseline (norm before A2A)
         def serial_fn():
             serial_pre_attn(x, b, bs, local_seq, q_nheads, kv_nheads, head_dim, k_dim,
                            num_ranks, group, norm_q, norm_k, eps, bias)
-
         t_serial = time_call(serial_fn, iters)
 
-        # Fused
+        # v2b: norm-deferred (GEMM → scatter un-normed + rms → peer norm)
         sym_buffer = deep_gemm.get_symm_buffer_for_fused_qkv_norm_a2a(
             group, bs, seq, q_nheads, kv_nheads, head_dim)
-
-        def fused_fn():
+        def v2b_fn():
             deep_gemm.bf16_fused_qkv_norm_a2a_transpose_nt(
                 x, b, sym_buffer, local_seq,
                 q_nheads, kv_nheads, head_dim,
                 eps=eps, norm_q_weight=norm_q, norm_k_weight=norm_k, bias=bias)
-
-        t_fused = time_call(fused_fn, iters)
+        t_v2b = time_call(v2b_fn, iters)
         sym_buffer.destroy()
 
-        speedup = t_serial / t_fused if t_fused > 0 else 0
+        speedup = t_serial / t_v2b if t_v2b > 0 else 0
+        geo_serial *= t_serial
+        geo_v2b *= t_v2b
+        num_shapes += 1
 
         if rank_idx == 0:
             shape_str = f"{bs},{local_seq},{q_nheads},{kv_nheads},{head_dim},{k_dim}"
-            print(f"{shape_str:<32} | {'norm' if norm_q is not None else 'noNorm':<8} | "
-                  f"{t_serial:>12.1f} {t_fused:>12.1f} {speedup:>7.2f}x | "
-                  f"{'fused' if speedup > 1 else 'serial wins'}")
+            print(f"{shape_str:<32} | {t_serial:>10.1f} {t_v2b:>10.1f} {speedup:>9.2f}x | "
+                  f"{'v2b' if speedup > 1 else 'serial'}")
 
         dist.barrier()
 
-    if rank_idx == 0:
-        print(f"\n{'='*130}\n")
+    if rank_idx == 0 and num_shapes > 0:
+        geo_ratio = (geo_serial / geo_v2b) ** (1.0 / num_shapes)
+        print(f"\n  Geo-mean speedup (v2b/serial): {geo_ratio:.3f}x")
+        print(f"{'='*140}\n")
 
     dist.barrier()
     dist.destroy_process_group()
