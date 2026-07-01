@@ -154,35 +154,35 @@ def bf16_fused_qkv_norm_a2a_nt(
     out = sym_buffer.get_out_view()
     rms = sym_buffer.get_rms_view().clone()  # small: [bs, seq, 2] fp32
 
-    # Apply bias + norm in-place (minimal kernel launches)
-    # Strategy: precompute rms*weight, then single fused add+mul per segment
+    # Precompute per-rank bias slices (avoid repeated view in each branch)
     local_q_n = (q_nheads // num_ranks) * head_dim
     local_kv_n = (kv_nheads // num_ranks) * head_dim
+    r = group.rank()
+    bias_q = bias[:q_dim].view(num_ranks, local_q_n)[r].to(out.dtype) if bias is not None else None
+    bias_k = bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[r].to(out.dtype) if bias is not None else None
+    bias_v = bias[q_dim+kv_dim:].view(num_ranks, local_kv_n)[r].to(out.dtype) if bias is not None else None
 
     if do_norm_q:
-        # Precompute rms_q * norm_q_weight (broadcast over seq)
-        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[group.rank()]
-        rms_q_scaled = rms[:, :, 0:1] * local_norm_q.float()  # [bs, seq, 1] * [local_q_n]
+        local_norm_q = norm_q_weight.view(num_ranks, local_q_n)[r]
+        rms_q_scaled = (rms[:, :, 0:1] * local_norm_q.float()).to(out.dtype)
         q_slice = out[:, :, :local_q_n]
-        if bias is not None:
-            q_slice.add_(bias[:q_dim].view(num_ranks, local_q_n)[group.rank()].to(out.dtype))
-        q_slice.mul_(rms_q_scaled.to(out.dtype))  # [bs, seq, local_q_n]
-    elif bias is not None:
-        out[:, :, :local_q_n].add_(bias[:q_dim].view(num_ranks, local_q_n)[group.rank()].to(out.dtype))
+        if bias_q is not None:
+            q_slice.add_(bias_q)
+        q_slice.mul_(rms_q_scaled)
+    elif bias_q is not None:
+        out[:, :, :local_q_n].add_(bias_q)
 
     if do_norm_k:
-        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[group.rank()]
-        rms_k_scaled = rms[:, :, 1:2] * local_norm_k.float()
+        local_norm_k = norm_k_weight.view(num_ranks, local_kv_n)[r]
+        rms_k_scaled = (rms[:, :, 1:2] * local_norm_k.float()).to(out.dtype)
         k_slice = out[:, :, local_q_n:local_q_n+local_kv_n]
-        if bias is not None:
-            k_slice.add_(bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
-        k_slice.mul_(rms_k_scaled.to(out.dtype))
-    elif bias is not None:
-        out[:, :, local_q_n:local_q_n+local_kv_n].add_(
-            bias[q_dim:q_dim+kv_dim].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
+        if bias_k is not None:
+            k_slice.add_(bias_k)
+        k_slice.mul_(rms_k_scaled)
+    elif bias_k is not None:
+        out[:, :, local_q_n:local_q_n+local_kv_n].add_(bias_k)
 
-    if bias is not None:
-        out[:, :, local_q_n+local_kv_n:].add_(
-            bias[q_dim+kv_dim:].view(num_ranks, local_kv_n)[group.rank()].to(out.dtype))
+    if bias_v is not None:
+        out[:, :, local_q_n+local_kv_n:].add_(bias_v)
 
     return out, rms  # return sym buffer view (no clone)

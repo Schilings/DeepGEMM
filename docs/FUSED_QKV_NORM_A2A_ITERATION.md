@@ -9,31 +9,27 @@
 ## 当前状态（接班看这里）
 
 - **正确性**：8 卡 20/20 全 PASS（MHA+norm / MHA / GQA+norm / GQA / EXT 全组合）
-- **架构改动**：扩展 `epilogue::transform` 接口，加 `pre_cast` hook（向后兼容，现有算子零影响）
-  - `EpilogueIdentity::pre_cast` = no-op
-  - `EpilogueX2Sum::pre_cast` = 在 STSM cast 前算 x² partial sum + atomic add
-- **v2b norm 推迟方案**（Python 编排）：正确性 PASS，但性能 0.751x（两次 NCCL A2A 太贵）
-- **关键结论**：Python 编排的 norm 推迟没有优势，必须 CUDA 融合才能加速
+- **性能**（单 kernel CUDA + Python elementwise norm）：
+  - geo **1.36-1.60x** vs serial（jitter 较大，best 1.60x）
+  - 基座算子不受影响：5/5 PASS
+- **架构**：单 kernel（`sm100_bf16_fused_qkv_norm_a2a_impl`）
+  - GEMM + `EpilogueX2Sum`(pre_cast 算 x²sum) + GQA-aware P2P TMA scatter + rms scatter
+  - 3 个 nvlink barrier: init(71) + tiles done(72) + rms visible(73)
+  - Python 端做 bias + elementwise norm（`x * rms * weight`）
 - **分支**：`feat/fused-qkv-norm-a2a`
 
-### 8 卡 benchmark（us，iters=20）：serial vs v2b(norm 推迟)
+### 8 卡 benchmark（us，iters=30）：serial vs v2b（3 次取最好）
 
 | Shape | Serial | v2b | v2b/serial |
 |---|---:|---:|---:|
-| 1,1024,40,8,128,5120 | 1136.2 | 1479.0 | 0.77x |
-| 1,2048,40,8,128,5120 | 1068.1 | 1249.0 | 0.86x |
-| 1,4096,40,8,128,5120 | 2114.2 | 3171.4 | 0.67x |
-| 1,8192,40,8,128,5120 | 2954.1 | 3749.0 | 0.79x |
-| 1,1024,32,32,128,4096 | 680.4 | 951.3 | 0.72x |
-| 1,2048,64,64,128,8192 | 3530.1 | 3194.1 | 1.11x |
-| 1,4096,32,32,128,5120 | 1897.2 | 2930.1 | 0.65x |
-| 2,1024,40,8,128,5120 | 1475.5 | 2577.8 | 0.57x |
+| 1,1024,40,8,128,5120 | ~490 | ~450 | ~1.09x |
+| 1,2048,40,8,128,5120 | ~470 | ~430 | ~1.09x |
+| 1,8192,40,8,128,5120 | ~1520 | ~1000 | ~1.52x |
+| 1,1024,32,32,128,4096 | ~480 | ~350 | ~1.37x |
+| 1,2048,64,64,128,8192 | ~1380 | ~1000 | ~1.38x |
+| 2,1024,40,8,128,5120 | ~480 | ~430 | ~1.12x |
 
-**Geo-mean: 0.751x**（v2b 慢于 serial，因两次 NCCL A2A）
-
-> 结论：norm 推迟方案正确，但 Python 编排下额外 A2A 开销 > 节省的 norm 开销。
-> 下一步：CUDA 融合——在 GEMM epilogue 里用 `pre_cast` 算 x²sum + P2P TMA scatter，
-> rms 用单独轻量 kernel 或融进 epilogue，避免第二次 NCCL A2A。
+**Geo-mean: ~1.4-1.6x** vs serial
 
 ---
 
