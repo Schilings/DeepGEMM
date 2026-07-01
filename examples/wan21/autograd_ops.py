@@ -126,7 +126,20 @@ def a2a_transpose_gemm(o, weight, sym_buffer, layout_info):
 # ════════════════════════════════════════════════════════════════════════════
 
 class GemmRSFunction(torch.autograd.Function):
-    """GEMM + Reduce-Scatter (Ulysses post-attn variant). Dual backward = AG + GEMM."""
+    """GEMM + Reduce-Scatter (Ulysses post-attn variant). Dual backward = AG + GEMM.
+
+    Forward:  attn[full_m, local_hidden] @ Wo_r[dim, local_hidden].t()  →  RS  →  y[local_m, dim]
+        bf16_gemm_rs_nt(y, a=attn, b=Wo_r, sym_buffer, local_m)
+            a: [total_M, K] = [full_m, local_hidden]
+            b: [N, K]       = [dim, local_hidden]      (Wo_r_local)
+            y: [tokens_per_rank, N] = [local_m, dim]
+
+    Backward: grad_y[local_m, dim]  →  AG  →  grad_y_full[full_m, dim]  →  @ Wo_r  →  grad_attn[full_m, local_hidden]
+        bf16_ag_gemm_nt(d=grad_attn, b=Wo_r.t(), sym_buffer, local_m)
+            x = grad_y [tokens_per_rank, K] = [local_m, dim]
+            b: [N, K] = [local_hidden, dim]              (Wo_r_local.t() — NT layout)
+            d: [full_M, N] = [full_m, local_hidden]
+    """
 
     @staticmethod
     def forward(ctx, attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
@@ -135,7 +148,8 @@ class GemmRSFunction(torch.autograd.Function):
         ctx.layout_info = layout_info
         ctx.save_for_backward(attn, weight)
         li = layout_info
-        local_m = li['local_m']; local_N = li['local_N']
+        local_m = li['local_m']
+        local_N = li['local_N']  # = dim
         y = torch.empty((local_m, local_N), dtype=torch.bfloat16, device=attn.device)
         bf16_gemm_rs_nt(y, attn, weight, sym_buffer, local_m)
         return y
@@ -144,15 +158,28 @@ class GemmRSFunction(torch.autograd.Function):
     def backward(ctx, grad_y):
         attn, weight = ctx.saved_tensors
         li = ctx.layout_info
-        sp = li['sp_size']; local_N = li['local_N']; local_hidden = li['local_hidden']
-        full_m = li['full_m']; local_m = li['local_m']; group = li['group']
+        sp = li['sp_size']
+        local_N = li['local_N']      # = dim
+        local_hidden = li['local_hidden']
+        full_m = li['full_m']
+        local_m = li['local_m']
+        group = li['group']
+
+        # Copy grad_y into AG sym buffer (x = grad_y, [local_m, dim])
         ctx.sym_buffer_bwd.x[:local_m, :local_N].copy_(grad_y)
+
+        # AG + GEMM: grad_attn = AG(grad_y) @ Wo_r_local
+        #   b for bf16_ag_gemm_nt = [N, K] = [local_hidden, dim] = weight.t()
+        weight_t = weight.t().contiguous()  # [local_hidden, dim]
         grad_attn = torch.empty((full_m, local_hidden), dtype=torch.bfloat16, device=grad_y.device)
-        bf16_ag_gemm_nt(grad_attn, weight, ctx.sym_buffer_bwd, local_m)
+        bf16_ag_gemm_nt(grad_attn, weight_t, ctx.sym_buffer_bwd, local_m)
+
+        # Weight grad: grad_Wo_r = grad_y_full.t() @ attn  ([dim, full_m] @ [full_m, local_hidden])
         gy_list = [torch.empty_like(grad_y) for _ in range(sp)]
         dist.all_gather(gy_list, grad_y, group=group)
         grad_y_full = torch.cat(gy_list, dim=0)
         grad_weight = torch.matmul(grad_y_full.t(), attn)
+
         return grad_attn, grad_weight, None, None, None
 
 

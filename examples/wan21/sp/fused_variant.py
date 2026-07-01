@@ -3,43 +3,24 @@
 Wo column-split (in Y=XW, W row-split): Wo_i [dim, local_hidden] per rank.
 Attention output [full_m, local_hidden] @ Wo_i^T → [full_m, dim] partial → RS → [local_m, dim].
 
-This uses reduce-scatter (not AllReduce) — matches our bf16_gemm_rs_nt operator.
-The RS replaces the POST A2A (scatter seq) + full Wo GEMM in serial/fused_std.
+POST uses fused GEMM+RS kernel (bf16_gemm_rs_nt) — no materialized y_partial.
+POST backward uses fused AG+GEMM kernel (bf16_ag_gemm_nt) — no materialized grad_y_full.
 """
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs, GemmRSSymmBuffer
+from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm, BF16AGGemmSymmBuffer
+
 from .base import UlyssesBase
 from .serial import NCCLAllToAll
-
-
-class ReduceScatter(torch.autograd.Function):
-    """Reduce-scatter with autograd: forward=RS, backward=AllGather."""
-
-    @staticmethod
-    def forward(ctx, x, group):
-        """x [full_m, dim] → RS → [local_m, dim] (each rank gets 1/sp of the sum)."""
-        ctx.group = group
-        sp = group.size()
-        full_m, dim = x.shape
-        local_m = full_m // sp
-        out = torch.empty(local_m, dim, dtype=x.dtype, device=x.device)
-        dist.reduce_scatter_tensor(out, x, op=dist.ReduceOp.SUM, group=group)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        """Backward = AllGather: [local_m, dim] → [full_m, dim]."""
-        sp = ctx.group.size()
-        full_list = [torch.empty_like(grad_out) for _ in range(sp)]
-        dist.all_gather(full_list, grad_out, group=ctx.group)
-        return torch.cat(full_list, dim=0), None
+from ..autograd_ops import gemm_rs
 
 
 class FusedVariantUlysses(UlyssesBase):
-    """Q/K/V separate + Wo column-split + GEMM+RS (Ulysses variant)."""
+    """Q/K/V separate + Wo column-split + fused GEMM+RS (Ulysses variant)."""
 
     def __init__(self, config, sp_config):
         super().__init__(config, sp_config)
@@ -51,8 +32,7 @@ class FusedVariantUlysses(UlyssesBase):
         Wv = self.model.v.weight
         self.Wqkv = nn.Parameter(torch.cat([Wq, Wk, Wv], dim=0).clone(), requires_grad=True)
         self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
-        # Wo column-split: Wo_i = Wo[:, i*local_hidden:(i+1)*local_hidden] = [dim, local_hidden]
-        # Y = attn [full_m, local_hidden] @ Wo_i^T [dim, local_hidden].T = [full_m, dim] (partial) → RS
+        # Wo column-split: Wo_i = Wo[:, rank*local_hidden:(rank+1)*local_hidden] = [dim, local_hidden]
         local_hidden = self.local_nh * self.head_dim
         rank = self.group.rank()
         Wo = self.model.o.weight  # [dim, dim] = [out, in]
@@ -60,6 +40,33 @@ class FusedVariantUlysses(UlyssesBase):
         self.Wo_r_local = nn.Parameter(Wo_i.clone(), requires_grad=True)
         self.Wo_r_local_t = nn.Parameter(self.Wo_r_local.data.t().contiguous(), requires_grad=True)
         self._wo_sharded = True  # Wo grad is local (no FSDP2 sync)
+
+    def _create_buffers(self):
+        """Create symmetric buffers for GEMM+RS (forward) and AG+GEMM (backward)."""
+        dim = self.cfg.dim
+        local_m = self.local_m  # tokens per rank = bs * (seq // sp)
+
+        # Forward: GEMM+RS sym buffer
+        #   hidden = N = dim (output cols)
+        #   num_max_tokens_per_rank = local_m (output rows per rank after RS)
+        self.sym_post = get_symm_buffer_for_gemm_rs(
+            self.group, local_m, dim, out_dtype=torch.bfloat16
+        )
+
+        # Backward: AG+GEMM sym buffer
+        #   x = grad_y [local_m, dim] → AG → [full_m, dim]
+        #   k_dim = dim (the K dim of the GEMM, which is the gather dim)
+        self.sym_post_bwd = get_symm_buffer_for_bf16_ag_gemm(
+            self.group, local_m, dim
+        )
+
+    def destroy_buffers(self):
+        if hasattr(self, 'sym_post') and self.sym_post is not None:
+            self.sym_post.destroy()
+            self.sym_post = None
+        if hasattr(self, 'sym_post_bwd') and self.sym_post_bwd is not None:
+            self.sym_post_bwd.destroy()
+            self.sym_post_bwd = None
 
     def _pre_forward(self, x_local, llseq):
         """PRE: GEMM → split Q/K/V → norm → A2A scatter heads → gather seq."""
@@ -83,19 +90,28 @@ class FusedVariantUlysses(UlyssesBase):
         return torch.cat([q, k, v], dim=2).reshape(lbs, lseq, -1)
 
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
-        """POST: Wo column-split GEMM → RS → + bias.
+        """POST: Wo column-split GEMM + RS (fused) + bias.
 
         o [lbs, lseq, local_nh, hd] → flatten [full_m, local_hidden]
-        → Y_i = attn @ Wo_i^T = [full_m, dim] (partial) → RS → [local_m, dim] → + bias
+        → fused GEMM+RS: attn @ Wo_r_local.t() → RS → y [local_m, dim]
+        → + bias
         """
         full_m = lbs * lseq  # full seq
         local_hidden = self.local_hidden
-        # Flatten attention output
+        # Flatten attention output to [full_m, local_hidden]
         attn_local = o.reshape(full_m, local_hidden).contiguous()
-        # Wo column-split GEMM: Y_i = attn @ Wo_i^T = [full_m, local_hidden] @ [dim, local_hidden].T
-        # = [full_m, local_hidden] @ [local_hidden, dim] = [full_m, dim] (PARTIAL SUM)
-        y_partial = torch.matmul(attn_local, self.Wo_r_local.t())
-        # Reduce-scatter: sum partial sums across ranks + scatter seq → [local_m, dim]
-        y = ReduceScatter.apply(y_partial, self.group)
+
+        # Build layout_info for GemmRSFunction
+        layout_info = {
+            'local_m': self.local_m,       # tokens per rank (output rows)
+            'local_N': self.cfg.dim,       # dim (output cols)
+            'full_m': full_m,              # full tokens (input rows)
+            'local_hidden': local_hidden,  # K dim of GEMM
+            'sp_size': self.sp_size,
+            'group': self.group,
+        }
+
+        # Fused GEMM + RS: y = RS(attn @ Wo_r.t()) → [local_m, dim]
+        y = gemm_rs(attn_local, self.Wo_r_local, self.sym_post, self.sym_post_bwd, layout_info)
         # Add bias (after RS, each rank has local_m tokens)
         return y + self.model.o.bias
