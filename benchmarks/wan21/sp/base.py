@@ -57,9 +57,11 @@ class UlyssesBase(nn.Module):
         Wk = self.model.k_proj.weight
         Wv = self.model.v_proj.weight
         Wo = self.model.o_proj.weight
-        self.Wqkv = build_wqkv_rankmajor(Wq, Wk, Wv, self.sp_size, self.local_nh, self.head_dim)
-        self.Wqkv_t = self.Wqkv.t().contiguous()
-        self.Wo = Wo
+        # Register Wqkv as nn.Parameter (not buffer) so FSDP2 can shard/sync it
+        Wqkv = build_wqkv_rankmajor(Wq, Wk, Wv, self.sp_size, self.local_nh, self.head_dim)
+        self.Wqkv = nn.Parameter(Wqkv.clone(), requires_grad=True)
+        self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
+        self.Wo = Wo  # model.o_proj.weight, still managed by FSDP2 via model
         self.Wo_t = Wo.t().contiguous()
 
     def _create_buffers(self):
@@ -69,6 +71,7 @@ class UlyssesBase(nn.Module):
         pass
 
     def _attn_forward(self, qkv, grid, lbs, lseq):
+        """Attention via FA4 — autograd-compatible (FA4 supports backward)."""
         ln = self.local_n
         q = qkv[:, :, :ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous()
         k = qkv[:, :, ln:2*ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous()
@@ -81,33 +84,14 @@ class UlyssesBase(nn.Module):
         o = flash_attn_func(q, k, v, softmax_scale=self.scale, causal=self.cfg.causal)
         return o[0] if isinstance(o, tuple) else o
 
-    def _attn_backward(self, grad_attn, qkv_pre_norm, grid, lbs, lseq):
-        ln = self.local_n
-        q_leaf = qkv_pre_norm[:, :, :ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous().requires_grad_(True)
-        k_leaf = qkv_pre_norm[:, :, ln:2*ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous().requires_grad_(True)
-        v_leaf = qkv_pre_norm[:, :, 2*ln:3*ln].view(lbs, lseq, self.local_nh, self.head_dim).contiguous().requires_grad_(True)
-        q = self.model.norm_q(q_leaf.reshape(-1, self.cfg.dim)).view(lbs, lseq, self.local_nh, self.head_dim)
-        k = self.model.norm_k(k_leaf.reshape(-1, self.cfg.dim)).view(lbs, lseq, self.local_nh, self.head_dim)
-        q = rope_apply(q, grid, self.model.freqs)
-        k = rope_apply(k, grid, self.model.freqs)
-        from flash_attn.cute import flash_attn_func
-        o = flash_attn_func(q, k, v_leaf, softmax_scale=self.scale, causal=self.cfg.causal)
-        o = o[0] if isinstance(o, tuple) else o
-        return torch.autograd.grad(o, [q_leaf, k_leaf, v_leaf], grad_attn)
-
     def _pre_forward(self, x_local, llseq):
         raise NotImplementedError
 
     def _post_forward(self, o, **kw):
         raise NotImplementedError
 
-    def _post_backward(self, grad_y, cache, **kw):
-        raise NotImplementedError
-
-    def _pre_backward(self, grad_qkv, **kw):
-        raise NotImplementedError
-
     def forward(self, x_local, grid, llseq=None):
+        """Forward pass — autograd graph (for FSDP2 + loss.backward())."""
         assert self._shape_set
         if llseq is None: llseq = self.local_seq
         lbs = self.bs if self.layout == 'BSHD' else 1
@@ -115,26 +99,4 @@ class UlyssesBase(nn.Module):
         qkv = self._pre_forward(x_local, llseq)
         o = self._attn_forward(qkv, grid, lbs, lseq)
         y = self._post_forward(o, lbs=lbs, lseq=lseq, llseq=llseq, grid=grid)
-        self._cache = (qkv, o)
         return y
-
-    def backward(self, grad_y, x_local, grid, llseq=None):
-        assert self._shape_set
-        if llseq is None: llseq = self.local_seq
-        lbs = self.bs if self.layout == 'BSHD' else 1
-        lseq = self.seq if self.layout == 'BSHD' else self.bs * self.seq
-        lm = lbs * llseq
-        qkv, o = self._cache
-
-        grad_attn, grad_Wo = self._post_backward(
-            grad_y, cache=o, lbs=lbs, lseq=lseq, llseq=llseq, lm=lm, grid=grid)
-        grad_q, grad_k, grad_v = self._attn_backward(grad_attn, qkv, grid, lbs, lseq)
-        ln = self.local_n
-        grad_qkv = torch.cat([
-            grad_q.reshape(lbs, lseq, ln),
-            grad_k.reshape(lbs, lseq, ln),
-            grad_v.reshape(lbs, lseq, ln)], dim=-1)
-        grad_X, grad_Wqkv = self._pre_backward(
-            grad_qkv, lbs=lbs, lseq=lseq, llseq=llseq, lm=lm, x_local=x_local)
-        # Gradient sync is handled externally via FSDP2/DTensor (see bench)
-        return grad_X, grad_Wqkv, grad_Wo
