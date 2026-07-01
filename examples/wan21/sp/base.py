@@ -36,6 +36,7 @@ class UlyssesBase(nn.Module):
         self.layout = sp_config.layout
         self.use_fused = sp_config.use_fused_ops
         self._shape_set = False
+        self._skip_buffer_creation = False
 
     def setup_shape(self, bs, seq, nheads, head_dim):
         sp = self.sp_size
@@ -51,7 +52,8 @@ class UlyssesBase(nn.Module):
         self.local_m = bs * (seq // sp)
         self._shape_set = True
         self._build_weights()
-        self._create_buffers()
+        if not self._skip_buffer_creation:
+            self._create_buffers()
 
     def _build_weights(self):
         # Model has separate q/k/v (official Wan2.1 layout) — reorder to rank-major for SP

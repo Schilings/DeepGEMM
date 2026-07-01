@@ -60,13 +60,15 @@ class FusedVariantUlysses(UlyssesBase):
             self.group, local_m, dim
         )
 
+    def share_buffers_from(self, other):
+        """Reuse sym_bufs from another strategy instance (for multi-layer models)."""
+        self.sym_post = other.sym_post
+        self.sym_post_bwd = other.sym_post_bwd
+
     def destroy_buffers(self):
-        if hasattr(self, 'sym_post') and self.sym_post is not None:
-            self.sym_post.destroy()
-            self.sym_post = None
-        if hasattr(self, 'sym_post_bwd') and self.sym_post_bwd is not None:
-            self.sym_post_bwd.destroy()
-            self.sym_post_bwd = None
+        # Only the owner should destroy; others just clear references
+        self.sym_post = None
+        self.sym_post_bwd = None
 
     def _pre_forward(self, x_local, llseq):
         """PRE: GEMM → split Q/K/V → norm → A2A scatter heads → gather seq."""
