@@ -145,9 +145,10 @@ def bf16_fused_qkv_norm_a2a_nt(
         q_nheads, kv_nheads, head_dim,
         eps, do_norm_q, do_norm_k)
 
-    torch.cuda.synchronize()
+    # Sync: kernel has 3 nvlink barriers internally (init + tiles + rms).
+    # After kernel returns, data is globally visible. Only need group barrier
+    # to ensure all ranks finished before we read sym buffer.
     group.barrier()
-    torch.cuda.synchronize()
 
     # Get output views (operate in-place on sym buffer, clone only at end)
     out = sym_buffer.get_out_view()
