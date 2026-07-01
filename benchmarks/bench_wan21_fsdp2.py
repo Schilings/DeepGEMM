@@ -159,7 +159,7 @@ def run(rank, ng, port, iters, verify, strategies):
                     local_N = hidden // ng if strat_name == 'fused_var' else hidden
                     gy = torch.randn((lm, local_N), dtype=torch.bfloat16, device=dev)
                 # Autograd backward — FSDP2 hooks reduce-scatter weight grads automatically
-                torch.autograd.backward(y, gy)
+                y.backward(gy)
                 return X_in.grad
             try:
                 t_bwd = time_call(bwd, iters, warmup=2, group=group)

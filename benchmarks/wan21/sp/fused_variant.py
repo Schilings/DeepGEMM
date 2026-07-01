@@ -64,7 +64,7 @@ class FusedVariantUlysses(UlyssesBase):
             'head_dim': self.head_dim, 'thd': self.layout == 'THD',
         }
         qkv = GemmA2ATransposeFunction.apply(
-            x_local, self.Wqkv, self.sym_pre, llseq, self.cfg.n_qkv,
+            x_local, self.Wqkv, self.sym_pre, self.sym_pre_bwd, llseq, self.cfg.n_qkv,
             self.sp_size, self.group, layout_info)
         if self.layout == 'THD':
             qkv = qkv[:lbs, :lseq, :]
@@ -92,4 +92,4 @@ class FusedVariantUlysses(UlyssesBase):
             'full_m': full_m, 'sp_size': self.sp_size, 'group': self.group,
             'bs': self.bs, 'seq': self.seq,
         }
-        return GemmRSFunction.apply(attn_local, self.Wo_r_local, self.sym_gemm_rs, layout_info)
+        return GemmRSFunction.apply(attn_local, self.Wo_r_local, self.sym_gemm_rs, self.sym_ag_gemm, layout_info)

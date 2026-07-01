@@ -94,16 +94,43 @@ Wan2.1 14B: dim=5120, nh=40, hd=128。VAE stride=(4,8,8), patch=(1,2,2)。
 | 1x148K | fused_std | 45182 | 34083 | 220560 | 440 | 266182 |
 | 1x148K | **fused_var** | **44764** | 36641 | **219672** | **278** | **264714** |
 
-### 加速比 (FWD+BWD+SYNC vs serial)
+## 结果 (8 GPU B300, FSDP2 fully_shard, autograd-based, iters=10, us)
+
+> **FSDP2 (fully_shard) + autograd.Function**：融合算子封装为 `torch.autograd.Function`，
+> forward 走 autograd graph，`y.backward()` 自动触发 FSDP2 的 reduce-scatter 梯度同步。
+> BWD 已包含 FSDP2 自动梯度同步（Wqkv reduce-scatter；fused_var Wo 跳过因行切分）。
+
+| Shape | Strategy | FWD | BWD | F+B |
+|-------|----------|------|------|------|
+| 1x8K | serial | 1698 | 3046 | 4744 |
+| 1x8K | fused_std | 1502 | 2927 | 4429 |
+| 1x8K | **fused_var** | **1423** | 3065 | **4487** |
+| 1x32K | serial | 4112 | 11987 | 16099 |
+| 1x32K | fused_std | 3789 | 12049 | 15839 |
+| 1x32K | **fused_var** | **3669** | **11576** | **15244** |
+| 1x74K | serial | 13343 | 51044 | 64386 |
+| 1x74K | fused_std | 12537 | 51014 | 63551 |
+| 1x74K | **fused_var** | **12376** | **49185** | **61561** |
+| 1x168K | serial | 58946 | 228491 | 287437 |
+| 1x168K | fused_std | 58198 | 229296 | 287494 |
+| 1x168K | **fused_var** | **57356** | **226077** | **283432** |
+| 1x64K | serial | 10418 | 39940 | 50359 |
+| 1x64K | fused_std | 9919 | 39724 | 49643 |
+| 1x64K | **fused_var** | **9775** | **38167** | **47942** |
+| 1x148K | serial | 46613 | 181370 | 227982 |
+| 1x148K | fused_std | 45579 | 181424 | 227003 |
+| 1x148K | **fused_var** | **45204** | **178769** | **223973** |
+
+### 加速比 (F+B vs serial, FSDP2 autograd)
 
 | Shape | fused_std | fused_var |
 |-------|-----------|-----------|
-| 1x8K | 0.80x | **1.09x** |
-| 1x32K | 0.95x | **1.07x** |
-| 1x74K | 1.01x | **1.04x** |
-| 1x168K | 1.00x | **1.02x** |
-| 1x64K | 1.02x | **1.05x** |
-| 1x148K | 1.01x | **1.02x** |
+| 1x8K | 0.93x | **0.95x** |
+| 1x32K | 0.98x | **1.05x** |
+| 1x74K | 0.99x | **1.04x** |
+| 1x168K | 1.00x | **1.01x** |
+| 1x64K | 0.99x | **1.05x** |
+| 1x148K | 1.00x | **1.02x** |
 
 ### SYNC 开销分析
 

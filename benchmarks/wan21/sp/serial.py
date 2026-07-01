@@ -30,6 +30,7 @@ class NCCLAllToAll(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_recv):
         """Backward = A2A-inverse = all_to_all again (A2A is self-inverse with matching permute)."""
+        grad_recv = grad_recv.contiguous()
         grad_send = torch.empty_like(grad_recv)
         dist.all_to_all_single(grad_send, grad_recv, group=ctx.group)
         return grad_send, None, None, None, None, None, None, None, None

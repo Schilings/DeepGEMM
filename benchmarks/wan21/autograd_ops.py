@@ -37,13 +37,14 @@ class GemmA2ATransposeFunction(torch.autograd.Function):
     """GEMM + A2A-transpose (Ulysses pre-attn). Dual backward = A2A + GEMM."""
 
     @staticmethod
-    def forward(ctx, x_local, weight, sym_buffer, local_seq, n_qkv, sp_size, group, layout_info):
+    def forward(ctx, x_local, weight, sym_buffer, sym_buffer_bwd, local_seq, n_qkv, sp_size, group, layout_info):
         """x_local [local_m, K] @ weight[N, K]^T → A2A-scatter → qkv [bs, seq, local_n].
 
         Args:
             x_local: [local_m, K] bf16, requires_grad=True
             weight: [N, K] bf16 (Wqkv, NT layout), nn.Parameter
-            sym_buffer: GemmA2ATransposeSymmBuffer
+            sym_buffer: GemmA2ATransposeSymmBuffer (for forward GEMM+A2A)
+            sym_buffer_bwd: BF16A2ATransposeGemmSymmBuffer (for backward A2A+GEMM)
             local_seq: this rank's seq length
             n_qkv: full N = 3 * nheads * head_dim
             sp_size: SP degree
@@ -52,6 +53,7 @@ class GemmA2ATransposeFunction(torch.autograd.Function):
         """
         from deep_gemm import bf16_gemm_a2a_transpose_nt
         ctx.sym_buffer = sym_buffer
+        ctx.sym_buffer_bwd = sym_buffer_bwd
         ctx.local_seq = local_seq
         ctx.n_qkv = n_qkv
         ctx.sp_size = sp_size
@@ -73,19 +75,18 @@ class GemmA2ATransposeFunction(torch.autograd.Function):
         head_dim = li['head_dim']
         # grad_qkv [lbs, lseq, local_nqkv] → BHSD [lbs, 3*local_nh, lseq, hd]
         gqkv_bhsd = grad_qkv.view(lbs, lseq, local_nh_qkv, head_dim).transpose(1, 2).contiguous()
-        ctx.sym_buffer.x.copy_(gqkv_bhsd)  # sym_pre_bwd buffer
+        ctx.sym_buffer_bwd.x.copy_(gqkv_bhsd)
         grad_X = torch.empty((lm, li['hidden']), dtype=torch.bfloat16, device=grad_qkv.device)
-        # weight is [N, K] (Wqkv), we need [K, N]^T for NT → use weight.t() (Wqkv_t)
-        bf16_a2a_transpose_gemm_nt(grad_X, weight.t(), ctx.sym_buffer)
+        bf16_a2a_transpose_gemm_nt(grad_X, weight.t(), ctx.sym_buffer_bwd)
         # Weight grad: grad_Wqkv = grad_local^T @ x_local
-        grad_local = ctx.sym_buffer.gathered[:lm, :ctx.n_qkv]
+        grad_local = ctx.sym_buffer_bwd.gathered[:lm, :ctx.n_qkv]
         grad_weight = torch.matmul(grad_local.t(), x_local)
-        return grad_X, grad_weight, None, None, None, None, None, None
+        return grad_X, grad_weight, None, None, None, None, None, None, None
 
 
-def gemm_a2a_transpose(x_local, weight, sym_buffer, local_seq, n_qkv, sp_size, group, layout_info):
+def gemm_a2a_transpose(x_local, weight, sym_buffer, sym_buffer_bwd, local_seq, n_qkv, sp_size, group, layout_info):
     """Functional wrapper for GemmA2ATransposeFunction."""
-    return GemmA2ATransposeFunction.apply(x_local, weight, sym_buffer, local_seq, n_qkv, sp_size, group, layout_info)
+    return GemmA2ATransposeFunction.apply(x_local, weight, sym_buffer, sym_buffer_bwd, local_seq, n_qkv, sp_size, group, layout_info)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -161,17 +162,19 @@ class GemmRSFunction(torch.autograd.Function):
     """GEMM + Reduce-Scatter (Ulysses post-attn variant). Dual backward = AG + GEMM."""
 
     @staticmethod
-    def forward(ctx, attn, weight, sym_buffer, layout_info):
+    def forward(ctx, attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
         """attn [local_m, local_hidden] @ weight[local_N, local_hidden]^T → RS → y [local_m, local_N].
 
         Args:
-            attn: [local_m, local_hidden] bf16 (local attention output, flattened), requires_grad=True
+            attn: [local_m, local_hidden] bf16, requires_grad=True
             weight: Wo_r_local [local_N, local_hidden] bf16, nn.Parameter (NT layout)
-            sym_buffer: GemmRSSymmBuffer
+            sym_buffer: GemmRSSymmBuffer (for forward GEMM+RS)
+            sym_buffer_bwd: BF16AGGemmSymmBuffer (for backward AG+GEMM)
             layout_info: dict with local_m, local_N, local_hidden, full_m, sp_size, group, bs, seq
         """
         from deep_gemm.gemm_rs import bf16_gemm_rs_nt
         ctx.sym_buffer = sym_buffer
+        ctx.sym_buffer_bwd = sym_buffer_bwd
         ctx.layout_info = layout_info
         ctx.save_for_backward(attn, weight)
         li = layout_info
@@ -189,17 +192,17 @@ class GemmRSFunction(torch.autograd.Function):
         sp = li['sp_size']; local_N = li['local_N']; local_hidden = li['local_hidden']
         full_m = li['full_m']; local_m = li['local_m']; group = li['group']
         # Fused AG+GEMM: grad_y → all-gather → @ Wo_r^T → grad_attn
-        ctx.sym_buffer.x[:local_m, :local_N].copy_(grad_y)  # sym_ag_gemm buffer
+        ctx.sym_buffer_bwd.x[:local_m, :local_N].copy_(grad_y)
         grad_attn = torch.empty((full_m, local_hidden), dtype=torch.bfloat16, device=grad_y.device)
-        bf16_ag_gemm_nt(grad_attn, weight, ctx.sym_buffer, local_m)
-        # Weight grad: grad_Wo_r = grad_y_full^T @ attn (need grad_y_full from all-gather)
+        bf16_ag_gemm_nt(grad_attn, weight, ctx.sym_buffer_bwd, local_m)
+        # Weight grad: grad_Wo_r = grad_y_full^T @ attn
         gy_list = [torch.empty_like(grad_y) for _ in range(sp)]
         dist.all_gather(gy_list, grad_y, group=group)
         grad_y_full = torch.cat(gy_list, dim=0)
         grad_weight = torch.matmul(grad_y_full.t(), attn)
-        return grad_attn, grad_weight, None, None
+        return grad_attn, grad_weight, None, None, None
 
 
-def gemm_rs(attn, weight, sym_buffer, layout_info):
+def gemm_rs(attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
     """Functional wrapper for GemmRSFunction."""
-    return GemmRSFunction.apply(attn, weight, sym_buffer, layout_info)
+    return GemmRSFunction.apply(attn, weight, sym_buffer, sym_buffer_bwd, layout_info)
