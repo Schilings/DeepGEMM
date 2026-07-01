@@ -15,6 +15,8 @@
 
 #include "apis/runtime.hpp"
 
+#include "jit_kernels/impls/sm100_bf16_fused_qkv_norm_a2a.hpp"
+
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -38,4 +40,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::a2a_transpose_gemm::register_apis(m);
     deep_gemm::mega::register_apis(m);
     deep_gemm::runtime::register_apis(m);
+
+    deep_gemm::fused_qkv_norm_a2a::register_apis(m);
 }

@@ -134,6 +134,13 @@ from .gemm_a2a_transpose import (
     bf16_gemm_a2a_transpose_nt,
 )
 
+# Fused QKV GEMM + RMSNorm + A2A-transpose (Ulysses SP pre-attention, GQA-aware, norm optional)
+from .fused_qkv_norm_a2a import (
+    FusedQKVNormA2ASymmBuffer,
+    get_symm_buffer_for_fused_qkv_norm_a2a,
+    bf16_fused_qkv_norm_a2a_transpose_nt,
+)
+
 
 
 
