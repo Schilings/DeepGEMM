@@ -33,7 +33,8 @@ def run_test(local_rank: int, num_local_ranks: int):
     device = f'cuda:{local_rank}'
 
     # Wan2.1 14B-like config
-    bs, seq = 1, 2048
+    # seq=8192 ensures num_tokens_per_rank >= 1024 on 8 GPUs (AG-GEMM needs >=128 alignment)
+    bs, seq = 1, 8192
     q_nheads, kv_nheads, head_dim = 32, 32, 128
     hidden = q_nheads * head_dim  # 4096
     local_seq = seq // num_ranks
@@ -81,6 +82,7 @@ def run_test(local_rank: int, num_local_ranks: int):
             print(f"  [{'PASS' if passed else 'FAIL'}] GEMM-A2A-transpose: rel_err={rel_err:.6f}")
         all_passed &= passed
         gemm_a2a_sym.destroy()
+        torch.cuda.synchronize()
     except Exception as e:
         if rank_idx == 0:
             import traceback; traceback.print_exc()
@@ -134,6 +136,7 @@ def run_test(local_rank: int, num_local_ranks: int):
             print(f"  [{'PASS' if passed2 else 'FAIL'}] Fused QKV+Norm+A2A: rel_err={rel_err2:.6f}")
         all_passed &= passed2
         fused_sym.destroy()
+        torch.cuda.synchronize()
     except Exception as e:
         if rank_idx == 0:
             import traceback; traceback.print_exc()
@@ -149,11 +152,15 @@ def run_test(local_rank: int, num_local_ranks: int):
     try:
         total_m_rs = bs * seq
         tokens_per_rank_rs = bs * local_seq
-        rs_sym = deep_gemm.get_symm_buffer_for_gemm_rs(group, tokens_per_rank_rs, hidden)
+        # Use unified buffer for GEMM-RS (avoids extra rendezvous on 8+ GPUs)
+        rs_sym_uni = deep_gemm.get_unified_symm_buffer(group, bs, seq, hidden)
+        rs_sym_uni.buffer.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
         d_rs = torch.randn((total_m_rs, hidden), dtype=torch.bfloat16, device=device)
         wo_rs = torch.randn((hidden, hidden), dtype=torch.bfloat16, device=device)
         out_rs = torch.empty((tokens_per_rank_rs, hidden), dtype=torch.bfloat16, device=device)
-        deep_gemm.bf16_gemm_rs_nt(out_rs, d_rs, wo_rs, rs_sym, tokens_per_rank_rs)
+        deep_gemm.bf16_gemm_rs_nt(out_rs, d_rs, wo_rs, rs_sym_uni, tokens_per_rank_rs)
 
         # Reference: GEMM + reduce_scatter
         d_local_rs = torch.matmul(d_rs, wo_rs.t())
@@ -165,7 +172,9 @@ def run_test(local_rank: int, num_local_ranks: int):
         if rank_idx == 0:
             print(f"  [{'PASS' if passed_rs else 'FAIL'}] GEMM-RS: rel_err={rel_err_rs:.6f}")
         all_passed &= passed_rs
-        rs_sym.destroy()
+        rs_sym_uni.destroy()
+        torch.cuda.synchronize()
+        dist.barrier()
     except Exception as e:
         if rank_idx == 0:
             import traceback; traceback.print_exc()
@@ -177,13 +186,20 @@ def run_test(local_rank: int, num_local_ranks: int):
     #  Test 4: AG-GEMM (bwd)
     # ════════════════════════════════════════════════════════════════
     try:
+        # Ensure previous sym buffer is fully released before creating a new one
+        torch.cuda.synchronize()
+        dist.barrier()
         num_tokens = bs * local_seq
-        ag_sym = deep_gemm.get_symm_buffer_for_bf16_ag_gemm(group, num_tokens, hidden)
+        # Use unified buffer for AG-GEMM (avoids extra rendezvous on 8+ GPUs)
+        ag_sym_uni = deep_gemm.get_unified_symm_buffer(group, bs, seq, hidden)
+        ag_sym_uni.buffer.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
         d_ag = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device)
         wo_ag = torch.randn((hidden, hidden), dtype=torch.bfloat16, device=device)
         out_ag = torch.empty((num_tokens * num_ranks, hidden), dtype=torch.bfloat16, device=device)
-        ag_sym.x.copy_(d_ag)
-        deep_gemm.bf16_ag_gemm_nt(out_ag, wo_ag, ag_sym, num_tokens)
+        ag_sym_uni.ag_x[:num_tokens].copy_(d_ag)
+        deep_gemm.bf16_ag_gemm_nt(out_ag, wo_ag, ag_sym_uni, num_tokens)
 
         # Reference: all_gather + GEMM
         all_d = [torch.empty_like(d_ag) for _ in range(num_ranks)]
@@ -196,7 +212,8 @@ def run_test(local_rank: int, num_local_ranks: int):
         if rank_idx == 0:
             print(f"  [{'PASS' if passed_ag else 'FAIL'}] AG-GEMM: rel_err={rel_err_ag:.6f}")
         all_passed &= passed_ag
-        ag_sym.destroy()
+        ag_sym_uni.destroy()
+        torch.cuda.synchronize()
     except Exception as e:
         if rank_idx == 0:
             import traceback; traceback.print_exc()
@@ -250,6 +267,7 @@ def run_test(local_rank: int, num_local_ranks: int):
             print(f"  [{'PASS' if passed_u else 'FAIL'}] Unified buffer reuse: reuse_diff={reuse_diff:.6f}")
         all_passed &= passed_u
         sym_u.destroy()
+        torch.cuda.synchronize()
     except Exception as e:
         if rank_idx == 0:
             import traceback; traceback.print_exc()
@@ -262,6 +280,9 @@ def run_test(local_rank: int, num_local_ranks: int):
     #          GEMM-RS and AG-GEMM should work with just (bs, seq, hidden)
     # ════════════════════════════════════════════════════════════════
     try:
+        # Ensure previous sym buffer is fully released before creating a new one
+        torch.cuda.synchronize()
+        dist.barrier()
         # No q_nheads/kv_nheads/head_dim — pure linear use case (e.g. MLP+RS)
         sym_lin = deep_gemm.get_unified_symm_buffer(group, bs, seq, hidden)
         assert not sym_lin.has_attention, 'has_attention should be False without head params'
@@ -290,6 +311,14 @@ def run_test(local_rank: int, num_local_ranks: int):
 
         # AG-GEMM: x[local_m, K] → AG → [total_m, K] @ b[N,K]^T → d[total_m, N]
         # Uses local tokens as input (AG gathers them inside the kernel)
+        # Sync between GEMM-RS and AG-GEMM on the same unified buffer:
+        # GEMM-RS leaves barrier/signal region in a modified state, AG-GEMM
+        # needs a clean barrier region to start its own +1/-1 protocol.
+        torch.cuda.synchronize()
+        dist.barrier()
+        sym_lin.buffer.zero_()  # clear barrier + data region
+        torch.cuda.synchronize()
+        dist.barrier()
         d_ag_lin = torch.randn((tokens_per_rank_lin, hidden), dtype=torch.bfloat16, device=device)
         sym_lin.ag_x[:tokens_per_rank_lin].copy_(d_ag_lin)
         out_ag_lin = torch.empty((total_m_lin, hidden), dtype=torch.bfloat16, device=device)
@@ -307,6 +336,7 @@ def run_test(local_rank: int, num_local_ranks: int):
             print(f"  [{'PASS' if passed_ag_lin else 'FAIL'}] Unified buffer (no attn) AG-GEMM: rel_err={rel_err_ag_lin:.6f}")
         all_passed &= passed_lin and passed_ag_lin
         sym_lin.destroy()
+        torch.cuda.synchronize()
     except Exception as e:
         if rank_idx == 0:
             import traceback; traceback.print_exc()
