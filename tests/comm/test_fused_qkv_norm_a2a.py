@@ -219,10 +219,17 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     # Compare torch baseline vs ground truth (should be very close, bf16 differences only)
     max_diff_ref_torch = (out_torch.float() - ref.float()).abs().max().item()
 
-    # Fused API (single kernel: GEMM + x²sum + scatter + rms scatter)
+    # Fused API — sym_buffer created once, reused across shapes (no per-call alloc)
     import deep_gemm
-    sym_buffer = deep_gemm.get_symm_buffer_for_fused_qkv_norm_a2a(
-        group, bs, seq, q_nheads, kv_nheads, head_dim)
+    if not hasattr(run_single_shape_test, '_sym_buffer_cache'):
+        run_single_shape_test._sym_buffer_cache = {}
+    cache_key = (bs, seq, q_nheads, kv_nheads, head_dim)
+    if cache_key not in run_single_shape_test._sym_buffer_cache:
+        run_single_shape_test._sym_buffer_cache[cache_key] = \
+            deep_gemm.get_symm_buffer_for_fused_qkv_norm_a2a(
+                group, bs, seq, q_nheads, kv_nheads, head_dim)
+    sym_buffer = run_single_shape_test._sym_buffer_cache[cache_key]
+
     out_fused, rms_fused = deep_gemm.bf16_fused_qkv_norm_a2a_nt(
         a, b, sym_buffer, local_seq,
         q_nheads, kv_nheads, head_dim,
@@ -248,8 +255,6 @@ def run_single_shape_test(rank_idx, num_ranks, local_rank, group,
     mean_diff_torch = (out_fused.float() - out_torch.float()).abs().mean().item()
     torch_abs_mean = out_torch.float().abs().mean().item()
     rel_error_torch = mean_diff_torch / max(torch_abs_mean, 1e-8)
-
-    sym_buffer.destroy()
     passed = (rel_error < 0.03 and rel_error_torch < 0.03 and max_diff_ref_torch < 1.0)
 
     return (passed, max_diff, rel_error, max_diff_ref_torch, max_diff_torch, rel_error_torch)

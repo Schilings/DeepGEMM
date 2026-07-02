@@ -33,13 +33,22 @@ from ..utils.math import align
 
 
 class FusedQKVNormA2ASymmBuffer:
-    """Symmetric buffer: [barrier(32B) | rms(bs*seq*2*4) | out(bs*seq*local_n*2)]"""
+    """Symmetric buffer: [barrier(32B) | rms(bs*seq*2*4) | out(bs*seq*local_n*2)]
+
+    Create once at model init, reuse across forward/backward calls.
+    The kernel's nvlink_barrier has a self-resetting protocol (+1/-1), so NO per-call
+    memset of the sym buffer is needed.
+
+    Also holds a local (non-symmetric) sum_buffer [local_m, 2] for x² partial sums.
+    sum_buffer MUST be zeroed before each kernel call (via reset()).
+    """
     def __init__(self, group, bs, seq, q_nheads, kv_nheads, head_dim,
                  out_dtype=torch.bfloat16):
         self.group = group
         self.world_size = group.size()
         self.bs = bs
         self.seq = seq
+        self.local_seq = seq // self.world_size
         self.q_nheads = q_nheads
         self.kv_nheads = kv_nheads
         self.head_dim = head_dim
@@ -63,6 +72,15 @@ class FusedQKVNormA2ASymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
+        # Local (non-symmetric) sum_buffer for x² partial sums — reuse across calls
+        local_m = bs * self.local_seq
+        self.sum_buffer = torch.zeros(local_m, 2, dtype=torch.float32, device='cuda')
+
+    def reset(self):
+        """Zero sum_buffer before each kernel call.
+        Sym buffer itself does NOT need zeroing (nvlink_barrier self-resets)."""
+        self.sum_buffer.zero_()
+
     def get_out_view(self):
         elem_size = 4 if self.out_dtype == torch.float32 else 2
         rms_bytes = self.bs * self.seq * 2 * 4
@@ -83,6 +101,7 @@ class FusedQKVNormA2ASymmBuffer:
     def destroy(self):
         self.handle = None
         self.buffer = None
+        self.sum_buffer = None
         self.group = None
 
 
@@ -131,8 +150,9 @@ def bf16_fused_qkv_norm_a2a_nt(
     do_norm_q = norm_q_weight is not None
     do_norm_k = norm_k_weight is not None
 
-    # Allocate sum_buffer: [local_m, 2] (indexed by GEMM M row, zeroed by host)
-    sum_buffer = torch.zeros(local_m, 2, dtype=torch.float32, device=a.device)
+    # Zero sum_buffer (reuse across calls — sym_buffer itself doesn't need zeroing)
+    sym_buffer.reset()
+    sum_buffer = sym_buffer.sum_buffer
 
     # Call CUDA kernel
     _C.sm100_bf16_fused_qkv_norm_a2a_nt(

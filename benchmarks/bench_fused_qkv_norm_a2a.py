@@ -149,7 +149,7 @@ def run_bench(local_rank, num_local_ranks, iters=30):
                            num_ranks, group, norm_q, norm_k, eps, bias)
         t_serial = time_call(serial_fn, iters)
 
-        # v2b: norm-deferred (GEMM → scatter un-normed + rms → peer norm)
+        # v2b: norm-deferred — sym_buffer created once, reused (no per-call alloc)
         sym_buffer = deep_gemm.get_symm_buffer_for_fused_qkv_norm_a2a(
             group, bs, seq, q_nheads, kv_nheads, head_dim)
         def v2b_fn():
@@ -158,7 +158,7 @@ def run_bench(local_rank, num_local_ranks, iters=30):
                 q_nheads, kv_nheads, head_dim,
                 eps=eps, norm_q_weight=norm_q, norm_k_weight=norm_k, bias=bias)
         t_v2b = time_call(v2b_fn, iters)
-        sym_buffer.destroy()
+        sym_buffer.destroy()  # destroy only after benchmark done for this shape
 
         speedup = t_serial / t_v2b if t_v2b > 0 else 0
         geo_serial *= t_serial
