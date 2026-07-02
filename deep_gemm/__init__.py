@@ -141,6 +141,12 @@ from .fused_qkv_norm_a2a import (
     bf16_fused_qkv_norm_a2a_nt,
 )
 
+# Unified sym buffer — one buffer for all communication-fused operators
+from .unified_buffer import (
+    UnifiedSymmBuffer,
+    get_unified_symm_buffer,
+)
+
 
 
 
