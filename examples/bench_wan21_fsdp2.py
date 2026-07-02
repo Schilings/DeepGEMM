@@ -114,7 +114,7 @@ def run(rank, ng, port, iters, verify, strategies):
             # Apply FSDP2: shard Wqkv Parameter; ignore model params (we use Wqkv not nn.Linear)
             ignored = set(strat.model.parameters())
             if strat_name == 'fused_var':
-                ignored |= {strat.Wo_r_local, strat.Wo_r_local_t}
+                ignored |= {strat.Wo_r_local}
             try:
                 apply_fsdp2(strat, group, reshard_after_forward=True, ignored_params=ignored)
             except Exception as e:
@@ -122,13 +122,9 @@ def run(rank, ng, port, iters, verify, strategies):
                 strat.destroy_buffers(); dist.barrier(); continue
 
             if do_verify:
-                local_N_verify = hidden // ng if strat_name == 'fused_var' else hidden
                 grad_y_full = ref_grad_y.clone() if rank == 0 else torch.empty(bs, seq, hidden, dtype=torch.bfloat16, device=dev)
                 dist.broadcast(grad_y_full, src=0, group=group)
-                if strat_name == 'fused_var':
-                    grad_y_local = grad_y_full[:, rank*llseq:(rank+1)*llseq, rank*local_N_verify:(rank+1)*local_N_verify].reshape(llseq, local_N_verify).contiguous()
-                else:
-                    grad_y_local = grad_y_full[:, rank*llseq:(rank+1)*llseq, :].reshape(llseq, hidden).contiguous()
+                grad_y_local = grad_y_full[:, rank*llseq:(rank+1)*llseq, :].reshape(llseq, hidden).contiguous()
             else:
                 grad_y_local = None
 
@@ -158,8 +154,7 @@ def run(rank, ng, port, iters, verify, strategies):
                 if grad_y_local is not None:
                     gy = grad_y_local
                 else:
-                    local_N = hidden // ng if strat_name == 'fused_var' else hidden
-                    gy = torch.randn((lm, local_N), dtype=torch.bfloat16, device=dev)
+                    gy = torch.randn((lm, hidden), dtype=torch.bfloat16, device=dev)
                 # Autograd backward — FSDP2 hooks reduce-scatter weight grads automatically
                 y.backward(gy)
                 return X_in.grad
@@ -172,16 +167,16 @@ def run(rank, ng, port, iters, verify, strategies):
             # --- Verify ---
             fwd_rel = bX_rel = -1.0; status = 'SKIP'
             if do_verify:
-                if strat_name != 'fused_var':
-                    if resets:
-                        for r in resets: r()
-                        dist.barrier(group)
-                    with torch.no_grad():
-                        y = strat.forward(X_local, grid, llseq)
-                    y_full = gather_to_rank0(y, group, ng)
-                    if rank == 0 and ref_out is not None:
-                        fwd_rel = rel_diff(y_full.reshape(-1, hidden)[:ref_out.reshape(-1,hidden).shape[0]],
-                                           ref_out.reshape(-1, hidden))
+                # fwd verify: all strategies output [lm, hidden]
+                if resets:
+                    for r in resets: r()
+                    dist.barrier(group)
+                with torch.no_grad():
+                    y = strat.forward(X_local, grid, llseq)
+                y_full = gather_to_rank0(y, group, ng)
+                if rank == 0 and ref_out is not None:
+                    fwd_rel = rel_diff(y_full.reshape(-1, hidden)[:ref_out.reshape(-1,hidden).shape[0]],
+                                       ref_out.reshape(-1, hidden))
                 # bwd verify
                 if resets:
                     for r in resets: r()

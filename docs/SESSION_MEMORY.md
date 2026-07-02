@@ -1,6 +1,6 @@
 # 会话接班记忆（通用 SOP · 算子无关）
 
-> 最后更新：2026-06-22
+> 最后更新：2026-07-02
 > 目标：新会话 5 分钟内无缝接手**用户指定的目标算子**。
 > 本文件只写**与算子无关的开局流程**；各算子的具体当前状态见对应 `*_ITERATION.md` 顶部「当前状态」。
 
@@ -15,7 +15,7 @@
    - 涉及 cluster/multicast：`SM100_2CTA_CLUSTER.md`
 3. 加载技能：`cuda-skill` + `ako4all`
 4. 构建：`python3 setup.py build_ext --inplace --force`
-5. 正确性：`DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python tests/test_<op>.py 2`
+5. 正确性：`DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python tests/comm/test_<op>.py 8`
 6. 性能：`benchmarks/bench_<op>.py` 建立基线，再进入迭代。
 
 ---
@@ -28,6 +28,9 @@
 - 学习方向：参考 `flux`（H 卡稳定上线），在 B 卡（SM100）做策略适配，不生硬照搬。
 - 主线策略：按 `SM100_2CTA_CLUSTER`，中大 shape 优先 `mc=2`（2-CTA cluster）。
 - 高风险大改在独立分支开发，main 保留已验证版；被取代的稳定版用 `git tag` 存档。
+- **UnifiedSymmBuffer**：所有通信融合算子可共用一个 sym buffer。GEMM-RS/AG-GEMM 不需要 attention 参数（`q_nheads`/`kv_nheads`/`head_dim` 均可选），attention-fused ops 需要传这些参数。
+- **测试路径**：通信类测试在 `tests/comm/`，核心 GEMM 测试在 `tests/core/`，Ulysses 端到端测试在 `tests/ulysses/`。
+- **已知环境问题**：`tests/core/` 中的 NVRTC 编译测试受 `cudaGridDependencySynchronize is undefined` 影响（需 nvcc 编译路径），这是预先存在的环境限制，与代码改动无关。
 
 ---
 
@@ -39,16 +42,16 @@ git pull
 python3 setup.py build_ext --inplace --force
 
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python tests/test_gemm_rs.py 2
+python tests/comm/test_gemm_rs.py 8
 
 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 8 8
+python benchmarks/bench_gemm_rs.py 8 2
 ```
 
 ---
 
 ## D. 收尾（每轮迭代后）
 
-1. 跑该算子 `test_<op>.py`（正确性，绝不退化）+ `bench_<op>.py`（性能，记录 4/8 卡 focus 数据）。
+1. 跑该算子 `tests/comm/test_<op>.py`（正确性，绝不退化）+ `benchmarks/bench_<op>.py`（性能，记录 4/8 卡 focus 数据）。
 2. 更新该算子 `*_ITERATION.md`（新 Iteration 条目 + 顶部「当前状态」）+ `PROGRESS.md` 一行状态。
 3. 阶段性立即 `commit + push`，避免服务器回收导致进度丢失。

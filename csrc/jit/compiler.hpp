@@ -212,10 +212,19 @@ public:
         } else {
             arch_flags = fmt::format("--gpu-architecture=sm_{}", arch);
         }
-        flags = fmt::format("{} -I{} {} "
+        // Build include directories (same logic as NVRTCCompiler)
+        std::string include_dirs;
+        include_dirs += fmt::format("-I{} ", library_include_path.string());
+        // For source-tree development (editable mode), CUTLASS headers live under
+        // <repo_root>/third-party/cutlass/include rather than packaged include path.
+        const auto repo_cutlass_include = library_root_path.parent_path() / "third-party" / "cutlass" / "include";
+        if (std::filesystem::exists(repo_cutlass_include))
+            include_dirs += fmt::format("-I{} ", repo_cutlass_include.string());
+
+        flags = fmt::format("{} {} {} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch_flags);
+                            flags, include_dirs, arch_flags);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
