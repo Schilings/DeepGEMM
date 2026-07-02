@@ -189,17 +189,18 @@ def run_test(local_rank: int, num_local_ranks: int):
         # Ensure previous sym buffer is fully released before creating a new one
         torch.cuda.synchronize()
         dist.barrier()
-        num_tokens = bs * local_seq
-        # Use unified buffer for AG-GEMM (avoids extra rendezvous on 8+ GPUs)
-        ag_sym_uni = deep_gemm.get_unified_symm_buffer(group, bs, seq, hidden)
+        # AG-GEMM with larger shape (matches test_ag_gemm.py for stability)
+        ag_tokens = 2048
+        ag_hidden = 4096
+        ag_sym_uni = deep_gemm.get_unified_symm_buffer(group, 1, ag_tokens * num_ranks, ag_hidden)
         ag_sym_uni.buffer.zero_()
         torch.cuda.synchronize()
         dist.barrier()
-        d_ag = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device=device)
-        wo_ag = torch.randn((hidden, hidden), dtype=torch.bfloat16, device=device)
-        out_ag = torch.empty((num_tokens * num_ranks, hidden), dtype=torch.bfloat16, device=device)
-        ag_sym_uni.ag_x[:num_tokens].copy_(d_ag)
-        deep_gemm.bf16_ag_gemm_nt(out_ag, wo_ag, ag_sym_uni, num_tokens)
+        d_ag = torch.randn((ag_tokens, ag_hidden), dtype=torch.bfloat16, device=device)
+        wo_ag = torch.randn((ag_hidden, ag_hidden), dtype=torch.bfloat16, device=device)
+        out_ag = torch.empty((ag_tokens * num_ranks, ag_hidden), dtype=torch.bfloat16, device=device)
+        ag_sym_uni.ag_x[:ag_tokens].copy_(d_ag)
+        deep_gemm.bf16_ag_gemm_nt(out_ag, wo_ag, ag_sym_uni, ag_tokens)
 
         # Reference: all_gather + GEMM
         all_d = [torch.empty_like(d_ag) for _ in range(num_ranks)]
