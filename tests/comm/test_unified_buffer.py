@@ -47,9 +47,10 @@ def run_test(local_rank: int, num_local_ranks: int):
               f"head_dim={head_dim}, hidden={hidden}")
         print(f"{'='*100}\n")
 
-    # ── Create ONE unified sym buffer ──
+    # ── Create ONE unified sym buffer (with attention params) ──
     sym = deep_gemm.get_unified_symm_buffer(
-        group, bs, seq, q_nheads, kv_nheads, head_dim, hidden)
+        group, bs, seq, hidden,
+        q_nheads=q_nheads, kv_nheads=kv_nheads, head_dim=head_dim)
 
     all_passed = True
 
@@ -142,13 +143,17 @@ def run_test(local_rank: int, num_local_ranks: int):
 
     # ════════════════════════════════════════════════════════════════
     #  Test 3: GEMM-RS (post-attn variant)
+    #    GEMM-RS: a[total_m, K] @ b[N, K]^T → RS → y[tokens_per_rank, N]
+    #    total_m = bs * seq (all tokens), tokens_per_rank = bs * local_seq
     # ════════════════════════════════════════════════════════════════
     try:
-        rs_sym = deep_gemm.get_symm_buffer_for_gemm_rs(group, bs * local_seq, hidden, num_ranks)
-        d_rs = torch.randn((bs * local_seq, hidden), dtype=torch.bfloat16, device=device)
+        total_m_rs = bs * seq
+        tokens_per_rank_rs = bs * local_seq
+        rs_sym = deep_gemm.get_symm_buffer_for_gemm_rs(group, tokens_per_rank_rs, hidden)
+        d_rs = torch.randn((total_m_rs, hidden), dtype=torch.bfloat16, device=device)
         wo_rs = torch.randn((hidden, hidden), dtype=torch.bfloat16, device=device)
-        out_rs = torch.empty((bs * local_seq // num_ranks, hidden), dtype=torch.bfloat16, device=device)
-        deep_gemm.bf16_gemm_rs_nt(out_rs, d_rs, wo_rs, rs_sym, bs * local_seq // num_ranks)
+        out_rs = torch.empty((tokens_per_rank_rs, hidden), dtype=torch.bfloat16, device=device)
+        deep_gemm.bf16_gemm_rs_nt(out_rs, d_rs, wo_rs, rs_sym, tokens_per_rank_rs)
 
         # Reference: GEMM + reduce_scatter
         d_local_rs = torch.matmul(d_rs, wo_rs.t())
@@ -204,7 +209,8 @@ def run_test(local_rank: int, num_local_ranks: int):
     # ════════════════════════════════════════════════════════════════
     try:
         sym_u = deep_gemm.get_unified_symm_buffer(
-            group, bs, seq, q_nheads, kv_nheads, head_dim, hidden)
+            group, bs, seq, hidden,
+            q_nheads=q_nheads, kv_nheads=kv_nheads, head_dim=head_dim)
 
         # Wrap for fused QKV
         from deep_gemm.fused_qkv_norm_a2a import FusedQKVNormA2ASymmBuffer
@@ -248,6 +254,63 @@ def run_test(local_rank: int, num_local_ranks: int):
         if rank_idx == 0:
             import traceback; traceback.print_exc()
             print(f"  [FAIL] Unified buffer reuse: {e}")
+        all_passed = False
+    dist.barrier()
+
+    # ════════════════════════════════════════════════════════════════
+    #  Test 6: Unified buffer WITHOUT attention params (general linear)
+    #          GEMM-RS and AG-GEMM should work with just (bs, seq, hidden)
+    # ════════════════════════════════════════════════════════════════
+    try:
+        # No q_nheads/kv_nheads/head_dim — pure linear use case (e.g. MLP+RS)
+        sym_lin = deep_gemm.get_unified_symm_buffer(group, bs, seq, hidden)
+        assert not sym_lin.has_attention, 'has_attention should be False without head params'
+
+        # Attention views should raise
+        try:
+            sym_lin.get_gemm_a2a_out_view()
+            raise AssertionError('get_gemm_a2a_out_view should raise without attention params')
+        except RuntimeError:
+            pass  # expected
+
+        # GEMM-RS: a[total_m, K] @ b[N,K]^T → RS → y[tokens_per_rank, N]
+        total_m_lin = bs * seq
+        tokens_per_rank_lin = bs * local_seq
+        d_rs_lin = torch.randn((total_m_lin, hidden), dtype=torch.bfloat16, device=device)
+        wo_lin = torch.randn((hidden, hidden), dtype=torch.bfloat16, device=device)
+        out_lin = torch.empty((tokens_per_rank_lin, hidden), dtype=torch.bfloat16, device=device)
+        deep_gemm.bf16_gemm_rs_nt(out_lin, d_rs_lin, wo_lin, sym_lin, tokens_per_rank_lin)
+
+        # Reference
+        d_local_lin = torch.matmul(d_rs_lin, wo_lin.t())
+        ref_lin = torch.empty_like(out_lin)
+        dist.reduce_scatter_tensor(ref_lin, d_local_lin, group=group)
+        rel_err_lin = (out_lin.float() - ref_lin.float()).abs().mean().item() / max(ref_lin.float().abs().mean().item(), 1e-8)
+        passed_lin = rel_err_lin < 0.05
+
+        # AG-GEMM: x[local_m, K] → AG → [total_m, K] @ b[N,K]^T → d[total_m, N]
+        # Uses local tokens as input (AG gathers them inside the kernel)
+        d_ag_lin = torch.randn((tokens_per_rank_lin, hidden), dtype=torch.bfloat16, device=device)
+        sym_lin.ag_x[:tokens_per_rank_lin].copy_(d_ag_lin)
+        out_ag_lin = torch.empty((total_m_lin, hidden), dtype=torch.bfloat16, device=device)
+        deep_gemm.bf16_ag_gemm_nt(out_ag_lin, wo_lin, sym_lin, tokens_per_rank_lin)
+
+        all_d_lin = [torch.empty_like(d_ag_lin) for _ in range(num_ranks)]
+        dist.all_gather(all_d_lin, d_ag_lin)
+        d_full_lin = torch.cat(all_d_lin, dim=0)
+        ref_ag_lin = torch.matmul(d_full_lin, wo_lin.t())
+        rel_err_ag_lin = (out_ag_lin.float() - ref_ag_lin.float()).abs().mean().item() / max(ref_ag_lin.float().abs().mean().item(), 1e-8)
+        passed_ag_lin = rel_err_ag_lin < 0.05
+
+        if rank_idx == 0:
+            print(f"  [{'PASS' if passed_lin else 'FAIL'}] Unified buffer (no attn) GEMM-RS: rel_err={rel_err_lin:.6f}")
+            print(f"  [{'PASS' if passed_ag_lin else 'FAIL'}] Unified buffer (no attn) AG-GEMM: rel_err={rel_err_ag_lin:.6f}")
+        all_passed &= passed_lin and passed_ag_lin
+        sym_lin.destroy()
+    except Exception as e:
+        if rank_idx == 0:
+            import traceback; traceback.print_exc()
+            print(f"  [FAIL] Unified buffer (no attn): {e}")
         all_passed = False
     dist.barrier()
 

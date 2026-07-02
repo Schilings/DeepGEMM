@@ -43,11 +43,11 @@
 
 | 算子 | 入口符号 | 设计 | 迭代记录（含当前状态 / 接班） | 参考 / 学习 | test / bench |
 |------|---------|------|------|------|------|
-| **GEMM-RS** | `bf16_gemm_rs_nt` | `GEMM_RS_DESIGN.md` | `GEMM_RS_ITERATION.md` | `FLUX_GEMM_RS_STUDY.md` | `tests/test_gemm_rs.py` / `benchmarks/bench_gemm_rs.py` |
-| **AG-GEMM** | `bf16_ag_gemm_nt` | （见 ITERATION 背景节） | `AG_GEMM_ITERATION.md` | `AG_GEMM_FLUX_REFERENCE.md` | `tests/test_ag_gemm.py` / `benchmarks/bench_ag_gemm.py` |
-| **A2A-GEMM** | `bf16_a2a_gemm_nt` | `A2A_GEMM_DESIGN.md`（旧token-A2A）+ `A2A_TRANSPOSE_GEMM_DESIGN.md`（Ulysses重写目标）| `A2A_GEMM_ITERATION.md` | flux `src/a2a_transpose_gemm` | `tests/test_a2a_gemm.py` / `benchmarks/bench_a2a_gemm.py` |
-| **A2A-transpose-GEMM**（Ulysses post-attn）| `bf16_a2a_transpose_gemm_nt` | `A2A_TRANSPOSE_GEMM_DESIGN.md` | （见 DESIGN 顶部）| flux `src/a2a_transpose_gemm` | `tests/test_a2a_transpose_gemm.py` / `benchmarks/bench_a2a_transpose_gemm.py` |
-| **GEMM-A2A-transpose**（Ulysses **pre-attn**）| `bf16_gemm_a2a_transpose_nt` | `GEMM_A2A_TRANSPOSE_DESIGN.md` | `GEMM_A2A_TRANSPOSE_ITERATION.md` | GEMM-RS（直接改写）/ A2A-transpose-GEMM（对偶）| `tests/test_gemm_a2a_transpose.py` / `benchmarks/bench_gemm_a2a_transpose.py` |
+| **GEMM-RS** | `bf16_gemm_rs_nt` | `GEMM_RS_DESIGN.md` | `GEMM_RS_ITERATION.md` | `FLUX_GEMM_RS_STUDY.md` | `tests/comm/test_gemm_rs.py` / `benchmarks/bench_gemm_rs.py` |
+| **AG-GEMM** | `bf16_ag_gemm_nt` | （见 ITERATION 背景节） | `AG_GEMM_ITERATION.md` | `AG_GEMM_FLUX_REFERENCE.md` | `tests/comm/test_ag_gemm.py` / `benchmarks/bench_ag_gemm.py` |
+| **A2A-GEMM** | `bf16_a2a_gemm_nt` | `A2A_GEMM_DESIGN.md`（旧token-A2A）+ `A2A_TRANSPOSE_GEMM_DESIGN.md`（Ulysses重写目标）| `A2A_GEMM_ITERATION.md` | flux `src/a2a_transpose_gemm` | `tests/comm/test_a2a_gemm.py` / `benchmarks/bench_a2a_gemm.py` |
+| **A2A-transpose-GEMM**（Ulysses post-attn）| `bf16_a2a_transpose_gemm_nt` | `A2A_TRANSPOSE_GEMM_DESIGN.md` | （见 DESIGN 顶部）| flux `src/a2a_transpose_gemm` | `tests/comm/test_a2a_transpose_gemm.py` / `benchmarks/bench_a2a_transpose_gemm.py` |
+| **GEMM-A2A-transpose**（Ulysses **pre-attn**）| `bf16_gemm_a2a_transpose_nt` | `GEMM_A2A_TRANSPOSE_DESIGN.md` | `GEMM_A2A_TRANSPOSE_ITERATION.md` | GEMM-RS（直接改写）/ A2A-transpose-GEMM（对偶）| `tests/comm/test_gemm_a2a_transpose.py` / `benchmarks/bench_gemm_a2a_transpose.py` |
 
 **通用知识（所有算子都应吸收）**：
 - `docs/PROGRESS.md`：**算子进度总览 / 索引** —— 先看这里挑选/确认目标算子的当前状态与分支/tag。
@@ -75,7 +75,7 @@
    - 涉及 cluster/multicast：`docs/SM100_2CTA_CLUSTER.md`
 3. 加载技能（见 §5）。
 4. 编译 `_C`：`python3 setup.py build_ext --inplace --force`
-5. 跑目标算子正确性：`DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python tests/test_<op>.py 2`
+5. 跑目标算子正确性：`DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python tests/comm/test_<op>.py 8`
 6. 跑目标算子 benchmark 建立基线，再进入优化迭代。
 
 ---
@@ -116,7 +116,7 @@ python3 setup.py build_ext --inplace --force
 
 # 目标算子正确性（脚本名按 §3 表替换：test_gemm_rs / test_ag_gemm / test_a2a_gemm）
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python tests/test_gemm_rs.py 2
+python tests/comm/test_gemm_rs.py 8
 
 # Megatron SP 中大 shape 基线（focus 子集）
 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \

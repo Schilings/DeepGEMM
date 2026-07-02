@@ -1,6 +1,6 @@
 # 算子开发进度总览（索引）
 
-> 最后更新：2026-07-01
+> 最后更新：2026-07-02
 > 用途：**新会话据此挑选/确认目标算子**，再读该算子的 `*_DESIGN` / `*_ITERATION` 文档接班继续开发。
 > 规则见 `docs/RULE.md`；接班流程见 `docs/SESSION_MEMORY.md`。
 
@@ -16,6 +16,34 @@
 | **A2A-GEMM**（旧 token-A2A，**语义错误**）| `bf16_a2a_gemm_nt` | — | ⚠️ **3/6 FAIL** + 语义错位（token(M)-A2A，非 Ulysses）→ 已被上面的 transpose 版取代 | `main`（保留未删）| `A2A_GEMM_ITERATION.md` / `A2A_GEMM_DESIGN.md`（旧）|
 | **AG-GEMM** | `bf16_ag_gemm_nt` | geo **~1.13x**（8 卡）| PASS | `main`（仅 PDL 默认开启被保留）| `AG_GEMM_ITERATION.md` / `AG_GEMM_FLUX_REFERENCE.md` |
 | **Fused QKV+Norm+A2A** | `bf16_fused_qkv_norm_a2a_transpose_nt` | **单 kernel CUDA**：geo vs serial **1.61x**（8卡）；norm 可选 + GQA-aware | 8卡 **20/20 PASS**（MHA/GQA × norm on/off）| `feat/fused-qkv-norm-a2a` | `FUSED_QKV_NORM_A2A_DESIGN.md` / `FUSED_QKV_NORM_A2A_ITERATION.md` |
+
+---
+
+## Unified Symm Buffer（2026-07-02 新增）
+
+**一个 sym buffer 服务所有通信融合算子**——消除每层每步 `symm_mem.rendezvous` 的毫秒级开销。
+
+| 算子 | 需要 attention 参数？ | 说明 |
+|------|---------------------|------|
+| GEMM-RS | ❌ 不需要 | 通用 linear+RS，用于 MLP/FFN/classifier 等任意 linear |
+| AG-GEMM | ❌ 不需要 | 通用 AG+linear，GEMM-RS 的 backward 对偶 |
+| GEMM-A2A-transpose | ✅ 需要 q_nheads/head_dim | pre-attn QKV scatter |
+| A2A-transpose-GEMM | ✅ 需要 nheads/head_dim | post-attn Wo gather |
+| Fused-QKV-Norm-A2A | ✅ 需要 q/kv_nheads/head_dim | pre-attn with RMSNorm |
+
+```python
+# Attention 场景
+sym = get_unified_symm_buffer(group, bs, seq, hidden,
+                               q_nheads=32, kv_nheads=32, head_dim=128)
+
+# 非 attention 场景（MLP+RS / AG+GEMM）
+sym = get_unified_symm_buffer(group, bs, seq, hidden)
+```
+
+- **正确性**：2卡 7/7 PASS，8卡 7/7 PASS（含无 attention 参数的 Test 6）
+- **修复**：AG-GEMM local_x 大小从 `1*M*H` 改为 `num_ranks*M*H`（与 C++ BF16AGGemmWorkspace 对齐）
+- **修复**：Test 3/6 GEMM-RS 维度（total_m=bs*seq, tokens_per_rank=bs*local_seq）
+- 分支 `feat/fused-qkv-norm-a2a`
 
 ---
 
@@ -76,8 +104,8 @@ git pull
 python3 setup.py build_ext --inplace --force
 
 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python tests/test_gemm_rs.py 2
+python tests/comm/test_gemm_rs.py 8
 
 DG_BENCH_FOCUS_ONLY=1 DG_JIT_USE_NVRTC=1 PYTHONPATH=/root/.local/codebuddy/DeepGEMM \
-python benchmarks/bench_gemm_rs.py 8 8
+python benchmarks/bench_gemm_rs.py 8 2
 ```
