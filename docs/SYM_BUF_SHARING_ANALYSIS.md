@@ -180,6 +180,9 @@ workspace。2 卡连续 4 次验证 `grad_X rel=0.0`。
 - `fwd rel (serial vs var) = 0.002964–0.002968`
 - teardown 在 `destroy_process_group()` 前显式释放 workspace，无 SIGABRT。
 
-严格 POST-only 显存消融显示当前变体并不省显存：8 卡、40 attention 层时，8K true peak
-14,616.5 vs 14,442.6 MB；32K 为 35,137.2 vs 34,076.4 MB。固定 unified workspace
-分别占 160/640 MB，且 baseline 在 FSDP2 下的 Wo 静态存储本来也已分片。
+严格 POST-only 显存消融必须区分 SP 与 DP/FSDP 维度。B300×8 全部用于 SP、DP=1 时，
+baseline Wo 在 SP rank 间复制，variant 才拥有 1/8 shard；不能错误地沿同一 SP group
+再做 FSDP。修正后 40 attention 层实测：8K true peak 38,277.4 vs 48,191.3 MB
+（节省 9,913.9 MB/20.6%）；32K 为 59,056.6 vs 68,686.5 MB（节省
+9,629.9 MB/14.0%）。160/640 MB unified workspace 远小于 40 层 Wo 权重、梯度和
+Adam 状态约 10.5 GB 的理论节省。

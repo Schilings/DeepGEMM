@@ -1,4 +1,11 @@
-"""Wan2.1 14B Ulysses SP Attention Benchmark with REAL FSDP2 (fully_shard).
+"""Legacy synthetic benchmark that applies FSDP2 on the SP process group.
+
+Do not use this script for the POST-variant memory ablation: SP and FSDP/DP are
+orthogonal dimensions, and sharding baseline Wo over the SP group erases the
+variant's intended 1/SP ownership advantage.  Use ``bench_wan21_mem_train.py``
+for the SP=8, DP=1 memory comparison.
+
+Wan2.1 14B Ulysses SP Attention Benchmark with FSDP2 (fully_shard).
 
 Autograd-based forward + FSDP2 automatic gradient sync:
   - Forward: autograd graph (fused ops as torch.autograd.Function)

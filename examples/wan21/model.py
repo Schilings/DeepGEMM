@@ -10,7 +10,8 @@ Reference: https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from flash_attn.cute import flash_attn_func
 
 from .norm import WanRMSNorm, WanLayerNorm
 from .config import Wan21Config
@@ -65,12 +66,10 @@ def build_wan21_freqs(head_dim, device='cpu'):
     ], dim=1).to(device)
 
 
-def _torch_attn(q, k, v, scale, causal=False):
-    """Torch SDPA for BSHD tensors; CUDA selects its memory-efficient backend."""
-    o = F.scaled_dot_product_attention(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-        dropout_p=0.0, is_causal=causal, scale=scale)
-    return o.transpose(1, 2).contiguous()
+def _fa4_attn(q, k, v, scale, causal=False):
+    """FlashAttention-4 for BSHD tensors."""
+    o = flash_attn_func(q, k, v, softmax_scale=scale, causal=causal)
+    return o[0] if isinstance(o, tuple) else o
 
 
 class WanSelfAttention(nn.Module):
@@ -110,7 +109,7 @@ class WanSelfAttention(nn.Module):
         v = self.v(x).view(B, S, n, d).to(torch.bfloat16)
         q = rope_apply(q, grid_sizes, freqs).to(torch.bfloat16)
         k = rope_apply(k, grid_sizes, freqs).to(torch.bfloat16)
-        o = _torch_attn(q, k, v, self.scale, self.causal)
+        o = _fa4_attn(q, k, v, self.scale, self.causal)
         return self.o(o.flatten(2).to(x.dtype))
 
 
@@ -138,7 +137,7 @@ class WanT2VCrossAttention(nn.Module):
         q = self.norm_q(self.q(x)).view(B, -1, n, d).to(torch.bfloat16)
         k = self.norm_k(self.k(context)).view(B, -1, n, d).to(torch.bfloat16)
         v = self.v(context).view(B, -1, n, d).to(torch.bfloat16)
-        o = _torch_attn(q, k, v, self.scale, causal=False)
+        o = _fa4_attn(q, k, v, self.scale, causal=False)
         return self.o(o.flatten(2).to(x.dtype))
 
 

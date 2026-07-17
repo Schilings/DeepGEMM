@@ -13,11 +13,10 @@ need the full input which isn't available during the overlapped GEMM.
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 
 from ..config import Wan21Config, SPConfig
-from ..model import WanSelfAttention
+from ..model import WanSelfAttention, _fa4_attn
 from ..rope import rope_apply
 
 
@@ -104,18 +103,15 @@ class UlyssesBase(nn.Module):
         return torch.cat((q, k, v), dim=2).reshape(lbs, lseq, -1)
 
     def _attn_forward(self, qkv, grid, lbs, lseq):
-        """Pure torch SDPA, shared by baseline and POST-only variant."""
+        """FlashAttention-4, shared identically by both ablation arms."""
         ln = self.local_n
         nh, hd = self.local_nh, self.head_dim
         q = qkv[:, :, :ln].view(lbs, lseq, nh, hd).contiguous()
         k = qkv[:, :, ln:2 * ln].view(lbs, lseq, nh, hd).contiguous()
         v = qkv[:, :, 2 * ln:3 * ln].view(lbs, lseq, nh, hd).contiguous()
-        q = rope_apply(q, grid, self.model.freqs).to(torch.bfloat16).transpose(1, 2)
-        k = rope_apply(k, grid, self.model.freqs).to(torch.bfloat16).transpose(1, 2)
-        v = v.transpose(1, 2)
-        o = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, is_causal=self.cfg.causal, scale=self.scale)
-        return o.transpose(1, 2).contiguous()
+        q = rope_apply(q, grid, self.model.freqs).to(torch.bfloat16)
+        k = rope_apply(k, grid, self.model.freqs).to(torch.bfloat16)
+        return _fa4_attn(q, k, v, self.scale, self.cfg.causal)
 
     def _post_forward(self, o, **kw):
         raise NotImplementedError

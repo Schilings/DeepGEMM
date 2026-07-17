@@ -11,7 +11,7 @@ from .base import NCCLAllToAll, UlyssesBase
 
 
 class SerialUlysses(UlyssesBase):
-    """Ablation baseline: torch linear/SDPA plus synchronous NCCL collectives."""
+    """Ablation baseline: torch linear, FA4 and synchronous NCCL collectives."""
 
     def __init__(self, config, sp_config):
         sp_config.use_fused_ops = False

@@ -3,14 +3,12 @@
 Measures torch.cuda.max_memory_allocated() during FWD+BWD for various seq lengths.
 """
 
-import os, sys, math, argparse
+import os, sys, math
 import torch, torch.distributed as dist, torch.multiprocessing as mp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from wan21.config import Wan21Config, SPConfig
-from wan21.model import WanSelfAttention
 from wan21.bench_utils import find_free_port
-from wan21.fsdp2_utils import apply_fsdp2
 
 
 WAN21_SHAPES = [
@@ -72,8 +70,8 @@ def run(rank, ng, port, strategies):
             strat.model = strat.model.to(torch.bfloat16)
             strat.setup_shape(bs, seq, nheads, head_dim)
 
-            ignored = {strat.Wo_r_local} if strat_name == 'fused_var' else None
-            apply_fsdp2(strat, group, reshard_after_forward=True, ignored_params=ignored)
+            # DP=1: do not shard parameters across the SP group.  This preserves
+            # standard Ulysses' replicated Wo versus the variant's 1/SP Wo shard.
 
             # Measure sym buffer size
             sym_mb = 0.0
@@ -87,7 +85,6 @@ def run(rank, ng, port, strategies):
             if strat_name == 'fused_var':
                 wo_mb = strat.Wo_r_local.numel() * 2 / 1024 / 1024
             else:
-                # Report the logical full Wo; FSDP2 stores only its local shard at rest.
                 wo_mb = hidden * hidden * 2 / 1024 / 1024
 
             # FWD peak

@@ -99,9 +99,9 @@ DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD \
   python examples/bench_wan21_mem_train.py 8 40 32768 serial,fused_var
 ```
 
-包含：逐层 FSDP2、BF16 参数/梯度、FP32 Adam `m/v`、保存到 backward 的
-激活，以及跨层复用一次的 symmetric workspace。输入只创建本 rank 的序列
-分片，不再让每卡常驻完整 `X_full`。
+包含：SP=8/DP=1 下真实本地参数所有权、BF16 参数/梯度、FP32 Adam `m/v`、
+保存到 backward 的激活，以及跨层复用一次的 symmetric workspace。输入只创建
+本 rank 的序列分片，不再让每卡常驻完整 `X_full`。
 
 `torch.cuda.max_memory_allocated()` 不保证统计 symmetric memory，所以文档将
 PyTorch 峰值和 workspace 分项报告，并给出二者相加的估算峰值；最终结论还应
@@ -125,28 +125,32 @@ fwd rel (serial vs var):    0.002964 ~ 0.002968
 
 ## 显存结果与结论
 
-B300 ×8、40 个 attention 层、逐层 FSDP2、BF16 参数/梯度、FP32 Adam m/v：
+B300 ×8、40 个 attention 层、SP=8/DP=1、FA4、BF16 参数/梯度、FP32 Adam m/v：
 
-| Sequence | Strategy | PyTorch peak | Shared sym buffer | Estimated true peak | 相对 baseline |
-|---|---:|---:|---:|---:|---:|
-| 8K | serial | 14,442.6 MB | 0 | 14,442.6 MB | — |
-| 8K | fused_var | 14,456.5 MB | 160.0 MB | 14,616.5 MB | **+173.9 MB (+1.2%)** |
-| 32K | serial | 34,076.4 MB | 0 | 34,076.4 MB | — |
-| 32K | fused_var | 34,497.2 MB | 640.0 MB | 35,137.2 MB | **+1,060.8 MB (+3.1%)** |
+| Sequence | Strategy | Weights | Grads | Adam | PyTorch peak | Sym buffer | Estimated true peak |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8K | serial | 8,002.3 | 8,002.3 | 32,009.4 | 48,191.3 | 0 | 48,191.3 MB |
+| 8K | fused_var | 6,252.3 | 6,252.3 | 25,009.4 | 38,117.4 | 160.0 | **38,277.4 MB** |
+| 32K | serial | 8,002.3 | 8,002.3 | 32,009.4 | 68,686.5 | 0 | 68,686.5 MB |
+| 32K | fused_var | 6,252.3 | 6,252.3 | 25,009.4 | 58,416.6 | 640.0 | **59,056.6 MB** |
 
-因此在当前严格 POST-only 消融中，结论是：**变体不省峰值显存，反而略增**。
-原因不是 buffer 没有跨层复用；它确实只分配了一次。根本原因是：
+最终结论：**POST 变体确实显著节省峰值显存。**
 
-1. 标准 Ulysses 的 POST 本来就只保存 `[local_tokens, hidden]` 的 gathered
-   activation，并不会物化 `[full_tokens, hidden]` partial；
-2. 变体的 attention activation 与 baseline 同量级，未减少逐层保存量；
-3. GEMM+RS/AG+GEMM 需要固定 workspace，其主项约为
-   `2 × full_tokens × hidden × sizeof(bf16)`，8K/32K 分别为 160/640 MB；
-4. 在本实验的 FSDP2 设置下，baseline 完整 Wo 在静态时已经按 8 卡分片，
-   与 variant 的天然 Wo shard 每卡同为 1/8，因此没有参数、梯度或 Adam 状态净节省；
-5. variant 的 backward 权重梯度还会复用 full-sequence gathered grad，带来额外
-   PyTorch 临时峰值，32K 时 tracked peak 已比 baseline 高约 421 MB。
+- 8K：节省 **9,913.9 MB（20.6%）**；
+- 32K：节省 **9,629.9 MB（14.0%）**。
 
-历史结果混入 PRE 融合、冗余权重副本、完整 `X_full` 和错误 FSDP2 生命周期，
-均不再作为证据。若目标仍是省显存，需要缩小 GEMM-RS/AG workspace，或让
-AG+GEMM 直接/分块累加 Wo 梯度，不能仅靠现有 POST 数据流。
+40 层中，Wo 的理论静态节省为：
+
+```text
+每层 Wo = 5120 × 5120 × 2 bytes = 50 MB
+每层节省 = 50 MB × 7/8 × (weight 1 + grad 1 + Adam 4) = 262.5 MB
+40 层 = 10,500 MB
+```
+
+这足以覆盖只分配一次的 160/640 MB unified workspace，以及 variant backward 的
+额外临时峰值。32K 的百分比低于 8K，是因为 attention activation 随序列增长，
+而 Wo 参数状态节省固定约 10.5 GB。
+
+上一轮“变体不省显存”的结果无效：当时错误地在同一个 SP=8 group 上应用 FSDP2，
+把 baseline Wo 也预先分成了 1/8，导致两条路径的 weight/grad/Adam 都显示相同大小，
+人为消除了 variant 的核心收益。

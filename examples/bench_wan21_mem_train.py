@@ -1,22 +1,18 @@
-"""Multi-layer full training memory benchmark: serial vs fused_var.
+"""Multi-layer training memory benchmark: serial vs POST-only variant.
 
-Measures REAL peak GPU memory including:
-  - Weights + gradients + Adam optimizer states (fp32 m, v)
-  - Activations (stored for backward, scale with num_layers)
-  - sym_buf (symm_mem, NOT tracked by torch.cuda.max_memory_allocated — added manually)
-  - FSDP2 unshard buffers
-
-sym_buf is reused across all layers (allocated once, shared) — the practical approach.
+Measures weights, gradients, FP32 Adam states, saved activations and the shared
+symmetric workspace.  All GPUs form one sequence-parallel group and DP=1, so
+parameters are not FSDP-sharded across that same SP dimension.  Standard
+Ulysses replicates Wo across SP ranks; the variant owns only a 1/SP Wo shard.
 
 Usage: python examples/bench_wan21_mem_train.py <num_gpus> [num_layers] [seq]
 """
 
-import os, sys, math, argparse
+import os, sys, math
 import torch, torch.nn as nn, torch.distributed as dist, torch.multiprocessing as mp
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from wan21.config import Wan21Config, SPConfig
-from wan21.fsdp2_utils import apply_fsdp2
 from wan21.bench_utils import find_free_port
 
 
@@ -90,7 +86,7 @@ def run(rank, ng, port, num_layers, seq, strategies):
         print(f"\n{'='*145}")
         print(f"  Wan2.1 14B Multi-Layer Training Memory Benchmark — {ng} GPUs, {num_layers} layers, seq={seq}")
         print(f"  dim={dim} nh={nh} hd={hd} sp={ng} local_nh={nh//ng} local_hidden={nh//ng*hd}")
-        print(f"  sym_buf reused across layers | FSDP2 (fully_shard) | Adam states (fp32 m,v) allocated")
+        print(f"  SP-only (DP=1, no FSDP across SP) | sym_buf shared across layers | Adam fp32 m/v")
         print(f"{'='*145}")
         print(f"{'strategy':<12} | {'weights(MB)':>11} {'grads(MB)':>11} {'adam(MB)':>11} {'fwd_peak(MB)':>11} {'bwd_peak(MB)':>11} {'sym_buf(MB)':>11} | {'true_peak(MB)':>13}")
         print('-' * 145)
@@ -108,27 +104,16 @@ def run(rank, ng, port, num_layers, seq, strategies):
                 layer.model = layer.model.to(torch.bfloat16)
         model.setup_shape(bs, seq, nh, hd)
 
-        # Apply FSDP2 per layer so one layer is unsharded at a time.  Q/K/V and
-        # baseline Wo use normal FSDP2; only the variant's already-local Wo shard
-        # is ignored.
-        for layer in model.layers:
-            ignored = {layer.Wo_r_local} if strat_name == 'fused_var' else None
-            apply_fsdp2(layer, group, reshard_after_forward=True, ignored_params=ignored)
+        # All GPUs belong to the SP group and DP=1.  Q/K/V are replicated in
+        # both arms; baseline Wo is replicated, while variant Wo is 1/SP local.
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-        def local_tensor(param):
-            return param.to_local() if hasattr(param, 'to_local') else param
-
-        # Count physical parameters resident on this rank, not DTensor global shapes.
-        n_params = sum(
-            local_tensor(p).numel() for p in model.parameters() if p.requires_grad)
-
-        # Allocate Adam m/v for each physical local shard.
+        # Adam m/v follows the actual local parameter ownership.
         adam_states = []
         for p in model.parameters():
             if p.requires_grad:
-                local_p = local_tensor(p)
-                adam_states.append(torch.zeros_like(local_p, dtype=torch.float32))
-                adam_states.append(torch.zeros_like(local_p, dtype=torch.float32))
+                adam_states.append(torch.zeros_like(p, dtype=torch.float32))
+                adam_states.append(torch.zeros_like(p, dtype=torch.float32))
 
         sym_buf_mb = model.sym_buf_bytes() / 1024 / 1024
 
@@ -142,8 +127,6 @@ def run(rank, ng, port, num_layers, seq, strategies):
         # Reset memory stats
         torch.cuda.reset_peak_memory_stats(dev)
         torch.cuda.synchronize(dev)
-
-        baseline = torch.cuda.memory_allocated(dev) / 1024 / 1024
 
         # --- FWD ---
         X_in = X_local.detach().requires_grad_(True)

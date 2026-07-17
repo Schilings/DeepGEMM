@@ -1,7 +1,7 @@
 """POST-only Ulysses variant using fused GEMM+RS / AG+GEMM.
 
-PRE projection, Q/K normalization, synchronous A2A, RoPE and torch SDPA are
-inherited unchanged from :class:`UlyssesBase`.  The only experimental variable
+PRE projection, Q/K normalization, synchronous A2A, RoPE and FA4 are inherited
+unchanged from :class:`UlyssesBase`.  The only experimental variable
 is POST attention:
 
   baseline: A2A(heads -> sequence) + replicated Wo linear
