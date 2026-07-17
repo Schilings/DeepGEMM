@@ -123,8 +123,30 @@ fwd rel (serial vs var):    0.002964 ~ 0.002968
 前向差异来自 BF16 GEMM/ReduceScatter 的归约顺序；输入梯度与同步 baseline
 一致。buffer 必须在 `destroy_process_group()` 前显式释放。
 
-## 尚待给出的结论
+## 显存结果与结论
 
-历史性能/显存数字来自旧实验：旧代码混入了 PRE 融合描述、冗余权重副本、
-整卡 `X_full`、错误的 FSDP2 ignored 参数和非逐层 unshard 生命周期，因此不再
-作为本消融结论。修正后的 8 卡 40 层结果重跑后再写入本节。
+B300 ×8、40 个 attention 层、逐层 FSDP2、BF16 参数/梯度、FP32 Adam m/v：
+
+| Sequence | Strategy | PyTorch peak | Shared sym buffer | Estimated true peak | 相对 baseline |
+|---|---:|---:|---:|---:|---:|
+| 8K | serial | 14,442.6 MB | 0 | 14,442.6 MB | — |
+| 8K | fused_var | 14,456.5 MB | 160.0 MB | 14,616.5 MB | **+173.9 MB (+1.2%)** |
+| 32K | serial | 34,076.4 MB | 0 | 34,076.4 MB | — |
+| 32K | fused_var | 34,497.2 MB | 640.0 MB | 35,137.2 MB | **+1,060.8 MB (+3.1%)** |
+
+因此在当前严格 POST-only 消融中，结论是：**变体不省峰值显存，反而略增**。
+原因不是 buffer 没有跨层复用；它确实只分配了一次。根本原因是：
+
+1. 标准 Ulysses 的 POST 本来就只保存 `[local_tokens, hidden]` 的 gathered
+   activation，并不会物化 `[full_tokens, hidden]` partial；
+2. 变体的 attention activation 与 baseline 同量级，未减少逐层保存量；
+3. GEMM+RS/AG+GEMM 需要固定 workspace，其主项约为
+   `2 × full_tokens × hidden × sizeof(bf16)`，8K/32K 分别为 160/640 MB；
+4. 在本实验的 FSDP2 设置下，baseline 完整 Wo 在静态时已经按 8 卡分片，
+   与 variant 的天然 Wo shard 每卡同为 1/8，因此没有参数、梯度或 Adam 状态净节省；
+5. variant 的 backward 权重梯度还会复用 full-sequence gathered grad，带来额外
+   PyTorch 临时峰值，32K 时 tracked peak 已比 baseline 高约 421 MB。
+
+历史结果混入 PRE 融合、冗余权重副本、完整 `X_full` 和错误 FSDP2 生命周期，
+均不再作为证据。若目标仍是省显存，需要缩小 GEMM-RS/AG workspace，或让
+AG+GEMM 直接/分块累加 Wo 梯度，不能仅靠现有 POST 数据流。

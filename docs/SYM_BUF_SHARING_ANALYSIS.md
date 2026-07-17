@@ -69,33 +69,37 @@ backward 读 `slots_x[:sp]` 做 weight grad 时，实际读的是物理偏移 40
 早先怀疑是「两个 layout 数据区起始偏移不同（差 40MB 的 `local_x` 前缀），不能直接共享 raw buffer」。
 **该假设已被推翻**：`UnifiedSymmBuffer` 实测证明单物理 buffer 可安全服务 fwd/bwd——fwd/bwd 不并发，各自按自己 layout 算 TMA 偏移，offset 差在单 pass 复用下无害。
 
-### 真正的根因（已定位并修复）
+### 真正的根因（2026-07-17 复核）
 
-unified buffer 在**所有层的 fwd GEMM-RS 与 bwd AG-GEMM 之间跨 pass 复用**同一块对称内存。
-GEMM-RS 与 AG-GEMM 各自依赖 buffer 开头的 **+1/-1 握手信号区 `[0,32)`** 及 AG 的 **`slot_state` 就绪标志**（kernel 用 `ld_acq_sys` 轮询）。
-若不复位，前一次 op 留下的脏信号/slot 字节会让后一个 kernel 的 handshake 读到过期值 →
-gather/AG 非确定性错乱 → `grad_X rel` 偶发抖动（0.25 / 0.44 / 0.63），且**并非随机垃圾而是稳定偏大**，指向 slot 就绪信号在 comm stream 未 flush 就被 memset 竞态。
+共享 layout 本身没有问题；非确定性 `grad_X rel≈0.44` 的直接原因是 **AG 输入发布竞态**：
+每个 rank 把本地 `grad_y` 写进 `local_x` 后，AG 的独立 communication stream 会立即 pull
+其他 rank 的 `local_x`。如果远端 rank 尚未完成 copy，就会拉到上一轮数据。
 
-### 修复（对齐 `tests/comm/test_unified_buffer.py` Test 6，并加固）
+之前在 autograd Function 里执行 `barrier + synchronize + buffer.zero_()` 偶尔能掩盖该竞态，
+但它并不是正确协议：
 
-在 `GemmRSFunction.forward`（GEMM-RS 前）与 `.backward`（AG-GEMM 前）都插入：
+- GEMM-RS 的 NVLink barrier 是 phase/sign 自复位协议，逐调用清零可能擦掉 peer 已到达的 signal；
+- AG launcher 自己会在 comm stream 上清零 `slot_state`；
+- 对数百 MB data region 做 `zero_()` 没有语义必要，并破坏 overlap。
 
-```
-group.barrier()
-torch.cuda.synchronize()   # 强制 flush symm_mem comm stream，避免跨流竞态
-sym_buffer.buffer.zero_()  # 清 barrier 信号区 + slot_state + 数据区
-torch.cuda.synchronize()
-group.barrier()
-torch.cuda.synchronize()   # ← 关键：二次 sync 确保 comm stream 完全 flush 后再让 kernel 启动
-```
+### 当前修复
 
-**关键点**：仅 `barrier + zero_()`（如 Test 6）仍有 ~1/3 偶发失败；必须额外一道 `synchronize()`
-强制 flush comm stream，才能消除 slot_state 的跨流竞态。
+新增高层入口 `bf16_ag_gemm_nt_with_input(d, a, b, workspace, num_tokens)`：
+
+1. copy 本地输入到 workspace `local_x`；
+2. 等待 copy 完成；
+3. 所有 rank 完成设备端 barrier；
+4. 才允许 C++ AG comm stream pull 远端输入；
+5. 返回已经 gather 的 slots view，供 Wo shard 权重梯度 GEMM 复用。
+
+因此 `FusedPostLinearFunction` 不再访问 `.ag_x/.ag_slots_x` 内部布局，也不再清零整个
+workspace。2 卡连续 4 次验证 `grad_X rel=0.0`。
 
 ### 结论
 
-**可以共享单块物理 buffer**（unified buffer 已落地）。所谓「偏移差 40MB」不是障碍；
-真正要守住的是**每次在同一 buffer 上启动新 kernel 前，先 barrier+sync+zero_+sync+barrier+sync 复位握手/就绪区**。
+**可以共享单块物理 buffer**。必须同步的是“所有 rank 的 AG 输入已经发布”，而不是
+粗暴复位整块物理内存。后续可将该输入发布 barrier 下沉为纯 GPU/NVLink 协议，以移除
+当前高层入口中的 host synchronize。
 
 ## 可能的解决方案
 
@@ -162,19 +166,20 @@ torch.cuda.synchronize()   # ← 关键：二次 sync 确保 comm stream 完全 
 
 ### wan21 迁移（2026-07-17）
 
-`examples/wan21` 的 `GemmRSFunction`（`autograd_ops.py`）+ `fused_variant.py` 已从旧的两独立 buffer
-（`GemmRSSymmBuffer` + `BF16AGGemmSymmBuffer`）迁移到单个 unified buffer：
+`examples/wan21` 的 POST 变体已迁移到单个 unified buffer，并重构成
+`FusedPostLinearFunction`：
 
-- `fused_variant._create_buffers` 只建 `self.sym_post = get_unified_symm_buffer(group, bs, seq, dim)`（num_max_tokens_per_rank = bs*(seq//sp) == self.local_m，正好等于 gemm_rs 调用传的 local_m）。
-- `GemmRSFunction.forward` 用该 buffer 跑 GEMM+RS；`backward` 用 `sym_buffer.ag_x` 写 grad_y、调 `bf16_ag_gemm_nt(sym_buffer, ...)` 跑 AG+GEMM、从 `sym_buffer.ag_slots_x` 读 gathered grad_y 算权重梯度。
-- 跨层通过 `share_buffers_from` 共享**同一个** buffer（destroy 时只 destroy 一次）。
+- `fused_variant._create_buffers` 只创建一个 `get_unified_symm_buffer(...)`；
+- forward 调 GEMM+RS，backward 经 `bf16_ag_gemm_nt_with_input` 调 AG+GEMM；
+- Function 只描述 autograd 数学，不创建、销毁或清零 workspace；
+- layer 0 拥有 workspace，其余层借用，跨全部层与前后向只分配一次。
 
-**状态（2026-07-17 已验证）**：本机即 **B300 SXM6 ×8**（CUDA 13.0），2 卡 `examples/debug_var_bwd.py` 实跑
-（`DG_JIT_USE_NVRTC=1`），连跑 4/4 全部 PASS：
+**状态（2026-07-17 已验证）**：B300 2 卡 `examples/debug_var_bwd.py` 连跑 4/4：
 
-- `grad_X rel (serial vs var)` ≈ **0.000000–0.000002**（迁移前唯一失败模式 0.2572 已消失）
-- `fwd rel (serial vs var)` ≈ **0.0026**（≤ 预期 ~0.028）
-- 退出码 0，无 SIGABRT（teardown 时在 `destroy_process_group()` 前显式 `destroy_buffers()` 释放 unified buffer，避免 `~CUDASymmetricMemory` 析构时序崩）
+- `grad_X rel (serial vs var) = 0.000000`
+- `fwd rel (serial vs var) = 0.002964–0.002968`
+- teardown 在 `destroy_process_group()` 前显式释放 workspace，无 SIGABRT。
 
-注意：`debug_var_bwd.py` 的 rel 在**修复前不稳定**（0.44/0.63 抖动），正是脏 signal/slot_state 竞态
-的直接证据；加固同步后稳定归零。上线前建议在其他 seq/bs 配置下再抽测一次。
+严格 POST-only 显存消融显示当前变体并不省显存：8 卡、40 attention 层时，8K true peak
+14,616.5 vs 14,442.6 MB；32K 为 35,137.2 vs 34,076.4 MB。固定 unified workspace
+分别占 160/640 MB，且 baseline 在 FSDP2 下的 Wo 静态存储本来也已分片。
