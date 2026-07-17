@@ -50,7 +50,7 @@ def apply_fsdp2(module: nn.Module, group: dist.ProcessGroup,
     fully_shard(
         module,
         mesh=mesh,
-        reshard_after_forward=False,  # Keep params unsharded after forward for backward
+        reshard_after_forward=reshard_after_forward,
         mp_policy=mp_policy,
         ignored_params=ignored_params,
     )

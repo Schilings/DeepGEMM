@@ -1,173 +1,130 @@
-# Wan2.1 14B Ulysses SP Attention Benchmark
+# Wan2.1 14B Ulysses POST 变体消融
 
-真实 Wan2.1 14B 训练场景的 Ulysses 序列并行注意力 benchmark。
+本实验只回答一个问题：**将标准 Ulysses 的 post-attention 从同步
+A2A + Wo 改为 Wo 分片 GEMM+ReduceScatter，能否降低真实训练峰值显存？**
 
-## 架构
+## 严格消融定义
 
-```
-benchmarks/wan21/
-  config.py          — Wan21Config / SPConfig / TrainConfig (dataclass)
-  model.py           — WanSelfAttention (nn.Module，纯模型层，与并行策略无关)
-  rope.py            — 3D RoPE (Wan2.1 原生 T/H/W 三轴)
-  norm.py            — WanRMSNorm (bf16)
-  sp/
-    base.py          — UlyssesBase 抽象基类 (forward/backward 接口)
-    serial.py        — SerialUlysses (matmul + NCCL A2A，串行 baseline)
-    fused_standard.py — FusedStandardUlysses (GEMM+A2A PRE + A2A+GEMM POST)
-    fused_variant.py  — FusedVariantUlysses (GEMM+A2A PRE + GEMM+RS POST)
-  fsdp2_utils.py     — FSDP2 权重梯度同步 (auto fully_shard / manual all-reduce)
-  bench_utils.py     — 计时 + 正确性验证
+两条路径的 PRE 和 attention 使用同一份代码：
 
-benchmarks/bench_wan21_strategies.py — 统一入口
-benchmarks/verify_wan21_attn.py      — 2卡快速正确性验证
-```
+1. Wan2.1 原始 Q/K/V `nn.Linear`；
+2. Q/K RMSNorm；
+3. 三次同步 `torch.distributed.all_to_all_single`；
+4. 3D RoPE；
+5. `torch.nn.functional.scaled_dot_product_attention`。
 
-## 三条策略
+它们唯一的差别是 POST：
 
-### 1. serial (Baseline)
-- FWD: `matmul(X, Wqkv^T)` + NCCL `all_to_all` → FA4 → `all_to_all` + `matmul(gathered, Wo^T)`
-- BWD: 串行 `matmul` + NCCL `all_to_all` (无 overlap)
-- 权重梯度: all-reduce (FSDP2 fallback)
-
-### 2. fused_std (融合标准 Ulysses)
-- FWD PRE: `bf16_gemm_a2a_transpose_nt` (GEMM+A2A，融合 kernel)
-- FWD POST: `bf16_a2a_transpose_gemm_nt_fused` (A2A+GEMM，融合 kernel)
-- BWD POST: 对偶 GEMM+A2A (serial A2A-inverse + matmul)
-- BWD PRE: 对偶 A2A+GEMM (`bf16_a2a_transpose_gemm_nt`, M0, 用 `Wqkv_t` 做 NT)
-- 权重梯度: serial matmul (融合算子只算激活梯度)
-
-### 3. fused_var (融合变体 Ulysses)
-- FWD PRE: `bf16_gemm_a2a_transpose_nt` (GEMM+A2A)
-- FWD POST: `bf16_gemm_rs_nt` (GEMM+RS，Wo 行拆分)
-- BWD POST: `bf16_ag_gemm_nt` (AG+GEMM，GEMM+RS 的对偶)
-- BWD PRE: 对偶 A2A+GEMM (`bf16_a2a_transpose_gemm_nt`, M0, 用 `Wqkv_t` 做 NT)
-- 输出 N-sharded (每 rank 持有 N/sp 维度，省显存)
-
-## 对偶关系
-
-| Forward 算子 | Backward 对偶算子 |
-|---|---|
-| GEMM+A2A (`bf16_gemm_a2a_transpose_nt`) | A2A+GEMM (`bf16_a2a_transpose_gemm_nt_fused`) |
-| A2A+GEMM (`bf16_a2a_transpose_gemm_nt_fused`) | GEMM+A2A (`bf16_gemm_a2a_transpose_nt`) |
-| GEMM+RS (`bf16_gemm_rs_nt`) | AG+GEMM (`bf16_ag_gemm_nt`) |
-
-> 注: 融合算子只能 overlap 计算激活值梯度，权重梯度需要完整输入无法 overlap。
-
-## 输入 Shape (THD / PackedSequence)
-
-Wan2.1 14B: dim=5120, nh=40, hd=128。VAE stride=(4,8,8), patch=(1,2,2)。
-81 帧 → T_latent=21。
-
-| Shape 标签 | Token 数 | 对应场景 |
+| 路径 | POST forward | POST backward |
 |---|---|---|
-| 1x8K | 8,192 | 小规模测试 |
-| 1x32K | 32,768 | 480p 81帧 |
-| 1x74K | 75,776 | 720p 81帧 |
-| 1x168K | 172,032 | 1080p 81帧 |
-| 1x64K | 65,536 | 480p × 2视频 |
-| 1x148K | 151,552 | 720p × 2视频 |
+| `serial` baseline | 同步 NCCL A2A → 完整 `Wo` 的 `nn.Linear` | torch autograd → 同步逆 A2A |
+| `fused_var` | 本地 Wo 输入列分片 → DeepGEMM GEMM+RS | DeepGEMM AG+GEMM → 本地 Wo shard 梯度 GEMM |
 
-## 结果 (8 GPU B300, THD, iters=10, us)
+`serial` 不调用任何 DeepGEMM 通信融合算子。`fused_std` 仅保留为旧命令行的
+兼容别名，执行内容与 `serial` 完全相同，不属于本消融的第三条路径。
 
-> **FWD+BWD+SYNC** 完整训练开销。SYNC = FSDP2 风格 reduce-scatter 梯度同步。
-> - Wqkv：总是 reduce-scatter（replicated weight，各 rank 算的是 partial grad）
-> - Wo：serial/fused_std reduce-scatter；**fused_var 跳过**（Wo 行切分，梯度天然本地）
+## POST 变体的数据布局
 
-| Shape | Strategy | FWD | ATTN | BWD | SYNC | F+B+S |
-|-------|----------|------|------|------|------|-------|
-| 1x8K | serial | 1468 | 228 | 3336 | 432 | 5235 |
-| 1x8K | fused_std | 1989 | 222 | 4115 | 399 | 6503 |
-| 1x8K | **fused_var** | **931** | 225 | **3590** | **269** | **4790** |
-| 1x32K | serial | 3707 | 1682 | 14380 | 408 | 18495 |
-| 1x32K | fused_std | 4606 | 1679 | 14370 | 460 | 19436 |
-| 1x32K | **fused_var** | **3222** | 1679 | **13854** | **268** | **17344** |
-| 1x74K | serial | 12958 | 8134 | 61645 | 426 | 75029 |
-| 1x74K | fused_std | 12748 | 8180 | 60840 | 424 | 74013 |
-| 1x74K | **fused_var** | **12230** | 8045 | **59497** | **279** | **72007** |
-| 1x168K | serial | 59717 | 46368 | 282145 | 431 | 342293 |
-| 1x168K | fused_std | 57947 | 47155 | 282241 | 443 | 340631 |
-| 1x168K | **fused_var** | **57035** | 47417 | **277554** | **292** | **334881** |
-| 1x64K | serial | 10205 | 6332 | 48365 | 425 | 58994 |
-| 1x64K | fused_std | 9692 | 6488 | 47943 | 426 | 58062 |
-| 1x64K | **fused_var** | **9361** | 6351 | **46716** | **275** | **56353** |
-| 1x148K | serial | 47052 | 36878 | 221935 | 437 | 269424 |
-| 1x148K | fused_std | 45182 | 34083 | 220560 | 440 | 266182 |
-| 1x148K | **fused_var** | **44764** | 36641 | **219672** | **278** | **264714** |
+Wan2.1 14B 使用 `hidden=5120, nheads=40, head_dim=128`。SP 大小为
+`P` 时，每卡 attention 输出为：
 
-## 结果 (8 GPU B300, FSDP2 fully_shard, autograd-based, iters=10, us)
-
-> **FSDP2 (fully_shard) + autograd.Function**：融合算子封装为 `torch.autograd.Function`，
-> forward 走 autograd graph，`y.backward()` 自动触发 FSDP2 的 reduce-scatter 梯度同步。
-> BWD 已包含 FSDP2 自动梯度同步（Wqkv reduce-scatter；fused_var Wo 跳过因行切分）。
-
-| Shape | Strategy | FWD | BWD | F+B |
-|-------|----------|------|------|------|
-| 1x8K | serial | 1698 | 3046 | 4744 |
-| 1x8K | fused_std | 1502 | 2927 | 4429 |
-| 1x8K | **fused_var** | **1423** | 3065 | **4487** |
-| 1x32K | serial | 4112 | 11987 | 16099 |
-| 1x32K | fused_std | 3789 | 12049 | 15839 |
-| 1x32K | **fused_var** | **3669** | **11576** | **15244** |
-| 1x74K | serial | 13343 | 51044 | 64386 |
-| 1x74K | fused_std | 12537 | 51014 | 63551 |
-| 1x74K | **fused_var** | **12376** | **49185** | **61561** |
-| 1x168K | serial | 58946 | 228491 | 287437 |
-| 1x168K | fused_std | 58198 | 229296 | 287494 |
-| 1x168K | **fused_var** | **57356** | **226077** | **283432** |
-| 1x64K | serial | 10418 | 39940 | 50359 |
-| 1x64K | fused_std | 9919 | 39724 | 49643 |
-| 1x64K | **fused_var** | **9775** | **38167** | **47942** |
-| 1x148K | serial | 46613 | 181370 | 227982 |
-| 1x148K | fused_std | 45579 | 181424 | 227003 |
-| 1x148K | **fused_var** | **45204** | **178769** | **223973** |
-
-### 加速比 (F+B vs serial, FSDP2 autograd)
-
-| Shape | fused_std | fused_var |
-|-------|-----------|-----------|
-| 1x8K | 0.93x | **0.95x** |
-| 1x32K | 0.98x | **1.05x** |
-| 1x74K | 0.99x | **1.04x** |
-| 1x168K | 1.00x | **1.01x** |
-| 1x64K | 0.99x | **1.05x** |
-| 1x148K | 1.00x | **1.02x** |
-
-### SYNC 开销分析
-
-| Shape | serial SYNC | fused_std SYNC | fused_var SYNC | var 节省 |
-|-------|-------------|---------------|---------------|---------|
-| 1x8K | 432us | 399us | **269us** | -38% |
-| 1x168K | 431us | 443us | **292us** | -32% |
-
-fused_var 的 SYNC 比 serial/fused_std 少 ~30-38%，因为它省掉了 Wo 的 reduce-scatter（行切分权重，梯度天然本地）。
-
-## 正确性验证 (2 GPU, 1x8K, serial)
-
-```
-FWD rel       = 0.0019
-BWD grad_X    = 0.0016
-BWD grad_Wqkv = 0.0034
-Status: PASS
+```text
+attn_local: [full_tokens, hidden / P]
+Wo_local:   [hidden, hidden / P]       # nn.Linear.weight 的输入列分片
 ```
 
-## 用法
+Forward：
+
+```text
+partial = attn_local @ Wo_local.T      # [full_tokens, hidden]
+y_local = ReduceScatter(partial)       # [local_tokens, hidden]
+```
+
+Backward：
+
+```text
+grad_y_full = AllGather(grad_y_local)
+grad_attn = grad_y_full @ Wo_local
+grad_Wo_local = grad_y_full.T @ attn_local
+```
+
+GEMM+RS 不物化普通 torch `partial`；AG+GEMM 不物化独立的
+`grad_y_full`，而是复用通信 workspace 已 gather 的 slots 计算权重梯度。
+
+## Function 与 workspace 生命周期
+
+`examples/wan21/autograd_ops.py` 只封装 POST 变体的
+`FusedPostLinearFunction`：
+
+- 数学输入、权重和输出都是普通 tensor；
+- `UnifiedSymmBuffer` 由策略拥有，不由 autograd Function 创建或销毁；
+- forward 与 backward 复用同一个固定 workspace；
+- 多层模型中 layer 0 为 owner，其余层为 borrower；
+- workspace 只分配一次，大小取 GEMM-RS 与 AG-GEMM 需求的最大值。
+
+AG+GEMM 的高层入口 `bf16_ag_gemm_nt_with_input` 接收显式输入，隐藏
+`.ag_x/.ag_slots_x` 等内部布局。底层 C++ 负责 stream/event 和 `slot_state`
+复位。不得在 Function 中对数百 MB workspace 做逐调用 `zero_()`；当前只在
+AG pull 前执行输入发布同步，防止某 rank 提前读取远端尚未写好的输入。
+
+## 参数与 FSDP2
+
+- PRE 直接使用 `model.q/k/v`，不再创建冗余 `Wqkv/Wqkv_t` 参数。
+- baseline 保留完整逻辑 `model.o.weight`，由 FSDP2 管理。
+- variant 创建 `[hidden, hidden/P]` 的 `Wo_r_local` 后注销完整
+  `model.o.weight`，避免“完整 Wo + 本地 shard”双份常驻。
+- 多层显存测试逐层应用 FSDP2，`reshard_after_forward=True`；仅 variant 的
+  `Wo_r_local` 被排除，因为它已经按 SP 天然分片。
+- Adam 状态按 DTensor 的本地 shard 分配，而不是按 global shape 重复分配。
+
+## 显存统计
+
+### 单层
 
 ```bash
-# 全部策略
-DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python benchmarks/bench_wan21_strategies.py 8 10
-
-# 指定策略
-DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python benchmarks/bench_wan21_strategies.py 8 10 --strategies serial,fused_var
-
-# 正确性验证 (2卡)
-DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python benchmarks/bench_wan21_strategies.py 2 5 --verify --strategies serial
+DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD \
+  python examples/bench_wan21_mem.py 8 serial,fused_var
 ```
 
-## 关键发现
+报告：
 
-1. **fused_var 全面最优** — 所有 shape 的 FWD+BWD 都最快
-2. **长序列 attention 占比大** — 1080p 的 ATTN 占 FWD 的 80%，e2e 加速被稀释
-3. **fused_std 在小 shape 反而慢** — 融合算子固定开销在 1x8K 不划算
-4. **batch=2 对 fused 有利** — 更大 GEMM 更好 overlap comm
-5. **BWD 的 PRE 部分已改用融合 A2A+GEMM 算子**（`bf16_a2a_transpose_gemm_nt`, M0, 用 `Wqkv_t` 做 NT）— 正确性验证通过（gX_rel=0.0016 vs serial NCCL），但因 PRE BWD 的 comm 数据量小（QKV 每 rank ~2MB），M0 对 BWD 整体加速不显著（±1%，大 shape 略快、小 shape 略慢）。BWD 主要被 FA4 backward 和 weight grad（串行 matmul）主导。
-6. **fused_var 的 Wo 行切分省掉 Wo 梯度 all-reduce** — serial/fused_std 每步 BWD 需 all-reduce Wqkv+Wo 两个权重梯度；fused_var 只 all-reduce Wqkv，Wo 梯度天然本地（行切分，每 rank 只更新自己的块）。这是 variant 在梯度同步阶段的额外优势。
+- `torch.cuda.max_memory_allocated()` 的 FWD/BWD 累计峰值；
+- symmetric workspace 的实际字节数；
+- Wo 逻辑大小和本地梯度大小。
+
+### 多层训练
+
+```bash
+DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD \
+  python examples/bench_wan21_mem_train.py 8 40 32768 serial,fused_var
+```
+
+包含：逐层 FSDP2、BF16 参数/梯度、FP32 Adam `m/v`、保存到 backward 的
+激活，以及跨层复用一次的 symmetric workspace。输入只创建本 rank 的序列
+分片，不再让每卡常驻完整 `X_full`。
+
+`torch.cuda.max_memory_allocated()` 不保证统计 symmetric memory，所以文档将
+PyTorch 峰值和 workspace 分项报告，并给出二者相加的估算峰值；最终结论还应
+用 `max_memory_reserved()`、NVML 或 `cudaMemGetInfo` 交叉验证。
+
+## 正确性
+
+```bash
+DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python examples/debug_var_bwd.py
+```
+
+2026-07-17，B300 2 卡连续 4 次结果：
+
+```text
+grad_X rel (serial vs var): 0.000000
+fwd rel (serial vs var):    0.002964 ~ 0.002968
+```
+
+前向差异来自 BF16 GEMM/ReduceScatter 的归约顺序；输入梯度与同步 baseline
+一致。buffer 必须在 `destroy_process_group()` 前显式释放。
+
+## 尚待给出的结论
+
+历史性能/显存数字来自旧实验：旧代码混入了 PRE 融合描述、冗余权重副本、
+整卡 `X_full`、错误的 FSDP2 ignored 参数和非逐层 unshard 生命周期，因此不再
+作为本消融结论。修正后的 8 卡 40 层结果重跑后再写入本节。

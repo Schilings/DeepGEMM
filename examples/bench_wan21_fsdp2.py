@@ -111,10 +111,9 @@ def run(rank, ng, port, iters, verify, strategies):
                 ref_out = yr.detach(); ref_gX = grads[0].detach(); ref_grad_y = gy_full
                 del Xr, yr, ref_m
 
-            # Apply FSDP2: shard Wqkv Parameter; ignore model params (we use Wqkv not nn.Linear)
-            ignored = set(strat.model.parameters())
-            if strat_name == 'fused_var':
-                ignored |= {strat.Wo_r_local}
+            # Apply the same FSDP2 policy to ordinary model parameters in both
+            # arms.  Only the variant's already-local Wo shard is excluded.
+            ignored = {strat.Wo_r_local} if strat_name == 'fused_var' else None
             try:
                 apply_fsdp2(strat, group, reshard_after_forward=True, ignored_params=ignored)
             except Exception as e:
@@ -150,7 +149,7 @@ def run(rank, ng, port, iters, verify, strategies):
                 for r in resets: r()
                 strat.layout = 'THD'
                 X_in = X_local.detach().requires_grad_(True)
-                y = strat.forward(X_in, grid, llseq)
+                y = strat(X_in, grid, llseq)
                 if grad_y_local is not None:
                     gy = grad_y_local
                 else:
@@ -172,7 +171,7 @@ def run(rank, ng, port, iters, verify, strategies):
                     for r in resets: r()
                     dist.barrier(group)
                 with torch.no_grad():
-                    y = strat.forward(X_local, grid, llseq)
+                    y = strat(X_local, grid, llseq)
                 y_full = gather_to_rank0(y, group, ng)
                 if rank == 0 and ref_out is not None:
                     fwd_rel = rel_diff(y_full.reshape(-1, hidden)[:ref_out.reshape(-1,hidden).shape[0]],
@@ -209,7 +208,7 @@ if __name__ == '__main__':
     parser.add_argument('num_gpus', type=int, nargs='?', default=8)
     parser.add_argument('iters', type=int, nargs='?', default=10)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument('--strategies', default='serial,fused_std,fused_var')
+    parser.add_argument('--strategies', default='serial,fused_var')
     args = parser.parse_args()
     strategies = args.strategies.split(',')
     port = find_free_port()

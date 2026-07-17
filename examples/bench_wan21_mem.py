@@ -57,9 +57,10 @@ def run(rank, ng, port, strategies):
 
         bs = 1; llseq = seq // ng; lm = bs * llseq
         grid = torch.tensor([[gt, gh, gw]], dtype=torch.long)
-        g2 = torch.Generator(device=dev).manual_seed(42)
-        X_full = torch.randn(bs, seq, hidden := nheads * head_dim, dtype=torch.bfloat16, device=dev, generator=g2)
-        X_local = X_full[:, rank*llseq:(rank+1)*llseq, :].reshape(llseq, hidden).contiguous()
+        hidden = nheads * head_dim
+        g2 = torch.Generator(device=dev).manual_seed(42 + rank)
+        X_local = torch.randn(
+            llseq, hidden, dtype=torch.bfloat16, device=dev, generator=g2)
 
         for strat_name in strategies:
             sp_cfg = SPConfig(sp_size=ng, group=group, layout='THD', use_fused_ops=True)
@@ -71,10 +72,8 @@ def run(rank, ng, port, strategies):
             strat.model = strat.model.to(torch.bfloat16)
             strat.setup_shape(bs, seq, nheads, head_dim)
 
-            ignored = set(strat.model.parameters())
-            if strat_name == 'fused_var':
-                ignored |= {strat.Wo_r_local}
-            apply_fsdp2(strat, group, reshard_after_forward=False, ignored_params=ignored)
+            ignored = {strat.Wo_r_local} if strat_name == 'fused_var' else None
+            apply_fsdp2(strat, group, reshard_after_forward=True, ignored_params=ignored)
 
             # Measure sym buffer size
             sym_mb = 0.0
@@ -86,9 +85,10 @@ def run(rank, ng, port, strategies):
             # Measure Wo weight size
             wo_mb = 0.0
             if strat_name == 'fused_var':
-                wo_mb = strat.Wo_r_local.numel() * 2 / 1024 / 1024  # bf16=2 bytes
+                wo_mb = strat.Wo_r_local.numel() * 2 / 1024 / 1024
             else:
-                wo_mb = strat.Wo.numel() * 2 / 1024 / 1024
+                # Report the logical full Wo; FSDP2 stores only its local shard at rest.
+                wo_mb = hidden * hidden * 2 / 1024 / 1024
 
             # FWD peak
             torch.cuda.reset_peak_memory_stats(dev)

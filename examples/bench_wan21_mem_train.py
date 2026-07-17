@@ -55,32 +55,15 @@ class MultiLayerModel(nn.Module):
         return x
 
     def destroy_buffers(self):
-        if self.layers and hasattr(self.layers[0], '_unified_buf') and self.layers[0]._unified_buf is not None:
-            self.layers[0]._unified_buf.destroy()
-            self.layers[0]._unified_buf = None
-            self.layers[0].sym_post = None
-            self.layers[0].sym_post_bwd = None
-        elif self.layers and hasattr(self.layers[0], 'sym_post'):
-            if hasattr(self.layers[0], 'sym_post') and self.layers[0].sym_post is not None:
-                self.layers[0].sym_post.destroy()
-                self.layers[0].sym_post = None
-            if hasattr(self.layers[0], 'sym_post_bwd') and self.layers[0].sym_post_bwd is not None:
-                self.layers[0].sym_post_bwd.destroy()
-                self.layers[0].sym_post_bwd = None
+        for layer in self.layers:
+            layer.destroy_buffers()
 
     def sym_buf_bytes(self):
-        """Total sym_buf allocation (not tracked by PyTorch allocator)."""
-        total = 0
-        owner = self.layers[0]
-        if hasattr(owner, '_unified_buf') and owner._unified_buf is not None:
-            # Unified: single shared buffer, don't double-count
-            total = owner._unified_buf.ag.buffer.numel()
-        else:
-            if hasattr(owner, 'sym_post') and owner.sym_post is not None:
-                total += owner.sym_post.buffer.numel()
-            if hasattr(owner, 'sym_post_bwd') and owner.sym_post_bwd is not None:
-                total += owner.sym_post_bwd.buffer.numel()
-        return total
+        """One UnifiedSymmBuffer is shared by all layers; count it once."""
+        if not self.layers:
+            return 0
+        workspace = getattr(self.layers[0], 'sym_post', None)
+        return 0 if workspace is None else workspace.num_bytes
 
 
 def run(rank, ng, port, num_layers, seq, strategies):
@@ -94,12 +77,14 @@ def run(rank, ng, port, num_layers, seq, strategies):
     model_cfg = Wan21Config(dim=5120, num_heads=40, head_dim=128)
     dim, nh, hd = model_cfg.dim, model_cfg.num_heads, model_cfg.head_dim
 
-    # Use a real Wan2.1 shape (grid product must be <= seq)
-    grid = torch.tensor([[21, 30, 52]], dtype=torch.long)  # 21*30*52 = 32760 ≤ 32768
+    # Use a valid 3D grid for every CLI sequence length.  The memory benchmark
+    # only needs the product to cover the packed sequence and each axis to stay
+    # within the precomputed RoPE table.
+    assert seq % (16 * 128) == 0
+    grid = torch.tensor([[seq // (16 * 128), 16, 128]], dtype=torch.long)
     bs = 1; llseq = seq // ng; lm = bs * llseq
-    g2 = torch.Generator(device=dev).manual_seed(42)
-    X_full = torch.randn(bs, seq, dim, dtype=torch.bfloat16, device=dev, generator=g2)
-    X_local = X_full[:, rank*llseq:(rank+1)*llseq, :].reshape(llseq, dim).contiguous()
+    g2 = torch.Generator(device=dev).manual_seed(42 + rank)
+    X_local = torch.randn(llseq, dim, dtype=torch.bfloat16, device=dev, generator=g2)
 
     if rank == 0:
         print(f"\n{'='*145}")
@@ -123,24 +108,27 @@ def run(rank, ng, port, num_layers, seq, strategies):
                 layer.model = layer.model.to(torch.bfloat16)
         model.setup_shape(bs, seq, nh, hd)
 
-        # FSDP2: shard Wqkv per layer; ignore model params + Wo_r_local for fused_var
-        ignored = set()
+        # Apply FSDP2 per layer so one layer is unsharded at a time.  Q/K/V and
+        # baseline Wo use normal FSDP2; only the variant's already-local Wo shard
+        # is ignored.
         for layer in model.layers:
-            ignored |= set(layer.model.parameters())
-            if strat_name == 'fused_var':
-                ignored |= {layer.Wo_r_local}
-        apply_fsdp2(model, group, reshard_after_forward=False, ignored_params=ignored)
+            ignored = {layer.Wo_r_local} if strat_name == 'fused_var' else None
+            apply_fsdp2(layer, group, reshard_after_forward=True, ignored_params=ignored)
 
-        # Count trainable params
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        def local_tensor(param):
+            return param.to_local() if hasattr(param, 'to_local') else param
 
-        # Adam optimizer states (fp32 m, v) — allocate manually to measure real memory
-        # (FSDP2 DTensor + Adam.step() has compatibility issues, so we measure states directly)
+        # Count physical parameters resident on this rank, not DTensor global shapes.
+        n_params = sum(
+            local_tensor(p).numel() for p in model.parameters() if p.requires_grad)
+
+        # Allocate Adam m/v for each physical local shard.
         adam_states = []
         for p in model.parameters():
             if p.requires_grad:
-                adam_states.append(torch.zeros(p.shape, dtype=torch.float32, device=dev))  # exp_avg
-                adam_states.append(torch.zeros(p.shape, dtype=torch.float32, device=dev))  # exp_avg_sq
+                local_p = local_tensor(p)
+                adam_states.append(torch.zeros_like(local_p, dtype=torch.float32))
+                adam_states.append(torch.zeros_like(local_p, dtype=torch.float32))
 
         sym_buf_mb = model.sym_buf_bytes() / 1024 / 1024
 

@@ -170,6 +170,39 @@ def bf16_ag_gemm_nt(d: torch.Tensor,
     )
 
 
+def bf16_ag_gemm_nt_with_input(d: torch.Tensor,
+                                a: torch.Tensor,
+                                b: torch.Tensor,
+                                sym_buffer: BF16AGGemmSymmBuffer,
+                                num_tokens: int,
+                                compiled_dims: str = 'nk') -> torch.Tensor:
+    """Stage a local input and launch BF16 AllGather+GEMM.
+
+    This is the high-level, reusable interface: callers pass the mathematical
+    input instead of mutating workspace internals.  It returns the gathered
+    input view because training backward commonly reuses it for a weight-gradient
+    GEMM.  Stream dependencies and ``slot_state`` reset are handled by the C++
+    launcher; callers must not clear the shared workspace between invocations.
+    """
+    assert a.ndim == 2 and a.shape[0] == num_tokens
+    assert a.shape[1] == sym_buffer.hidden
+    local_x = sym_buffer.x if hasattr(sym_buffer, 'x') else sym_buffer.ag_x
+    slots_x = sym_buffer.slots_x if hasattr(sym_buffer, 'slots_x') else sym_buffer.ag_slots_x
+    local_x[:num_tokens, :a.shape[1]].copy_(a)
+
+    # The C++ communication stream may immediately pull remote ``local_x``.
+    # Publish every rank's staged input before any rank starts that pull.  This
+    # is the only cross-rank synchronization required here; slot_state is reset
+    # internally and the large data region must not be memset between calls.
+    torch.cuda.synchronize(a.device)
+    sym_buffer.group.barrier()
+    torch.cuda.synchronize(a.device)
+
+    bf16_ag_gemm_nt(d, b, sym_buffer, num_tokens, compiled_dims)
+    return slots_x[:sym_buffer.group.size(), :num_tokens, :a.shape[1]].reshape(
+        sym_buffer.group.size() * num_tokens, a.shape[1])
+
+
 def fp8_ag_gemm_nt(d: torch.Tensor,
 
 

@@ -97,6 +97,7 @@ from .ag_gemm import (
     fp8_ag_gemm_nt,
     fp8_ag_gemm_nt_hopper,
     bf16_ag_gemm_nt,
+    bf16_ag_gemm_nt_with_input,
     bf16_ag_gemm_nt_hopper,
 )
 

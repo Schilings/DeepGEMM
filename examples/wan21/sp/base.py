@@ -13,12 +13,30 @@ need the full input which isn't available during the overlapped GEMM.
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 
 from ..config import Wan21Config, SPConfig
-from ..model import WanSelfAttention, build_wqkv_rankmajor
+from ..model import WanSelfAttention
 from ..rope import rope_apply
-from ..norm import WanRMSNorm
+
+
+class NCCLAllToAll(torch.autograd.Function):
+    """Synchronous NCCL all-to-all with the inverse collective in backward."""
+
+    @staticmethod
+    def forward(ctx, send, group):
+        ctx.group = group
+        recv = torch.empty_like(send)
+        dist.all_to_all_single(recv, send, group=group)
+        return recv
+
+    @staticmethod
+    def backward(ctx, grad_recv):
+        grad_recv = grad_recv.contiguous()
+        grad_send = torch.empty_like(grad_recv)
+        dist.all_to_all_single(grad_send, grad_recv, group=ctx.group)
+        return grad_send, None
 
 
 class UlyssesBase(nn.Module):
@@ -56,15 +74,7 @@ class UlyssesBase(nn.Module):
             self._create_buffers()
 
     def _build_weights(self):
-        # Model has separate q/k/v (official Wan2.1 layout) — reorder to rank-major for SP
-        Wq = self.model.q.weight
-        Wk = self.model.k.weight
-        Wv = self.model.v.weight
-        Wqkv = build_wqkv_rankmajor(Wq, Wk, Wv, self.sp_size, self.local_nh, self.head_dim)
-        self.Wqkv = nn.Parameter(Wqkv.clone(), requires_grad=True)
-        self.Wqkv_t = nn.Parameter(self.Wqkv.data.t().contiguous(), requires_grad=True)
-        self.Wo = self.model.o.weight  # [dim, dim], managed by FSDP2 via model
-        self.Wo_t = self.Wo.t().contiguous()
+        """Hook for POST-specific parameter layouts; PRE always uses the model Q/K/V."""
 
     def _create_buffers(self):
         pass
@@ -72,21 +82,40 @@ class UlyssesBase(nn.Module):
     def destroy_buffers(self):
         pass
 
+    def _pre_forward(self, x_local, llseq):
+        """Pure PyTorch synchronous Ulysses PRE, shared by every ablation arm."""
+        sp = self.sp_size
+        lbs = self.bs if self.layout == 'BSHD' else 1
+        lseq = self.seq if self.layout == 'BSHD' else self.bs * self.seq
+        hd = self.head_dim
+
+        q = self.model.norm_q(self.model.q(x_local)).view(lbs, llseq, sp, self.local_nh, hd)
+        k = self.model.norm_k(self.model.k(x_local)).view(lbs, llseq, sp, self.local_nh, hd)
+        v = self.model.v(x_local).view(lbs, llseq, sp, self.local_nh, hd)
+
+        def scatter_heads(tensor):
+            send = tensor.permute(2, 0, 1, 3, 4).contiguous()
+            recv = NCCLAllToAll.apply(send, self.group)
+            return recv.permute(1, 2, 0, 3, 4).reshape(lbs, lseq, self.local_nh, hd)
+
+        q = scatter_heads(q)
+        k = scatter_heads(k)
+        v = scatter_heads(v)
+        return torch.cat((q, k, v), dim=2).reshape(lbs, lseq, -1)
+
     def _attn_forward(self, qkv, grid, lbs, lseq):
-        """Attention via FA4 — qkv already normed + A2A'd by _pre_forward."""
+        """Pure torch SDPA, shared by baseline and POST-only variant."""
         ln = self.local_n
         nh, hd = self.local_nh, self.head_dim
         q = qkv[:, :, :ln].view(lbs, lseq, nh, hd).contiguous()
-        k = qkv[:, :, ln:2*ln].view(lbs, lseq, nh, hd).contiguous()
-        v = qkv[:, :, 2*ln:3*ln].view(lbs, lseq, nh, hd).contiguous()
-        q = rope_apply(q, grid, self.model.freqs).to(torch.bfloat16)
-        k = rope_apply(k, grid, self.model.freqs).to(torch.bfloat16)
-        from flash_attn.cute import flash_attn_func
-        o = flash_attn_func(q, k, v, softmax_scale=self.scale, causal=self.cfg.causal)
-        return o[0] if isinstance(o, tuple) else o
-
-    def _pre_forward(self, x_local, llseq):
-        raise NotImplementedError
+        k = qkv[:, :, ln:2 * ln].view(lbs, lseq, nh, hd).contiguous()
+        v = qkv[:, :, 2 * ln:3 * ln].view(lbs, lseq, nh, hd).contiguous()
+        q = rope_apply(q, grid, self.model.freqs).to(torch.bfloat16).transpose(1, 2)
+        k = rope_apply(k, grid, self.model.freqs).to(torch.bfloat16).transpose(1, 2)
+        v = v.transpose(1, 2)
+        o = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=self.cfg.causal, scale=self.scale)
+        return o.transpose(1, 2).contiguous()
 
     def _post_forward(self, o, **kw):
         raise NotImplementedError
