@@ -64,17 +64,38 @@ backward 读 `slots_x[:sp]` 做 weight grad 时，实际读的是物理偏移 40
 
 **实测发现**：backward 正确性 bX_rel=0.2572（FAIL），说明 AG+GEMM kernel 读到了错误的数据。
 
-### 根因
+### 初步（错误）假设
 
-1. **RS 的 `partial` 区域在 forward 写入后，没有清零**
-2. **AG 的 comm kernel 往 `local_x` (offset 32) 写 grad_y**，覆盖了 RS `partial[0]` 的数据
-3. **AG 的 comm kernel 往 `slots_x` (offset 40MB) 写其他 rank 的 grad_y**，这恰好对应 RS 的 `partial[1:]` 区域
-4. 但 **AG 的 `slots_x[0]` 在 offset 40MB，而 RS 的 `partial[0]` 在 offset 32** — `slots_x[0]` 实际上落在了 RS `partial[1]` 的位置
-5. weight grad 读 `slots_x[:sp]` 得到的是 `partial[1:sp+1]`，但 `partial[sp]` 越界！
+早先怀疑是「两个 layout 数据区起始偏移不同（差 40MB 的 `local_x` 前缀），不能直接共享 raw buffer」。
+**该假设已被推翻**：`UnifiedSymmBuffer` 实测证明单物理 buffer 可安全服务 fwd/bwd——fwd/bwd 不并发，各自按自己 layout 算 TMA 偏移，offset 差在单 pass 复用下无害。
+
+### 真正的根因（已定位并修复）
+
+unified buffer 在**所有层的 fwd GEMM-RS 与 bwd AG-GEMM 之间跨 pass 复用**同一块对称内存。
+GEMM-RS 与 AG-GEMM 各自依赖 buffer 开头的 **+1/-1 握手信号区 `[0,32)`** 及 AG 的 **`slot_state` 就绪标志**（kernel 用 `ld_acq_sys` 轮询）。
+若不复位，前一次 op 留下的脏信号/slot 字节会让后一个 kernel 的 handshake 读到过期值 →
+gather/AG 非确定性错乱 → `grad_X rel` 偶发抖动（0.25 / 0.44 / 0.63），且**并非随机垃圾而是稳定偏大**，指向 slot 就绪信号在 comm stream 未 flush 就被 memset 竞态。
+
+### 修复（对齐 `tests/comm/test_unified_buffer.py` Test 6，并加固）
+
+在 `GemmRSFunction.forward`（GEMM-RS 前）与 `.backward`（AG-GEMM 前）都插入：
+
+```
+group.barrier()
+torch.cuda.synchronize()   # 强制 flush symm_mem comm stream，避免跨流竞态
+sym_buffer.buffer.zero_()  # 清 barrier 信号区 + slot_state + 数据区
+torch.cuda.synchronize()
+group.barrier()
+torch.cuda.synchronize()   # ← 关键：二次 sync 确保 comm stream 完全 flush 后再让 kernel 启动
+```
+
+**关键点**：仅 `barrier + zero_()`（如 Test 6）仍有 ~1/3 偶发失败；必须额外一道 `synchronize()`
+强制 flush comm stream，才能消除 slot_state 的跨流竞态。
 
 ### 结论
 
-**不能直接共享 raw buffer**，因为两个 layout 的数据区起始偏移不同（差 40MB 的 `local_x` 前缀）。
+**可以共享单块物理 buffer**（unified buffer 已落地）。所谓「偏移差 40MB」不是障碍；
+真正要守住的是**每次在同一 buffer 上启动新 kernel 前，先 barrier+sync+zero_+sync+barrier+sync 复位握手/就绪区**。
 
 ## 可能的解决方案
 
@@ -148,4 +169,12 @@ backward 读 `slots_x[:sp]` 做 weight grad 时，实际读的是物理偏移 40
 - `GemmRSFunction.forward` 用该 buffer 跑 GEMM+RS；`backward` 用 `sym_buffer.ag_x` 写 grad_y、调 `bf16_ag_gemm_nt(sym_buffer, ...)` 跑 AG+GEMM、从 `sym_buffer.ag_slots_x` 读 gathered grad_y 算权重梯度。
 - 跨层通过 `share_buffers_from` 共享**同一个** buffer（destroy 时只 destroy 一次）。
 
-**状态**：`py_compile` 通过，但本机无 GPU，**尚未在 B300 上跑 2 卡 verify 确认 bX_rel 仍 PASS**——这是迁移前 SYM_BUF_SHARING 的唯一失败模式，上线前必须重跑。
+**状态（2026-07-17 已验证）**：本机即 **B300 SXM6 ×8**（CUDA 13.0），2 卡 `examples/debug_var_bwd.py` 实跑
+（`DG_JIT_USE_NVRTC=1`），连跑 4/4 全部 PASS：
+
+- `grad_X rel (serial vs var)` ≈ **0.000000–0.000002**（迁移前唯一失败模式 0.2572 已消失）
+- `fwd rel (serial vs var)` ≈ **0.0026**（≤ 预期 ~0.028）
+- 退出码 0，无 SIGABRT（teardown 时在 `destroy_process_group()` 前显式 `destroy_buffers()` 释放 unified buffer，避免 `~CUDASymmetricMemory` 析构时序崩）
+
+注意：`debug_var_bwd.py` 的 rel 在**修复前不稳定**（0.44/0.63 抖动），正是脏 signal/slot_state 竞态
+的直接证据；加固同步后稳定归零。上线前建议在其他 seq/bs 配置下再抽测一次。

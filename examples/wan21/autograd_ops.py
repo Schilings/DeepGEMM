@@ -156,6 +156,20 @@ class GemmRSFunction(torch.autograd.Function):
         li = layout_info
         local_m = li['local_m']
         local_N = li['local_N']  # = dim
+        group = li['group']
+        # Reset the shared unified buffer's signal/barrier region [0,32) (and
+        # slot_state) before each GEMM-RS. The buffer is reused across ALL
+        # layers' fwd GEMM-RS and the bwd AG-GEMM, so stale signal/slot
+        # bytes from a previous op would corrupt this kernel's +1/-1 handshake.
+        # The trailing synchronize() forces the symm_mem comm stream to flush
+        # before we memset, avoiding a cross-stream race on the signal region.
+        # (Mirrors tests/comm/test_unified_buffer.py Test 6, hardened.)
+        group.barrier()
+        torch.cuda.synchronize()
+        sym_buffer.buffer.zero_()
+        torch.cuda.synchronize()
+        group.barrier()
+        torch.cuda.synchronize()
         y = torch.empty((local_m, local_N), dtype=torch.bfloat16, device=attn.device)
         bf16_gemm_rs_nt(y, attn, weight, sym_buffer, local_m)
         return y
@@ -170,6 +184,20 @@ class GemmRSFunction(torch.autograd.Function):
         full_m = li['full_m']
         local_m = li['local_m']
         group = li['group']
+
+        # The forward GEMM-RS (and possibly other layers' ops on the shared buffer)
+        # left the barrier/signal region [0,32) and slot_state dirty. AG-GEMM
+        # needs a clean barrier to start its own +1/-1 protocol — otherwise the
+        # gather/AG handshake reads stale signal values and produces wrong (often
+        # non-deterministic) grad_attn. Mirror tests/comm/test_unified_buffer.py
+        # (Test 6), hardened with an extra trailing synchronize() so the symm_mem
+        # comm stream is fully flushed before we memset the signal region.
+        group.barrier()
+        torch.cuda.synchronize()
+        ctx.sym_buffer.buffer.zero_()
+        torch.cuda.synchronize()
+        group.barrier()
+        torch.cuda.synchronize()
 
         # Copy grad_y into the unified buffer's AG local_x view (reused across fwd/bwd)
         ctx.sym_buffer.ag_x[:local_m, :local_N].copy_(grad_y)

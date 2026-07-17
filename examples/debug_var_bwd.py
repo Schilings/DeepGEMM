@@ -45,6 +45,10 @@ def run(rank, ng, port):
         yv2 = var(X_local, grid, llseq)
         frel = (ys2.float() - yv2.float()).norm().item() / (ys2.float().norm().item() + 1e-12)
     print(f'[r{rank}] fwd rel (serial vs var): {frel:.6f}', flush=True)
+    # Release symmetric buffers BEFORE tearing down the process group, otherwise
+    # CUDASymmetricMemory is destroyed after NCCL comms -> "CUDA driver error".
+    var.destroy_buffers()
+    serial.destroy_buffers()
     dist.destroy_process_group()
 
 if __name__ == '__main__':
