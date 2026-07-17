@@ -45,6 +45,13 @@ sym = get_unified_symm_buffer(group, bs, seq, hidden)
 - **修复**：Test 3/6 GEMM-RS 维度（total_m=bs*seq, tokens_per_rank=bs*local_seq）
 - 分支 `feat/fused-qkv-norm-a2a`
 
+### 2026-07-17：wan21 例子迁移到 unified buffer
+
+- `examples/wan21` 的 `GemmRSFunction` + `fused_variant.py` 已从旧两独立 buffer 迁到单个 `get_unified_symm_buffer`：fwd GEMM+RS、bwd AG+GEMM 共用同一块物理 buffer，跨层经 `share_buffers_from` 共享。
+- 动机：用户要求「全局所有层、一个固定大小 buffer、fwd/bwd 都复用，不增加多余开销和显存」——这正是 `UnifiedSymmBuffer` 的设计。
+- 实现细节见 `docs/SYM_BUF_SHARING_ANALYSIS.md` 2026-07-17 节。
+- **待办**：B300 上跑 2 卡 `verify_wan21_attn.py` 确认 fused_var 的 bX_rel 仍 PASS（本机无 GPU，未验证）。
+
 ---
 
 ## Wan2.1 14B Ulysses SP Attention Benchmark（2026-06-30 新增）

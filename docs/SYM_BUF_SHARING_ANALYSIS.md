@@ -129,3 +129,23 @@ backward 读 `slots_x[:sp]` 做 weight grad 时，实际读的是物理偏移 40
 - **1 层时 fused_var 反而省显存**（-614MB）：sym_buf 被Wo省的权重+梯度+Adam 摊薄
 - **多层时 gap 随层线性增长**：每层 weight grad matmul 临时 293MB 累积
 - **根因是 GEMM+RS 架构固有**：Wo 权重梯度需要 full grad_y（`[full_m, dim]`），而 serial 只需 local（`[lm, dim]`）
+
+## 2026-07-17 更新：UnifiedSymmBuffer 已解决单 buffer fwd+bwd 复用
+
+`deep_gemm/unified_buffer/UnifiedSymmBuffer`（`get_unified_symm_buffer`）实现了本文档想要的「单物理 buffer 服务所有算子」。对 GEMM-RS(fwd) 与 AG-GEMM(bwd)：
+
+- **一块** `symm_mem.empty(max(rs_bytes, ag_bytes))` 物理分配，rendezvous **一次**（消除每层每步毫秒级开销）。
+- fwd 用 RS 视图（`partial` @ offset 32）；bwd 用 AG 视图（`ag_x` @ 32 / `ag_slots_x` @ 32+sp*M*H*2），两者在**同一块物理内存**上 reinterpret。
+- fwd/bwd **不并发**（整轮 forward 跑完才进 backward，每层顺序执行），故物理内存可安全复用，无交叉读——之前「offset 差 40MB」的分析在本方案下不构成问题（kernel 各自按自己 layout 算偏移，且不会读到对方 pass 的数据）。
+- 已通过 `tests/comm/test_unified_buffer.py`（2/8 卡 GEMM-RS + AG-GEMM 7/7 PASS）。
+
+### wan21 迁移（2026-07-17）
+
+`examples/wan21` 的 `GemmRSFunction`（`autograd_ops.py`）+ `fused_variant.py` 已从旧的两独立 buffer
+（`GemmRSSymmBuffer` + `BF16AGGemmSymmBuffer`）迁移到单个 unified buffer：
+
+- `fused_variant._create_buffers` 只建 `self.sym_post = get_unified_symm_buffer(group, bs, seq, dim)`（num_max_tokens_per_rank = bs*(seq//sp) == self.local_m，正好等于 gemm_rs 调用传的 local_m）。
+- `GemmRSFunction.forward` 用该 buffer 跑 GEMM+RS；`backward` 用 `sym_buffer.ag_x` 写 grad_y、调 `bf16_ag_gemm_nt(sym_buffer, ...)` 跑 AG+GEMM、从 `sym_buffer.ag_slots_x` 读 gathered grad_y 算权重梯度。
+- 跨层通过 `share_buffers_from` 共享**同一个** buffer（destroy 时只 destroy 一次）。
+
+**状态**：`py_compile` 通过，但本机无 GPU，**尚未在 B300 上跑 2 卡 verify 确认 bX_rel 仍 PASS**——这是迁移前 SYM_BUF_SHARING 的唯一失败模式，上线前必须重跑。

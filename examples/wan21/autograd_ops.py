@@ -128,6 +128,12 @@ def a2a_transpose_gemm(o, weight, sym_buffer, layout_info):
 class GemmRSFunction(torch.autograd.Function):
     """GEMM + Reduce-Scatter (Ulysses post-attn variant). Dual backward = AG + GEMM.
 
+    Uses a SINGLE UnifiedSymmBuffer (deep_gemm.get_unified_symm_buffer) shared
+    across all layers and reused for both passes:
+      - forward  (GEMM+RS)  uses the unified buffer's GEMM-RS workspace (partial@32)
+      - backward (AG+GEMM) uses the unified buffer's AG views (.ag_x / .ag_slots_x)
+    The two passes never run concurrently, so the one physical buffer is safe to reuse.
+
     Forward:  attn[full_m, local_hidden] @ Wo_r[dim, local_hidden].t()  →  RS  →  y[local_m, dim]
         bf16_gemm_rs_nt(y, a=attn, b=Wo_r, sym_buffer, local_m)
             a: [total_M, K] = [full_m, local_hidden]
@@ -136,15 +142,15 @@ class GemmRSFunction(torch.autograd.Function):
 
     Backward: grad_y[local_m, dim]  →  AG  →  grad_y_full[full_m, dim]  →  @ Wo_r  →  grad_attn[full_m, local_hidden]
         bf16_ag_gemm_nt(d=grad_attn, b=Wo_r.t(), sym_buffer, local_m)
-            x = grad_y [tokens_per_rank, K] = [local_m, dim]
+            x = grad_y [tokens_per_rank, K] = [local_m, dim]  (sym_buffer.ag_x)
             b: [N, K] = [local_hidden, dim]              (Wo_r_local.t() — NT layout)
             d: [full_M, N] = [full_m, local_hidden]
+        grad_y_full = sym_buffer.ag_slots_x[:sp, :local_m, :local_N].reshape(full_m, local_N)
     """
 
     @staticmethod
-    def forward(ctx, attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
+    def forward(ctx, attn, weight, sym_buffer, layout_info):
         ctx.sym_buffer = sym_buffer
-        ctx.sym_buffer_bwd = sym_buffer_bwd
         ctx.layout_info = layout_info
         ctx.save_for_backward(attn, weight)
         li = layout_info
@@ -165,25 +171,26 @@ class GemmRSFunction(torch.autograd.Function):
         local_m = li['local_m']
         group = li['group']
 
-        # Copy grad_y into AG sym buffer (x = grad_y, [local_m, dim])
-        ctx.sym_buffer_bwd.x[:local_m, :local_N].copy_(grad_y)
+        # Copy grad_y into the unified buffer's AG local_x view (reused across fwd/bwd)
+        ctx.sym_buffer.ag_x[:local_m, :local_N].copy_(grad_y)
 
         # AG + GEMM: grad_attn = AG(grad_y) @ Wo_r_local
         #   b for bf16_ag_gemm_nt = [N, K] = [local_hidden, dim] = weight.t()
         weight_t = weight.t().contiguous()  # [local_hidden, dim]
         grad_attn = torch.empty((full_m, local_hidden), dtype=torch.bfloat16, device=grad_y.device)
-        bf16_ag_gemm_nt(grad_attn, weight_t, ctx.sym_buffer_bwd, local_m)
+        bf16_ag_gemm_nt(grad_attn, weight_t, ctx.sym_buffer, local_m)
 
-        # Weight grad: reuse gathered grad_y from sym_buf slots (already populated by AG+GEMM comm kernel)
+        # Weight grad: reuse gathered grad_y from the unified buffer's AG slots_x
+        # (already populated by the AG+GEMM comm kernel).
         # grad_W = grad_y_full.T @ attn  = [dim, full_m] @ [full_m, local_hidden] = [dim, local_hidden]
         # To avoid matmul internal copy of grad_y_full.T (335MB), use:
         #   grad_W.T = attn.T @ grad_y_full  = [local_hidden, full_m] @ [full_m, dim] = [local_hidden, dim]
         #   then grad_W = (attn.T @ grad_y_full).T
-        grad_y_full = ctx.sym_buffer_bwd.slots_x[:sp, :local_m, :local_N].reshape(full_m, local_N)
+        grad_y_full = ctx.sym_buffer.ag_slots_x[:sp, :local_m, :local_N].reshape(full_m, local_N)
         grad_weight = torch.matmul(attn.t(), grad_y_full).t().contiguous()
 
-        return grad_attn, grad_weight, None, None, None
+        return grad_attn, grad_weight, None, None
 
 
-def gemm_rs(attn, weight, sym_buffer, sym_buffer_bwd, layout_info):
-    return GemmRSFunction.apply(attn, weight, sym_buffer, sym_buffer_bwd, layout_info)
+def gemm_rs(attn, weight, sym_buffer, layout_info):
+    return GemmRSFunction.apply(attn, weight, sym_buffer, layout_info)

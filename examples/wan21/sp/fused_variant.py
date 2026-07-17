@@ -11,8 +11,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from deep_gemm.gemm_rs import get_symm_buffer_for_gemm_rs, GemmRSSymmBuffer
-from deep_gemm.ag_gemm import get_symm_buffer_for_bf16_ag_gemm, BF16AGGemmSymmBuffer
+from deep_gemm import get_unified_symm_buffer
 
 from .base import UlyssesBase
 from .serial import NCCLAllToAll
@@ -41,32 +40,32 @@ class FusedVariantUlysses(UlyssesBase):
         self._wo_sharded = True  # Wo grad is local (no FSDP2 sync)
 
     def _create_buffers(self):
-        """Create symmetric buffers for GEMM+RS (forward) and AG+GEMM (backward).
+        """Create ONE unified symmetric buffer shared by GEMM+RS (fwd) and AG+GEMM (bwd).
 
-        NOTE: Cannot share a single buffer because GEMM+RS and AG+GEMM have
-        different layout structures (offsets don't align). RS's partial[r]
-        starts at offset 32 (after barrier), but AG's local_x starts at 32 and
-        slots_x starts at 32 + local_x_size — a 40MB offset mismatch.
-        See docs/SYM_BUF_SHARING_ANALYSIS.md for details.
+        Uses `deep_gemm.get_unified_symm_buffer`: a single fixed-size symmetric
+        allocation sized to the largest operator's needs. GEMM+RS (fwd) and
+        AG+GEMM (bwd) reinterpret the same physical data region via dual views
+        (RS `partial` vs AG `ag_x`/`ag_slots_x`). They never run concurrently
+        (fwd pass fully completes before bwd), so the one buffer is safely
+        reused across all layers and both passes — no extra overhead or memory.
+        See deep_gemm/unified_buffer/__init__.py and docs/SYM_BUF_SHARING_ANALYSIS.md.
         """
         dim = self.cfg.dim
-        local_m = self.local_m
-
-        self.sym_post = get_symm_buffer_for_gemm_rs(
-            self.group, local_m, dim, out_dtype=torch.bfloat16
-        )
-        self.sym_post_bwd = get_symm_buffer_for_bf16_ag_gemm(
-            self.group, local_m, dim
+        # num_max_tokens_per_rank = bs * (seq // sp) == self.local_m, so the
+        # buffer is sized exactly for the gemm_rs call's token-per-rank.
+        self.sym_post = get_unified_symm_buffer(
+            self.group, self.bs, self.seq, dim,
+            out_dtype=torch.bfloat16,
         )
 
     def share_buffers_from(self, other):
-        """Reuse sym_bufs from another strategy instance (for multi-layer models)."""
+        """Reuse the single unified buffer from another strategy instance (multi-layer)."""
         self.sym_post = other.sym_post
-        self.sym_post_bwd = other.sym_post_bwd
 
     def destroy_buffers(self):
+        if self.sym_post is not None:
+            self.sym_post.destroy()
         self.sym_post = None
-        self.sym_post_bwd = None
 
     def _pre_forward(self, x_local, llseq):
         """PRE: GEMM → split Q/K/V → norm → A2A scatter heads → gather seq."""
@@ -112,6 +111,7 @@ class FusedVariantUlysses(UlyssesBase):
         }
 
         # Fused GEMM + RS: y = RS(attn @ Wo_r.t()) → [local_m, dim]
-        y = gemm_rs(attn_local, self.Wo_r_local, self.sym_post, self.sym_post_bwd, layout_info)
+        # Uses the single unified buffer (fwd GEMM+RS view).
+        y = gemm_rs(attn_local, self.Wo_r_local, self.sym_post, layout_info)
         # Add bias (after RS, each rank has local_m tokens)
         return y + self.model.o.bias
