@@ -26,7 +26,7 @@ python examples/verify_wan21_14b_full.py
 - 下载全部 6 shards（1095 keys，14.29B params）
 - 权重 key 100% 对齐官方 checkpoint
 - 完整 forward: `[C=16, F=4, H=64, W=64]` → `[C=16, F=4, H=64, W=64]` PASS
-- 输出: mean=0.079, std=0.137, norm=81.0
+- 2026-07-19 BF16 实测输出: mean=0.072576, std=0.133118, norm=77.6277
 
 ### 对齐官方的关键点
 
@@ -51,17 +51,28 @@ dim=5120, num_heads=40, head_dim=128, ffn_dim=13824, num_layers=40
 patch_size=(1,2,2), text_len=512, in_dim=16, freq_dim=256, text_dim=4096, out_dim=16
 ```
 
-## SP Bench + FSDP2
+## 官方 14B 权重训练核心吞吐
 
 ```bash
-# 8 GPU bench with FSDP2 (fully_shard)
-DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python examples/bench_wan21_fsdp2.py 8 10
-
-# 2 GPU verify
-DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD python examples/bench_wan21_fsdp2.py 2 3 --verify --strategies serial,fused_std
+DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD/examples:$PWD \
+python examples/ulysses_variant/bench_wan21_14b_train.py 8 \
+  --layers 40 --seq 8192 --warmup 2 --iters 5 \
+  --strategies serial,fused_var --sync-mode manual
 ```
 
-### 已知问题
+该入口默认下载/加载官方权重；只有显式传 `--synthetic` 才使用随机权重。它运行 40 个完整 Transformer block（14.056B 参数），只排除 patch/text/time embedding、输出 head 和 optimizer step。
 
-- **fwd_rel=0.9939**：SP bench 的 forward verify 失败，因为 `build_wqkv_rankmajor` 重组权重后 `_attn_forward` 的 qkv split 顺序和 reference 不一致。这是 SP 策略的固有特性（rank-major 排列为了 fused A2A scatter），不是 bug。backward 正确（bX_rel=0.0017）说明数学是对的。
-- **fused_var verify**：fused_var 的 `_post_backward`（AG-GEMM）有 pre-existing bug（bX_rel~1.2），与 PRE BWD 融合无关。
+B300×8、SP=8、8K 实测：
+
+| Sync | Baseline | Variant | Variant/Baseline |
+|---|---:|---:|---:|
+| manual bucketed | 24,530.1 tok/s | 23,285.0 tok/s | 0.9492x (-5.08%) |
+| DDP overlapped | 27,175.8 tok/s | 25,851.0 tok/s | 0.9513x (-4.87%) |
+
+注意：当前 AG-GEMM backward 为修复输入发布竞态，每层仍含两次 device sync 和一次 host group barrier；上述训练吞吐包含该正确性 workaround，并非纯 kernel 上限。
+
+### SP 梯度同步语义
+
+- baseline 所有复制参数（包括完整 Wo）都需要跨 SP reduce。
+- variant 除 `Wo_r_local` 外的参数仍需跨 SP reduce；Wo 每个 rank 持有不同输入列 shard，backward 已 AG 完整 `grad_y`，因此本地 dW 已完整且不能在 SP group 互相归约。
+- 若存在 DP，Wo shard 仍需在相同 SP 坐标的 DP group 同步。普通 DDP 应用于 DP group；实验的 SP-DDP 模式会显式排除 `_sp_sharded` Wo。

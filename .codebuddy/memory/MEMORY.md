@@ -1,10 +1,12 @@
 # DeepGEMM 项目长期记忆
 
 ## 当前进度（2026-07-19，Wan2.1 Ulysses POST 变体）
-- **状态：显存消融已闭环，结论为「变体显著省显存」。** 详见 `memory/2026-07-19.md`。
+- **状态：显存与真实 14B 权重训练核心吞吐均已实测。** 详见 `memory/2026-07-19.md`。
 - 严格两臂：baseline=纯 torch 同步 Ulysses + FA4（无融合算子）；variant=只换 POST 为 GEMM-RS/AG-GEMM。两臂 PRE/RoPE/attention 共用同一代码且都用 FA4。
 - 关键坑：本机 8 卡 = `SP=8, DP=1`，**不能把 SP group 当 FSDP group**（否则 baseline Wo 被切 1/8 抹掉收益）。
-- 实测：B300×8、40 层、BF16+FP32 Adam → 8K 省 9.9 GiB(20.6%)，32K 省 9.6 GiB(14.0%)。
+- 显存实测（attention stack + FP32 Adam）：B300×8、40 层 → 8K 省 9.9 GiB(20.6%)，32K 省 9.6 GiB(14.0%)。
+- 真实权重吞吐：官方 checkpoint 严格加载 40 blocks/1080 tensors/14.056B params，8K 手动 SP sync 时 variant 23,285 vs baseline 24,530 tokens/s（**-5.08%**）；修正条件一致性和 Wo 梯度尺度后的 DDP 重叠口径 **-4.87%**。
+- SP 梯度：所有复制参数都需跨 SP reduce；variant 只有 `Wo_r_local` 不做 SP reduce，因为其 backward 已 AG 完整 `grad_y` 且各 rank 持有不同输入列 shard。若有 DP，Wo 仍需在对应 DP group 同步。
 - `autograd_ops.py` 已是 DeepEP 风格 `FusedPostLinearFunction`；AG 发布竞态用 device-sync+barrier+device-sync 修（grad_X rel=0），待下沉为纯 NVLink barrier。
 
 ## 约定（用户偏好）

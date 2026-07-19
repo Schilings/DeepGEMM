@@ -16,6 +16,70 @@ Usage in bench:
 
 import torch
 import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+
+def _all_reduce_bucket(grads, group, average):
+    if not grads:
+        return
+    flat = _flatten_dense_tensors(grads)
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
+    if average:
+        flat.div_(dist.get_world_size(group))
+    for grad, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+        grad.copy_(synced)
+
+
+def sync_replicated_grads(module, group, bucket_cap_mb=64.0, average=False):
+    """Synchronize replicated SP parameters and leave native SP shards local.
+
+    Standard Ulysses parameters receive partial-sequence gradients and therefore
+    need a reduction across the SP group. Parameters tagged ``_sp_sharded`` own
+    distinct logical shards on different ranks and must not be reduced together.
+    Large gradients are reduced in place; smaller gradients are packed into
+    bounded buckets to avoid one model-sized temporary allocation.
+    """
+    cap_bytes = max(1, int(bucket_cap_mb * 1024 * 1024))
+    buckets = {}
+    bucket_bytes = {}
+    synced_elements = 0
+    sharded_elements = 0
+
+    def flush(key):
+        grads = buckets.get(key, [])
+        _all_reduce_bucket(grads, group, average)
+        buckets[key] = []
+        bucket_bytes[key] = 0
+
+    for parameter in module.parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        if getattr(parameter, "_sp_sharded", False):
+            sharded_elements += parameter.numel()
+            continue
+        if grad.is_sparse:
+            raise TypeError("Sparse gradients are not supported by SP synchronization")
+        grad = grad.detach()
+        synced_elements += grad.numel()
+        num_bytes = grad.numel() * grad.element_size()
+        key = (grad.device, grad.dtype)
+        buckets.setdefault(key, [])
+        bucket_bytes.setdefault(key, 0)
+        if num_bytes >= cap_bytes:
+            flush(key)
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+            if average:
+                grad.div_(dist.get_world_size(group))
+            continue
+        if bucket_bytes[key] + num_bytes > cap_bytes:
+            flush(key)
+        buckets[key].append(grad)
+        bucket_bytes[key] += num_bytes
+
+    for key in list(buckets):
+        flush(key)
+    return synced_elements, sharded_elements
 
 
 def sync_grads(strat, group):

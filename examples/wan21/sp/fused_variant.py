@@ -42,6 +42,7 @@ class FusedVariantUlysses(UlyssesBase):
         full_weight = self.model.o.weight.detach()
         local_weight = full_weight[:, rank * local_hidden:(rank + 1) * local_hidden]
         self.Wo_r_local = nn.Parameter(local_weight.contiguous(), requires_grad=True)
+        self.Wo_r_local._sp_sharded = True
         self.model.o.register_parameter('weight', None)
         self._wo_sharded = True
 
