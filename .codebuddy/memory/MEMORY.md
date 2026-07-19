@@ -1,5 +1,12 @@
 # DeepGEMM 项目长期记忆
 
+## 当前进度（2026-07-19，Wan2.1 Ulysses POST 变体）
+- **状态：显存消融已闭环，结论为「变体显著省显存」。** 详见 `memory/2026-07-19.md`。
+- 严格两臂：baseline=纯 torch 同步 Ulysses + FA4（无融合算子）；variant=只换 POST 为 GEMM-RS/AG-GEMM。两臂 PRE/RoPE/attention 共用同一代码且都用 FA4。
+- 关键坑：本机 8 卡 = `SP=8, DP=1`，**不能把 SP group 当 FSDP group**（否则 baseline Wo 被切 1/8 抹掉收益）。
+- 实测：B300×8、40 层、BF16+FP32 Adam → 8K 省 9.9 GiB(20.6%)，32K 省 9.6 GiB(14.0%)。
+- `autograd_ops.py` 已是 DeepEP 风格 `FusedPostLinearFunction`；AG 发布竞态用 device-sync+barrier+device-sync 修（grad_X rel=0），待下沉为纯 NVLink barrier。
+
 ## 约定（用户偏好）
 - **工作记忆存放在本仓库内** `DeepGEMM/.codebuddy/memory/`，随 git 一起 commit & push（2026-06-28 用户明确要求）。
   - 与 DeepGEMM 相关的工作记录（日报 `YYYY-MM-DD.md`、本 `MEMORY.md`）都写在这里，不再放全局 `~/.local/codebuddy/.codebuddy/memory/`。
