@@ -53,5 +53,6 @@ def run(rank, ng, port):
 
 if __name__ == '__main__':
     import socket
+    ng = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     s = socket.socket(); s.bind(('',0)); port = s.getsockname()[1]; s.close()
-    mp.spawn(run, args=(2, port), nprocs=2, join=True)
+    mp.spawn(run, args=(ng, port), nprocs=ng, join=True)

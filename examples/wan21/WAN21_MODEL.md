@@ -66,10 +66,10 @@ B300×8、SP=8、8K 实测：
 
 | Sync | Baseline | Variant | Variant/Baseline |
 |---|---:|---:|---:|
-| manual bucketed | 24,530.1 tok/s | 23,285.0 tok/s | 0.9492x (-5.08%) |
-| DDP overlapped | 27,175.8 tok/s | 25,851.0 tok/s | 0.9513x (-4.87%) |
+| manual bucketed | 24,486.2 tok/s | 23,988.2 tok/s | 0.9797x (-2.03%) |
+| DDP overlapped（最终 wall-clock） | 29,249.9 tok/s | 28,193.0 tok/s | 0.9639x (-3.61%) |
 
-注意：当前 AG-GEMM backward 为修复输入发布竞态，每层仍含两次 device sync 和一次 host group barrier；上述训练吞吐包含该正确性 workaround，并非纯 kernel 上限。
+最终口径使用 warmup=3、iters=10、同步后的 rank-max wall-clock，并用两个 symmetric-memory 设备端 barrier 分别保证 AG 输入发布和 peer 消费完成；SP=8 数值验证 `grad_X rel=0`。剩余差距主要来自 AG 通信本体：每 rank 单向远端 payload 为 70 MiB，而 baseline A2A 为 8.75 MiB，正好 8×。
 
 ### SP 梯度同步语义
 

@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Optional, Tuple
 
@@ -191,14 +192,31 @@ def bf16_ag_gemm_nt_with_input(d: torch.Tensor,
     local_x[:num_tokens, :a.shape[1]].copy_(a)
 
     # The C++ communication stream may immediately pull remote ``local_x``.
-    # Publish every rank's staged input before any rank starts that pull.  This
-    # is the only cross-rank synchronization required here; slot_state is reset
-    # internally and the large data region must not be memset between calls.
-    torch.cuda.synchronize(a.device)
-    sym_buffer.group.barrier()
-    torch.cuda.synchronize(a.device)
+    # Publish every rank's staged input before any rank starts that pull.  The
+    # symmetric-memory barrier is stream ordered and avoids draining unrelated
+    # CUDA/NCCL streams.  Keep the old host fence as a diagnostic fallback.
+    publish_sync = os.getenv('DG_AG_PUBLISH_SYNC', 'symm')
+    if publish_sync == 'symm':
+        sym_buffer.handle.barrier()
+    elif publish_sync == 'host':
+        torch.cuda.synchronize(a.device)
+        sym_buffer.group.barrier()
+        torch.cuda.synchronize(a.device)
+    elif publish_sync != 'none':
+        raise ValueError(f'Unknown DG_AG_PUBLISH_SYNC={publish_sync!r}')
 
     bf16_ag_gemm_nt(d, b, sym_buffer, num_tokens, compiled_dims)
+
+    # The next layer reuses and overwrites ``local_x``.  The launcher waits for
+    # this rank's pulls, but peers may still be reading our input.  Confirm that
+    # every rank has completed its pulls before allowing workspace reuse.
+    if publish_sync == 'symm':
+        sym_buffer.handle.barrier()
+    elif publish_sync == 'host':
+        torch.cuda.synchronize(a.device)
+        sym_buffer.group.barrier()
+        torch.cuda.synchronize(a.device)
+
     return slots_x[:sym_buffer.group.size(), :num_tokens, :a.shape[1]].reshape(
         sym_buffer.group.size() * num_tokens, a.shape[1])
 

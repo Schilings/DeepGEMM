@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import timedelta
 
 import torch
@@ -92,6 +93,8 @@ def _run_iteration(train_model, raw_model, x_seed, grad_output, e, grid, context
     x_local = x_seed.detach().requires_grad_(True)
 
     if measure:
+        torch.cuda.synchronize()
+        wall_start = time.perf_counter()
         total_start = torch.cuda.Event(enable_timing=True)
         fwd_start = torch.cuda.Event(enable_timing=True)
         fwd_end = torch.cuda.Event(enable_timing=True)
@@ -119,11 +122,13 @@ def _run_iteration(train_model, raw_model, x_seed, grad_output, e, grid, context
     if measure:
         sync_end.record()
         torch.cuda.synchronize()
+        wall_ms = (time.perf_counter() - wall_start) * 1000.0
         return (
             fwd_start.elapsed_time(fwd_end),
             fwd_end.elapsed_time(bwd_end),
             bwd_end.elapsed_time(sync_end),
             total_start.elapsed_time(sync_end),
+            wall_ms,
         )
     torch.cuda.synchronize()
     return None
@@ -159,10 +164,11 @@ def run(rank, world_size, port, args, checkpoint_dir):
                          dtype=torch.bfloat16, generator=generator)
     grad_output = torch.randn(local_seq, config.dim, device=device,
                               dtype=torch.float32, generator=generator)
+    condition_generator = torch.Generator(device=device).manual_seed(5678)
     e = torch.randn(1, 6, config.dim, device=device,
-                    dtype=torch.float32, generator=generator) * 0.01
+                    dtype=torch.float32, generator=condition_generator) * 0.01
     context = torch.randn(1, 512, config.dim, device=device,
-                          dtype=torch.bfloat16, generator=generator) * 0.02
+                          dtype=torch.bfloat16, generator=condition_generator) * 0.02
 
     results = {}
     for strategy in args.strategies.split(","):
@@ -210,7 +216,7 @@ def run(rank, world_size, port, args, checkpoint_dir):
             dist.barrier(group)
 
         torch.cuda.reset_peak_memory_stats(device)
-        accumulated = [0.0, 0.0, 0.0, 0.0]
+        accumulated = [0.0, 0.0, 0.0, 0.0, 0.0]
         for _ in range(args.iters):
             dist.barrier(group)
             local_times = _run_iteration(
@@ -224,15 +230,15 @@ def run(rank, world_size, port, args, checkpoint_dir):
         peak_mb = torch.cuda.max_memory_allocated(device) / 1024**2
         peak_mb += raw_model.sym_buffer_bytes() / 1024**2
         peak_mb = _max_across_ranks([peak_mb], group, device)[0]
-        throughput = args.seq / (times[3] / 1000.0)
+        throughput = args.seq / (times[4] / 1000.0)
         results[strategy] = (times, throughput, peak_mb, replicated, sharded)
 
         if rank == 0:
-            fwd, bwd, sync, total = times
+            fwd, bwd, sync, total, wall = times
             sync_label = "overlapped in BWD" if args.sync_mode == "ddp" else f"{sync:.2f} ms"
             print(
                 f"{strategy:<10} fwd={fwd:>9.2f} ms  bwd={bwd:>9.2f} ms  "
-                f"sync={sync_label:>18}  total={total:>9.2f} ms  "
+                f"sync={sync_label:>18}  cuda={total:>9.2f} ms  wall={wall:>9.2f} ms  "
                 f"tokens/s={throughput:>10.1f}  peak={peak_mb:>10.1f} MiB",
                 flush=True,
             )

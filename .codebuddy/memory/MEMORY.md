@@ -5,9 +5,10 @@
 - 严格两臂：baseline=纯 torch 同步 Ulysses + FA4（无融合算子）；variant=只换 POST 为 GEMM-RS/AG-GEMM。两臂 PRE/RoPE/attention 共用同一代码且都用 FA4。
 - 关键坑：本机 8 卡 = `SP=8, DP=1`，**不能把 SP group 当 FSDP group**（否则 baseline Wo 被切 1/8 抹掉收益）。
 - 显存实测（attention stack + FP32 Adam）：B300×8、40 层 → 8K 省 9.9 GiB(20.6%)，32K 省 9.6 GiB(14.0%)。
-- 真实权重吞吐：官方 checkpoint 严格加载 40 blocks/1080 tensors/14.056B params，8K 手动 SP sync 时 variant 23,285 vs baseline 24,530 tokens/s（**-5.08%**）；修正条件一致性和 Wo 梯度尺度后的 DDP 重叠口径 **-4.87%**。
+- 真实权重吞吐：官方 checkpoint 严格加载 40 blocks/1080 tensors/14.056B params。最终严格 wall-clock、warmup=3/iters=10、DDP overlap、AG 发布+消费双 barrier：baseline 29,250 vs variant 28,193 tok/s，variant **-3.61%**。
 - SP 梯度：所有复制参数都需跨 SP reduce；variant 只有 `Wo_r_local` 不做 SP reduce，因为其 backward 已 AG 完整 `grad_y` 且各 rank 持有不同输入列 shard。若有 DP，Wo 仍需在对应 DP group 同步。
-- `autograd_ops.py` 已是 DeepEP 风格 `FusedPostLinearFunction`；AG 发布竞态用 device-sync+barrier+device-sync 修（grad_X rel=0），待下沉为纯 NVLink barrier。
+- AG 生命周期已从 host fence 改成两个 stream-ordered `sym_buffer.handle.barrier()`：一个发布本代输入，一个确认所有 peer 已消费后才允许下一层覆盖；SP=8 实测 grad_X rel=0。最终 40 层 BWD variant 198.46ms，baseline 185.77ms。
+- BWD 剩余慢点是 AG 本体：8K/SP8 每 rank AG 远端 payload 70 MiB，baseline A2A 为 8.75 MiB，理论正好 **8×**；当前 AG 在单 comm stream 串行提交 7 peers×4 chunks 的 memcpy，组件实测 AG+GEMM 0.54–0.66ms，而同形状纯 GEMM约 0.07ms。
 
 ## 约定（用户偏好）
 - **工作记忆存放在本仓库内** `DeepGEMM/.codebuddy/memory/`，随 git 一起 commit & push（2026-06-28 用户明确要求）。
