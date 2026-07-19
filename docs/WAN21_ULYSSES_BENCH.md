@@ -11,7 +11,7 @@ A2A + Wo 改为 Wo 分片 GEMM+ReduceScatter，能否降低真实训练峰值显
 2. Q/K RMSNorm；
 3. 三次同步 `torch.distributed.all_to_all_single`；
 4. 3D RoPE；
-5. `torch.nn.functional.scaled_dot_product_attention`。
+5. FlashAttention-4（FA4）。
 
 它们唯一的差别是 POST：
 
@@ -67,15 +67,20 @@ AG+GEMM 的高层入口 `bf16_ag_gemm_nt_with_input` 接收显式输入，隐藏
 复位。不得在 Function 中对数百 MB workspace 做逐调用 `zero_()`；当前只在
 AG pull 前执行输入发布同步，防止某 rank 提前读取远端尚未写好的输入。
 
-## 参数与 FSDP2
+## 参数所有权与并行维度
 
-- PRE 直接使用 `model.q/k/v`，不再创建冗余 `Wqkv/Wqkv_t` 参数。
-- baseline 保留完整逻辑 `model.o.weight`，由 FSDP2 管理。
-- variant 创建 `[hidden, hidden/P]` 的 `Wo_r_local` 后注销完整
-  `model.o.weight`，避免“完整 Wo + 本地 shard”双份常驻。
-- 多层显存测试逐层应用 FSDP2，`reshard_after_forward=True`；仅 variant 的
-  `Wo_r_local` 被排除，因为它已经按 SP 天然分片。
-- Adam 状态按 DTensor 的本地 shard 分配，而不是按 global shape 重复分配。
+本机 8 张 GPU 全部组成一个 `SP=8` group，`DP=1`。FSDP/ZeRO 应沿独立的 DP
+维度分片，**不能再沿同一个 SP group 分片**；否则会把 baseline 的 replicated Wo
+也提前切成 1/8，直接抹掉本实验要测的结构性收益（上一轮“变体不省显存”的
+错误结论即源于此）。
+
+- PRE 直接使用 `model.q/k/v`，不再创建冗余 `Wqkv/Wqkv_t` 参数；两条路径相同。
+- baseline 的完整 `model.o.weight[hidden, hidden]` 在 8 个 SP rank 上复制；每卡都有
+  完整 Wo 权重、完整梯度和完整 Adam m/v。
+- variant 只注册 `[hidden, hidden/8]` 的 `Wo_r_local`，随后注销完整
+  `model.o.weight`；每卡 Wo 权重、梯度和优化器状态均减少 7/8。
+- 若未来有 `SP=8 × DP>1` 的二维 mesh，两条路径仍可沿 DP 维做相同 FSDP；
+  variant 相对 baseline 的 SP 维 Wo 分片收益仍然存在。
 
 ## 显存统计
 
