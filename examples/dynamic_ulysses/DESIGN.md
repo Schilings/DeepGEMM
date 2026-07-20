@@ -228,21 +228,29 @@ class DynamicGradientSync:
 
 ## 4. 实现计划
 
-### Phase 1: 基础设施 (MVP)
-- [ ] `DynamicSPGroupManager`: 预创建通信组
-- [ ] `BalancedDataLoader`: 基础 FLOPs 分桶
-- [ ] `DynamicUlyssesLayer`: 运行时 SP 切换
-- [ ] `DynamicGradientSync`: 跨 SP 组梯度同步
+### Phase 1: 基础设施 (MVP) ✓ 已完成
+- [x] `DynamicSPGroupManager`: 预创建 {1,2,4,8} SP/DP NCCL 通信组
+- [x] `BalancedDataLoader`: FLOPs-aware 序列→SP 组分配
+- [x] `DynamicUlyssesLayer`: 运行时 SP 切换（SP=1 纯 DP, SP>1 Ulysses A2A）
+- [x] `DynamicGradientSync`: Bucketed AllReduce + token 数缩放
+- [x] 基本功能测试（4 个测试全部通过）
 
-### Phase 2: 验证
-- [ ] 正确性测试: 不同 SP 组大小混合训练
-- [ ] 性能 bench: 对比静态 SP vs 动态 SP
-- [ ] 负载不均衡场景模拟
+### Phase 2: 验证 ✓ 已完成
+- [x] `DynamicTrainer`: 完整训练循环（microbatch 调度 + forward/backward + 梯度同步）
+- [x] 正确性测试（5 个测试：跨组 AllReduce、SP 组 AllToAll、梯度同步、调度、顺序执行）
+- [x] 分析模型 benchmark：几何均值 +7.4% vs SP=8，+20% vs SP=4
+- [x] 真实 GPU benchmark（B300×8）：uniform 8K 动态 SP 快 **2.5x**
 
-### Phase 3: 优化
-- [ ] 通信组缓存和复用
-- [ ] UnifiedSymmBuffer 按 SP 大小预分配
-- [ ] 梯度同步 overlap
+### Phase 3: 优化 ✓ 已完成
+- [x] `SymBufferPool`: UnifiedSymmBuffer 按 SP 大小预分配，懒加载
+- [x] `OverlapGradientSync`: 非阻塞 AllReduce 与 backward overlap
+- [x] 通信组缓存和复用（DynamicSPGroupManager 一次性预创建）
+
+### 后续方向
+- [ ] Pipeline 调度：不同 SP 大小的 microbatch 交错执行
+- [ ] DeepGEMM 融合算子集成（替换 PyTorch 原生 A2A）
+- [ ] 自适应 SP 分配（运行时 profiling 动态调整阈值）
+- [ ] 多节点扩展
 
 ## 5. 约束
 
