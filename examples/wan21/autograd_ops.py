@@ -140,11 +140,17 @@ class FusedPreQKVFunction(torch.autograd.Function):
         kv_nheads = sym_pre.kv_nheads
         head_dim = sym_pre.head_dim
 
+        # Ensure bf16 for kernel (autocast may pass fp32 inputs)
+        x_bf16 = x_local.to(torch.bfloat16) if x_local.dtype != torch.bfloat16 else x_local
+        w_bf16 = wqkv.to(torch.bfloat16) if wqkv.dtype != torch.bfloat16 else wqkv
+        nq_bf16 = norm_q_weight.to(torch.bfloat16) if (norm_q_weight is not None and norm_q_weight.dtype != torch.bfloat16) else norm_q_weight
+        nk_bf16 = norm_k_weight.to(torch.bfloat16) if (norm_k_weight is not None and norm_k_weight.dtype != torch.bfloat16) else norm_k_weight
+
         out, rms = bf16_fused_qkv_norm_a2a_nt(
-            x_local, wqkv, sym_pre, local_seq,
+            x_bf16, w_bf16, sym_pre, local_seq,
             q_nheads, kv_nheads, head_dim, eps,
-            norm_q_weight=norm_q_weight,
-            norm_k_weight=norm_k_weight,
+            norm_q_weight=nq_bf16,
+            norm_k_weight=nk_bf16,
         )
         ctx.rms = rms  # [bs, seq, 2] fp32 — saved for backward
         # The fused kernel scatters with rank-major seq ordering [sp, local_seq].
@@ -366,8 +372,8 @@ class FusedPreQKVFunction(torch.autograd.Function):
         # saved_tensors strip requires_grad, so we re-enable it to build a
         # fresh autograd graph for the norm backward.
         with torch.enable_grad():
-            x_local_g = x_local.detach().requires_grad_(True)
-            wqkv_g = wqkv.detach().requires_grad_(True)
+            x_local_g = x_local.detach().to(torch.bfloat16).requires_grad_(True)
+            wqkv_g = wqkv.detach().to(torch.bfloat16).requires_grad_(True)
             proj = torch.matmul(x_local_g, wqkv_g.t())  # [bs*local_seq, n_total]
             proj.retain_grad()  # need grad_proj for GEMM backward
             proj_q = proj[:, :q_dim]  # [bs*local_seq, q_dim]
@@ -400,8 +406,10 @@ class FusedPreQKVFunction(torch.autograd.Function):
         grad_proj[:, q_dim+kv_dim:] = grad_proj_normed[:, q_dim+kv_dim:]
 
         # GEMM backward: grad_X = grad_proj @ wqkv, grad_Wqkv = grad_proj.T @ x
-        grad_x = torch.matmul(grad_proj, wqkv)
-        grad_wqkv = torch.matmul(grad_proj.t(), x_local)
+        w_bf16 = wqkv.to(torch.bfloat16)
+        x_bf16 = x_local.to(torch.bfloat16)
+        grad_x = torch.matmul(grad_proj, w_bf16)
+        grad_wqkv = torch.matmul(grad_proj.t(), x_bf16)
 
         grad_nq = nq_g.grad if (nq_g is not None) else None
         grad_nk = nk_g.grad if (nk_g is not None) else None
