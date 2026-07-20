@@ -54,6 +54,14 @@ sym = get_unified_symm_buffer(group, bs, seq, hidden)
 
 ---
 
+## Standard Ulysses baseline vs fused（2026-07-20）
+
+> 权威结果见 `examples/ulysses_fused/ULYSSES_FULL_ATTN_BENCH.md`。
+
+`examples/ulysses_fused/` 已清理为标准 Ulysses forward 的严格两臂：torch matmul + 同步 NCCL A2A baseline，对比 DeepGEMM fused GEMM+A2A PRE 和 A2A+GEMM POST。B300×8、10 iters、rank-max：BSHD chain/PRE+POST 几何平均 1.032x/1.111x，THD 为 1.026x/1.098x；正确性 3/3 PASS。
+
+---
+
 ## Wan2.1 14B Ulysses POST 变体（2026-07-20 更新）
 
 > 当前权威结果见 `examples/ulysses_variant/WAN21_ULYSSES_BENCH.md`，代码在 `examples/ulysses_variant/`。通用 profiling 方法见 `docs/GPU_PROFILING_GUIDE.md`。

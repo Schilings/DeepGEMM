@@ -29,18 +29,13 @@
 - 接口坑：dense 用 **[B,S,H,D]**（非 BHSD）；varlen 用 [T,H,D]+cu_seqlens（关键字传，第 4 个位置是 qv）；无 dropout_p；返回可能是 tuple。
 - 测试/bench 统一经 `tests/ulysses/fa4_attn.py` 的 `fa4_attn_bhsd` / `fa4_attn_varlen_thd` 调用。
 
-## 待办 / TODO
-- （已完成 2026-06-28）~~Ulysses bench 加 async Ulysses baseline~~ → 见下「Ulysses bench async 基线」。
-
-## Ulysses bench async-Ulysses 基线（2026-06-28 完成）
-- 文件 `benchmarks/bench_ulysses_full_attn_flow.py` 现对比**三条链路**：fused(ours) / torch-native(串行) / async-Ulysses(手工多 stream 重叠)。
-- async PRE：拆 Q/K/V → 用 `Wq_t/Wk_t/Wv_t` 各做一次 GEMM + 各发一次 `all_to_all_single`，
-  comp 默认流算 GEMM、`comm_stream` 侧流发 A2A，event 串依赖：A2A(Q) 与 K 的 GEMM 重叠。
-- async POST：token 维 `llocal_seq` 切 `nseg`(≤4，按 128 整除回退) 块，逐块在 `comm_stream_po` 上 scatter+A2A 流水线，
-  comp 流上各块 GEMM 等自己那块 A2A 完成 → 与后续块 A2A 重叠（split-token，非 split-K）。
-- 表格列：时间 `us=ours/torch/async`，加速比 `vs_torch/vs_async`；汇总 geo_mean 同时给两个口径。
-- 文档 `docs/ULYSSES_FULL_ATTN_BENCH.md` 第 1 节已补三链路说明；第 4 节结果表标注为加 async 前的旧数据，async 列待 B300×8 重跑补全。
-- 注意：脚本只 `py_compile` 过，**尚未真正多卡跑过**，下次需实跑验证（NCCL 双流重叠正确性 + 数字）。
+## Standard Ulysses fused benchmark（2026-07-20 清理）
+- `examples/ulysses_fused/` 只保留两个文件：`bench_ulysses_full_attn_flow.py` 和 `ULYSSES_FULL_ATTN_BENCH.md`。
+- 只比较两条等价标准 Ulysses forward：torch+同步 NCCL baseline vs DeepGEMM fused PRE/POST；不含其他实验策略。
+- 已删除混合旧 API 且不可运行的 `bench_wan21_strategies.py` 和沿 SP group 做 FSDP2 的 `bench_wan21_fsdp2.py`。
+- B300×8、10 iters、rank-max：BSHD chain geo 1.032x、PRE+POST 1.111x；THD chain 1.026x、PRE+POST 1.098x。
+- 8 卡正确性 3/3 PASS，relative error 均为 1.41e-3。
+- chain 是独立 PRE+FA4+POST 计时之和，不是 autograd 训练吞吐；权威结果见 `examples/ulysses_fused/ULYSSES_FULL_ATTN_BENCH.md`。
 
 ## 仓库结构 / 语义
 - `tests/` 按职责分子目录：`core/`（单卡正确性/性能 + 共享 `generators.py` + sanitizer，必须同目录）、

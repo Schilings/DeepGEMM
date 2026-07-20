@@ -1,193 +1,173 @@
-# Ulysses 完整 Attention 链路 Benchmark 与 bf16 误差分析
+# Standard Ulysses Baseline vs DeepGEMM Fused Benchmark
 
-机器：NVIDIA B300 SXM6 AC ×8。脚本：`benchmarks/bench_ulysses_full_attn_flow.py`。
-端到端测试见 `tests/ulysses/test_ulysses_full_attn_flow.py`。
-attention 统一使用 **FlashAttention-4**（安装见 `docs/INSTALL_FA4.md`，封装于 `tests/ulysses/fa4_attn.py`）。
+本目录只比较**标准 Ulysses**的两条等价 forward 路径：
 
----
-
-## 1. 测什么
-
-Ulysses SP 单 rank 的完整 attention 链路（序列并行输入）：
-
-```
-X_local[bs, local_seq, hidden]
-  --[PRE]  融合 QKV-proj GEMM + A2A-transpose  --> q,k,v [bs, seq, local_nh, hd]   (OUR op #1)
-  --[ATTN] attention (FlashAttention-4)         --> attn  [bs, local_nh, seq, hd]
-  --[POST] A2A-transpose + Wo GEMM（comm/计算重叠）--> y    [bs*local_seq, N]         (OUR op #2)
-```
-
-每个 shape、每种输入布局都对比三条链路：
-
-| 链路 | PRE | ATTN | POST |
+| 路径 | PRE | Attention | POST |
 |---|---|---|---|
-| **fused（ours）** | `bf16_gemm_a2a_transpose_nt`（单 kernel epilogue scatter 重叠） | FlashAttention-4 | `bf16_a2a_transpose_gemm_nt_fused`（单 kernel 重叠） |
-| **torch-native（串行）** | `torch.matmul` + `all_to_all`（不重叠） | FlashAttention-4 | `all_to_all` + `torch.matmul`（不重叠） |
-| **async-Ulysses（手工重叠）** | 拆 Q/K/V → 3×GEMM + 3×A2A，多 stream 流水线重叠 | FlashAttention-4 | token 分块 → 逐块 (scatter+A2A) 与 Wo GEMM 多 stream 重叠 |
+| `baseline` | BF16 `torch.matmul` + 同步 NCCL `all_to_all_single` | FlashAttention-4 | 同步 NCCL `all_to_all_single` + BF16 `torch.matmul` |
+| `fused` | `bf16_gemm_a2a_transpose_nt` | FlashAttention-4 | `bf16_a2a_transpose_gemm_nt_fused` |
 
-**async-Ulysses** 是比串行 torch-native 更强的对照：用 ≥2 条 CUDA stream 在**算子外**手工编排计算-通信重叠
-（PRE：Q 的 GEMM 算完即在 comm stream 发 Q 的 A2A，同时 comp stream 算 K，依此类推；POST：token 切块，
-块 A2A 与已到达块的 Wo GEMM 重叠）。我们的融合算子则是在**单 kernel 内**用 epilogue scatter 做重叠，
-因此 `async → ours` 的差距单独刻画了**相对手工多 stream 重叠的额外收益**。
+两条路径都持有完整、复制的 Q/K/V/Wo 方阵权重，并实现相同的数据布局变换。目录中不包含其他实验策略。
 
-ATTN 三条链路完全相同（本工作不优化 attention），所以对两个 baseline 各报告两个口径：
+## 1. 数据流
 
-- **e2e speedup** = `(torch | async)链路 / fused链路`（含 attention 的诚实全链路加速）
-- **comm+GEMM speedup** = `(PRE+POST)_(torch | async) / (PRE+POST)_ours`（融合算子真正起作用的部分）
+每个 sequence-parallel rank：
 
-> 表格列约定：时间 `us = ours/torch/async`；加速比 `= vs_torch/vs_async (x)`。
-
----
-
-## 2. 输入 shape 与权重 shape（正常训练场景：权重均为方阵）
-
-约定 `hidden = nheads * head_dim`，且 **Wo 输出宽度 N = hidden**（方阵）。
-
-### 权重 shape（方阵）
-
-| 权重 | shape | 说明 |
-|---|---|---|
-| `Wq` / `Wk` / `Wv` | `[hidden, hidden]` | 各自方阵 |
-| 融合 `Wqkv` | `[3*hidden, hidden]` | 3 个方阵块按 rank-major 堆叠 |
-| `Wo` | `[hidden, hidden]` | 方阵，`N = hidden` |
-
-### 输入 shape
-
-| `(bs, nheads, seq, head_dim)` | `hidden = N` | 权重（方阵） |
-|---|---:|---|
-| `(1, 32, 4096, 128)` | 4096 | `[4096,4096]`，`Wqkv [12288,4096]` |
-| `(1, 56, 4096, 128)` | 7168 | `[7168,7168]`，`Wqkv [21504,7168]` |
-| `(2, 32, 4096, 128)` | 4096 | `[4096,4096]`，`Wqkv [12288,4096]` |
-| `(2, 56, 2048, 128)` | 7168 | `[7168,7168]`，`Wqkv [21504,7168]` |
-| `(1, 64, 8192, 128)` | 8192 | `[8192,8192]`，`Wqkv [24576,8192]` |
-
----
-
-## 3. BSHD vs THD —— 等价前提
-
-同一个 shape `(bs, nheads, seq, hd)` 按两种布局各跑一遍：
-
-- **BSHD**：`bs` 条长度 `seq` 的序列，批量排布 → tokens = `bs*seq`。
-- **THD**：把**同样**的 `bs` 条序列打包成单一 token 流 `T = bs*seq`（`bs'=1, seq'=T`）。
-
-融合 comm/GEMM 算子两种布局处理的 token 总数完全相同（`bs*seq`），调用方式也相同（仅 symm-buffer
-的 `(bs, seq)` 描述符不同），因此**加速比必然一致** —— 这正是“等价前提”要验证的：算子对 BSHD / THD
-一视同仁。等长序列下 attention FLOPs 也完全相同，故 ATTN 每个 shape 只计时一次、两布局共用。
-
-> THD 真正的额外收益（变长序列免 padding）属于 attention 侧，不是这两个 comm/GEMM 算子的加速来源，
-> 故等价测试用等长序列即可证明算子层面的等价性。
-
----
-
-## 4. 结果
-
-时间单位 us（每算子 20 iters、逐 iter event 计时 + 跨 rank barrier）。
-
-> 列约定：时间 `us = ours/torch/async`；加速比 `= vs_torch / vs_async`。
-> shape 列为每种布局的**有效维度**：`h`=hidden、`nh`=nheads、`lbs x lseq`=该布局实际 (batch × 序列)、
-> `L`=每卡 local_seq=`lseq/sp`。`bs=1` 的 BSHD/THD 有效维度相同（数字近似一致）即等价性验证；
-> `bs=2` 行 BSHD `2x32K L4K` vs THD `1x64K L8K` 体现 THD 打包。（序列维度统一用 K=×1024 表示）
-
-### 8 GPUs（ATTN = FlashAttention-4，长序列 32K~128K）
-
-| shape | 布局 | PRE o/t/a | ATTN | POST o/t/a | e2e o/t/a | **e2e t/a** | **c+g t/a** |
-|---|---|---|---:|---|---|---:|---:|
-| h4096 nh32 1x32K L4K | BSHD | 336/587/730 | 1327 | 178/307/669 | 1841/2222/2725 | **1.21/1.48** | 1.74/2.72 |
-| h4096 nh32 1x32K L4K | THD | 338/569/593 | 1327 | 179/260/486 | 1844/2156/2406 | **1.17/1.30** | 1.60/2.08 |
-| h8192 nh64 1x32K L4K | BSHD | 1348/1684/1613 | 2364 | 621/674/778 | 4333/4722/4755 | **1.09/1.10** | 1.20/1.21 |
-| h8192 nh64 1x32K L4K | THD | 1332/1945/1598 | 2364 | 594/661/921 | 4290/4970/4884 | **1.16/1.14** | 1.35/1.31 |
-| h8192 nh64 1x64K L8K | BSHD | 2705/3803/3044 | 10209 | 1117/1218/1261 | 14032/15230/14514 | **1.09/1.03** | 1.31/1.13 |
-| h8192 nh64 1x64K L8K | THD | 2664/3778/3027 | 10209 | 1162/1199/1251 | 14035/15186/14487 | **1.08/1.03** | 1.30/1.12 |
-| h4096 nh32 1x128K L16K | BSHD | 1236/2362/1956 | 21079 | 586/893/933 | 22902/24335/23968 | **1.06/1.05** | 1.79/1.59 |
-| h4096 nh32 1x128K L16K | THD | 1217/2545/1963 | 21079 | 637/861/976 | 22934/24486/24019 | **1.07/1.05** | 1.84/1.58 |
-| h4096 nh32 2x32K L4K | BSHD | 644/1084/1033 | 2362 | 374/517/584 | 3380/3963/3979 | **1.17/1.18** | 1.57/1.59 |
-| h4096 nh32 1x64K L8K (THD of 2x32K) | THD | 630/1075/1069 | 2362 | 335/506/564 | 3327/3943/3995 | **1.19/1.20** | 1.64/1.69 |
-
-**geo_mean**：BSHD e2e **vs_torch 1.122x / vs_async 1.157x**，comm+GEMM **vs_torch 1.503x / vs_async 1.564x**；
-THD e2e **vs_torch 1.131x / vs_async 1.140x**，comm+GEMM **vs_torch 1.533x / vs_async 1.522x**。
-
-> 解读：长序列下 attention（FA4）成为 e2e 主体（128K 那行 ATTN≈21ms，占 e2e 九成），故 e2e 加速被稀释到
-> ~1.05–1.13x，这是诚实数字；真正反映融合算子价值的是 **comm+GEMM 1.5x 左右**。async-Ulysses（手工拆 QKV /
-> token 分块 + 多 stream 重叠）在长序列下已与串行 torch 同档、PRE 偶有反超，是一个合理的强对照；ours 仍稳定领先。
-> （注：短序列 4K~8K 下 async 因 N× collective 固定开销反而比 torch 慢 2~3 倍，那是 comm-bound 区，不是 SP 的目标场景。）
-
-### 4 GPUs（ATTN = FlashAttention-4）
-
-> 注：下表为旧的**短序列**（2K~8K）数据，仅含 `ours/torch`，属 comm-bound 区，待用长序列在 4 卡重跑后更新。
-
-| `(bs,nh,seq,hd)` hidden | 布局 | PRE ours/torch | ATTN | POST ours/torch | e2e ours/torch | **e2e** | **c+g** |
-|---|---|---|---:|---|---|---:|---:|
-| (1,32,4096,128) 4096 | BSHD | 122/196 | 119 | 75/112 | 317/427 | **1.35x** | 1.56x |
-| (1,32,4096,128) 4096 | THD | 124/182 | 119 | 75/117 | 318/418 | **1.31x** | 1.50x |
-| (1,56,4096,128) 7168 | BSHD | 293/349 | 152 | 149/174 | 593/674 | **1.14x** | 1.18x |
-| (1,56,4096,128) 7168 | THD | 292/351 | 152 | 148/177 | 592/679 | **1.15x** | 1.20x |
-| (2,32,4096,128) 4096 | BSHD | 188/303 | 156 | 110/154 | 454/613 | **1.35x** | 1.53x |
-| (2,32,4096,128) 4096 | THD | 190/412 | 156 | 110/156 | 455/723 | **1.59x** | 1.89x |
-| (2,56,2048,128) 7168 | BSHD | 293/351 | 116 | 148/183 | 557/650 | **1.17x** | 1.21x |
-| (2,56,2048,128) 7168 | THD | 292/349 | 116 | 176/175 | 585/640 | **1.10x** | 1.12x |
-| (1,64,8192,128) 8192 | BSHD | 684/778 | 388 | 331/327 | 1404/1493 | **1.06x** | 1.09x |
-| (1,64,8192,128) 8192 | THD | 674/818 | 388 | 337/383 | 1399/1589 | **1.14x** | 1.19x |
-
-**geo_mean**：BSHD e2e **1.207x** / comm+GEMM **1.300x**；THD e2e **1.244x** / comm+GEMM **1.353x**。
-
-### 结论
-
-1. **comm+GEMM（融合算子真正发力的部分）8 卡 ~1.37x、4 卡 ~1.30x 加速**；含 attention 的全链路 e2e
-   8 卡 ~1.25x、4 卡 ~1.22x（attention 占比越大，e2e 稀释越多，符合预期）。
-2. **换用 FlashAttention-4 后 attention 大幅变快**（例如 8192 shape 的 8 卡 attn 从 SDPA 的 796us 降到
-   227us），attention 在 e2e 中的占比下降，因此 e2e 加速比比 SDPA 版本更高（8 卡从 ~1.20x 提升到 ~1.25x）；
-   而 comm+GEMM 口径基本不变（融合算子本身未改），仍为 ~1.37x。
-3. **BSHD 与 THD 数值几乎一致**（同 shape 两行差异多在测量抖动内），实证算子对两种输入布局**等价**。
-4. **小 K / 大 batch 通信占比高 → 融合收益最大**（如 `(1,32,4096)` comm+GEMM 1.6~1.8x）；
-   大 hidden（8192）计算 bound，e2e 收敛到 ~1.1x，但每个 shape 仍稳定快于 torch-native。
-
----
-
-## 5. `test_ulysses_full_attn_flow.py` 中 rel ~1e-3 误差分析
-
-**结论先行：这不是 bug，1e-3 是全 bf16 链路对 FP32 真值的正常精度量级；两个融合算子本身数值精确。**
-
-### 5.1 误差分解（8 卡，shape `(1,32,2048,128,4096)`，逐项实测）
-
-| 环节 | 测量 | rel | 含义 |
-|---|---|---:|---|
-| PRE op | `rel(q, ref)` | **0.00e+00** | 融合 QKV-proj + A2A **逐元素精确** |
-| ATTN | dist_attn vs **全 head** attention 切片 | 1.11e-03 | bf16 attention 在不同 head 数下的归约顺序差异 |
-| ATTN | dist_attn vs **本 rank head 组** attention | **0.00e+00** | 同 head 数 → **精确相等**（证明上一行非真误差） |
-| 输出 GEMM | bf16 输出 vs FP32 输出 | 1.41e-03 | bf16 输出 GEMM 的量化地板 |
-
-> 说明：上表的逐项分解最初用 SDPA 实测；改用 FlashAttention-4 后整链路 `test_ulysses_full_attn_flow.py`
-> 实测 rel 仍稳定为 **1.41e-3**（3/3 PASS），与「纯 bf16 输出 GEMM 地板」一致，结论不变。
-> pre-attn 链路（`test_ulysses_pre_attn_flow.py`）FA4 分布式 vs FA4 参考逐组计算时 q/k/v/attn rel 恒 **0.0**。
-
-### 5.2 两个独立的 bf16 来源
-
-旧测试 rel ≈ 2.6e-3，由两个**相互独立、且都合理**的 bf16 误差叠加而成：
-
-1. **Attention 参考构造伪差（~1.1e-3，非真实误差）**：旧参考用**一次覆盖全部 32 个 head 的 attention**，
-   而分布式路径每个 rank 只跑自己的 `local_nh=4` 个 head。bf16 attention 在不同 head 数下选择不同的
-   kernel tiling / 归约顺序，导致 ~1e-3 的位级差异。**这不是算子误差** —— 一旦参考也按「本 rank head 组」
-   计算 attention，rel 立刻变成 **0.0**（见上表第 3 行）。
-
-2. **输出投影 bf16 vs FP32（~1.4e-3，预期地板）**：参考的 `Wo` 投影用 FP32（`ag.float() @ Wo.float().t()`）
-   即真值，而算子是 bf16（fp32 累加、bf16 输入/输出）。bf16 尾数 8 bit，单元素相对舍入 ~2⁻⁸≈3.9e-3，
-   经 `hidden` 维点积部分平均后，输出平均相对误差 ~1.4e-3。这是 **bf16 输出 GEMM 的精度地板**，无法再降
-   （除非把算子也改成 FP32 输出）。
-
-### 5.3 已做的修正
-
-把测试参考的 attention 改为**按 rank head 组逐组计算**（与分布式执行一致），消除第 1 项伪差，同时
-保留 FP32 输出投影（对真值比较）。修正后：
-
-```
-rel = 1.41e-03   （三个 shape 完全一致，3/3 PASS）
+```text
+X_local[bs, local_seq, hidden]
+  -- PRE: QKV projection + heads/sequence A2A transpose
+  --> q,k,v[bs, seq, local_nheads, head_dim]
+  -- FlashAttention-4
+  --> attention output
+  -- POST: heads/sequence A2A transpose + full Wo projection
+  --> y[bs * local_seq, hidden]
 ```
 
-跨 shape 高度稳定的 1.41e-3 恰好等于「纯 bf16 输出 GEMM 量化地板」（5.1 表最后一行），进一步佐证残差是
-**系统性 bf16 舍入**而非数值 bug。阈值 `0.03` 仍然合适。
+权重：
 
-### 5.4 要点
+```text
+Wq/Wk/Wv: [hidden, hidden]
+Wqkv:     [3 * hidden, hidden]
+Wo:       [hidden, hidden]
+hidden = nheads * head_dim
+```
 
-- 融合算子精确：PRE op q/k/v 逐元素 rel = 0；POST op 在输入/dtype 一致时同样精确。
-- 残差 = bf16 attention + bf16 输出 GEMM 对 FP32 真值的固有舍入，**1e-3 级别对全 bf16 链路完全正常，不偏大**。
-- 旧的 2.6e-3 偏高部分来自参考端「全 head 一次 attention」的构造方式，与算子无关，已通过 head 组一致化消除。
+## 2. Benchmark 口径
+
+脚本：
+
+```text
+examples/ulysses_fused/bench_ulysses_full_attn_flow.py
+```
+
+运行：
+
+```bash
+DG_JIT_USE_NVRTC=1 \
+PYTHONPATH=$PWD/examples:$PWD \
+PYTHONWARNINGS=ignore \
+python3 examples/ulysses_fused/bench_ulysses_full_attn_flow.py 8 10
+```
+
+计时方法：
+
+- 每个组件 warmup 3 次；
+- 每次 measured iteration 前做跨 rank barrier；
+- CUDA Event 记录本 rank GPU 时间；
+- 每次对 elapsed time 做跨 rank MAX；
+- 表中单位为 microseconds；
+- Attention 两臂完全相同，每个 shape 只计时一次。
+
+`chain` 是独立计时的 `PRE + ATTN + POST` 之和，用于估算标准 attention forward 链路；当前脚本不是张量真实串联的 autograd 训练 benchmark。
+
+加速比：
+
+```text
+e2e = chain_baseline / chain_fused
+c+g = (PRE_baseline + POST_baseline) / (PRE_fused + POST_fused)
+```
+
+其中 `c+g` 更直接反映两个通信融合算子的收益；长序列下 FA4 attention 占比很高，因此 e2e 收益会被稀释。
+
+## 3. BSHD 与 THD
+
+每个原始 shape `(bs, nheads, seq, head_dim)` 以两种布局运行：
+
+- BSHD：`bs × seq`；
+- THD：把同样 token 打包为 `1 × (bs*seq)`。
+
+对于 `bs=1`，二者实际 shape 相同；对于 `bs>1`，THD 行用于验证相同 token 总数下的 packed layout。本文不测试变长序列免 padding 收益。
+
+## 4. B300×8 结果
+
+环境：
+
+```text
+GPU: NVIDIA B300 SXM6 AC ×8
+Dtype: BF16
+Attention: FlashAttention-4
+Iterations: 10 per component
+Timing: rank-max CUDA Event
+```
+
+列格式：`fused/baseline`，时间单位 us。
+
+| Shape | Layout | PRE f/base | ATTN | POST f/base | Chain f/base | e2e | c+g |
+|---|---|---:|---:|---:|---:|---:|---:|
+| h4096 nh32 1×32K L4K | BSHD | 334/551 | 1390 | 348/258 | 2072/2199 | 1.06× | 1.19× |
+| h4096 nh32 1×32K L4K | THD | 335/561 | 1390 | 343/259 | 2068/2209 | 1.07× | 1.21× |
+| h8192 nh64 1×32K L4K | BSHD | 1325/1601 | 2483 | 895/742 | 4703/4826 | 1.03× | 1.06× |
+| h8192 nh64 1×32K L4K | THD | 1327/1613 | 2483 | 902/657 | 4712/4753 | 1.01× | 1.02× |
+| h8192 nh64 1×64K L8K | BSHD | 2632/3771 | 11381 | 1806/1231 | 15819/16383 | 1.04× | 1.13× |
+| h8192 nh64 1×64K L8K | THD | 2632/3885 | 11381 | 1821/1230 | 15834/16495 | 1.04× | 1.15× |
+| h4096 nh32 1×128K L16K | BSHD | 1219/2178 | 23487 | 1327/885 | 26033/26549 | 1.02× | 1.20× |
+| h4096 nh32 1×128K L16K | THD | 1209/2174 | 23487 | 1311/885 | 26007/26546 | 1.02× | 1.21× |
+| h4096 nh32 2×32K L4K | BSHD | 628/1031 | 2541 | 677/467 | 3846/4039 | 1.05× | 1.15× |
+| h4096 nh32 1×64K L8K | THD | 632/1032 | 2541 | 675/455 | 3849/4028 | 1.05× | 1.14× |
+| h5120 nh40 1×32K L4K | BSHD | 530/733 | 1734 | 439/388 | 2702/2855 | 1.06× | 1.16× |
+| h5120 nh40 1×32K L4K | THD | 517/736 | 1734 | 494/330 | 2745/2799 | 1.02× | 1.05× |
+| h5120 nh40 1×74K L9472 | BSHD | 1147/1725 | 9428 | 1045/715 | 11620/11868 | 1.02× | 1.11× |
+| h5120 nh40 1×74K L9472 | THD | 1147/1716 | 9428 | 1038/749 | 11613/11893 | 1.02× | 1.13× |
+| h2048 nh16 1×32K L4K | BSHD | 167/262 | 705 | 194/141 | 1067/1108 | 1.04× | 1.11× |
+| h2048 nh16 1×32K L4K | THD | 166/259 | 705 | 231/142 | 1102/1107 | 1.00× | 1.01× |
+| h2048 nh16 1×74K L9472 | BSHD | 299/501 | 3397 | 513/245 | 4209/4143 | 0.98× | 0.92× |
+| h2048 nh16 1×74K L9472 | THD | 306/501 | 3397 | 446/243 | 4149/4142 | 1.00× | 0.99× |
+
+几何均值：
+
+| Layout | Chain speedup | PRE+POST speedup |
+|---|---:|---:|
+| BSHD | **1.032×** | **1.111×** |
+| THD | **1.026×** | **1.098×** |
+
+## 5. 结果解读
+
+1. 融合 PRE 稳定快于 baseline；它是当前主要收益来源。
+2. 当前融合 POST 在部分大 hidden/长序列 shape 上慢于 NCCL A2A + cuBLAS GEMM，抵消了一部分 PRE 收益。
+3. 标准 Ulysses forward 链路的几何平均收益约为 2.6%～3.2%。
+4. 只看 PRE+POST，几何平均收益约为 9.8%～11.1%。
+5. `h2048 nh16 74K` 是当前短板，融合路径略慢，需要单独 profile POST kernel 与 baseline NCCL/cuBLAS。
+6. 由于 attention 在长序列下占主要时间，即使通信融合部分提升约 10%，chain e2e 也只提升约 3%。
+
+## 6. 正确性
+
+标准 Ulysses 测试入口：
+
+```bash
+DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD \
+python3 tests/ulysses/test_ulysses_full_attn_flow.py 8
+```
+
+2026-07-20 在 B300×8 实跑 3 个 shape，结果 3/3 PASS：
+
+| Shape | Relative error | PRE | POST | PRE+POST |
+|---|---:|---:|---:|---:|
+| `(1,32,2048,128,4096)` | 1.41e-3 | 199.1 us | 101.9 us | 301.0 us |
+| `(1,56,2048,128,7168)` | 1.41e-3 | 193.5 us | 130.6 us | 324.2 us |
+| `(8,56,4096,128,7168)` | 1.41e-3 | 1040.8 us | 407.6 us | 1448.4 us |
+
+融合 PRE 的 q/k/v 在对齐布局和 dtype 后可逐元素一致；全 BF16 链路相对 FP32 参考的约 `1e-3` 误差主要来自 BF16 attention/output GEMM 的归约和量化顺序。
+
+性能优化后必须先复跑正确性，再运行本 benchmark。
+
+## 7. Profiling
+
+通用操作见：
+
+```text
+docs/GPU_PROFILING_GUIDE.md
+```
+
+对本脚本继续分析时，应分别给 `pre_fused`、`pre_baseline`、`post_fused`、`post_baseline` 添加 NVTX，并使用少量 iteration 的 Nsight Systems trace。正式吞吐仍以无 profiler、重复多轮的 rank-max 时间为准。
+
+## 8. 范围边界
+
+本 benchmark 只测标准 Ulysses forward 的 baseline 与 fused 两臂：
+
+- 不包含 backward；
+- 不包含 DDP/FSDP/optimizer；
+- 不加载模型 checkpoint；
+- 不报告训练显存；
+- chain 时间为组件之和，不是真实 tensor-connected end-to-end。
+
+需要模型级训练 benchmark 时，应另建标准 fused autograd 路径，不能把本脚本结果解释为训练吞吐。
