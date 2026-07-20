@@ -150,29 +150,32 @@ def bf16_fused_qkv_norm_a2a_nt(
     do_norm_q = norm_q_weight is not None
     do_norm_k = norm_k_weight is not None
 
-    # Zero sum_buffer (reuse across calls — sym_buffer itself doesn't need zeroing)
-    sym_buffer.reset()
-    sum_buffer = sym_buffer.sum_buffer
+    # Zero sum_buffer and get views (UnifiedSymmBuffer stores them in fused_qkv)
+    views = getattr(sym_buffer, 'fused_qkv', None)
+    if views is not None:
+        views.sum_buffer.zero_()
+        out = views.out
+        rms = views.rms.clone()
+    else:
+        # Legacy FusedQKVNormA2ASymmBuffer
+        sym_buffer.reset()
+        sum_buffer = sym_buffer.sum_buffer
+        out = sym_buffer.get_out_view()
+        rms = sym_buffer.get_rms_view().clone()
 
     # Call CUDA kernel
     _C.sm100_bf16_fused_qkv_norm_a2a_nt(
         a, b,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs,
-        sum_buffer,
+        views.sum_buffer if views is not None else sum_buffer,
         group.rank(),
         bs, local_seq,
         q_nheads, kv_nheads, head_dim,
         eps, do_norm_q, do_norm_k)
 
     # Sync: kernel has 3 nvlink barriers internally (init + tiles + rms).
-    # After kernel returns, data is globally visible. Only need group barrier
-    # to ensure all ranks finished before we read sym buffer.
     group.barrier()
-
-    # Get output views (operate in-place on sym buffer, clone only at end)
-    out = sym_buffer.get_out_view()
-    rms = sym_buffer.get_rms_view().clone()  # small: [bs, seq, 2] fp32
 
     # Precompute per-rank bias slices (avoid repeated view in each branch)
     local_q_n = (q_nheads // num_ranks) * head_dim

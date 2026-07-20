@@ -277,9 +277,9 @@ class FusedPostWoFunction(torch.autograd.Function):
         ctx.save_for_backward(wo_weight)
 
         # Copy attention output into the POST symmetric buffer.
-        # attn_output is FA4 BSHD [bs, seq, local_nh, hd]; sym_post.x is BHSD
+        # attn_output is FA4 BSHD [bs, seq, local_nh, hd]; views.x is BHSD
         # [bs, local_nh, seq, hd].  The comm kernel (seq_major=False) reads BHSD.
-        sym_post.x.copy_(attn_output.transpose(1, 2))
+        sym_post.a2a_gemm.x.copy_(attn_output.transpose(1, 2))
 
         hidden = wo_weight.shape[0]
         y = wo_weight.new_empty((local_m, hidden))
@@ -308,7 +308,7 @@ class FusedPostWoFunction(torch.autograd.Function):
         #   2. grad_wo = grad_y.T @ gathered         [hidden, hidden]
         #   3. inverse A2A-transpose on grad_gathered → grad_attn_output
 
-        gathered = sym_post.gathered  # [bs*local_seq, hidden]
+        gathered = sym_post.a2a_gemm.gathered  # [bs*local_seq, hidden]
 
         # Step 1: grad w.r.t. gathered input
         grad_gathered = torch.matmul(grad_y, wo_weight)  # [local_m, hidden]

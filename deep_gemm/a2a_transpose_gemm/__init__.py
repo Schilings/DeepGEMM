@@ -84,23 +84,28 @@ def get_symm_buffer_for_a2a_transpose_gemm(group: dist.ProcessGroup,
     return BF16A2ATransposeGemmSymmBuffer(group, bs, nheads, seq, head_dim)
 
 
-def bf16_a2a_transpose(sym_buffer: BF16A2ATransposeGemmSymmBuffer,
+def bf16_a2a_transpose(sym_buffer,
                        seq_major: bool = False) -> torch.Tensor:
     """Run the transpose-scatter comm + SP-group barrier. Returns gathered [bs*local_seq, hidden].
 
-    seq_major=True consumes FlashAttention-native BSHD input (sym.x laid out as
-    [bs, seq, local_nheads, head_dim]) directly — skipping the .permute(BSHD->BHSD).contiguous()
-    that the default BHSD layout would otherwise need on FA's output (that permute is a full HBM
-    pass, worth ~1.25-1.45x on the whole post-attn op). Default False keeps the BHSD x layout
-    [bs, local_nheads, seq, head_dim]."""
+    Accepts either ``BF16A2ATransposeGemmSymmBuffer`` or ``UnifiedSymmBuffer``
+    (with attention params).  For ``UnifiedSymmBuffer``, views are accessed via
+    ``sym_buffer.a2a_gemm.x`` / ``sym_buffer.a2a_gemm.gathered``.
+
+    seq_major=True consumes FlashAttention-native BSHD input. Default False expects BHSD.
+    """
+    # UnifiedSymmBuffer stores views in a2a_gemm NamedTuple; legacy buffer uses flat attrs
+    views = getattr(sym_buffer, 'a2a_gemm', None)
+    x = views.x if views is not None else sym_buffer.x
+    gathered = views.gathered if views is not None else sym_buffer.gathered
+
     _C.bf16_a2a_transpose_comm(
         sym_buffer.buffer, sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.bs, sym_buffer.nheads, sym_buffer.seq, sym_buffer.head_dim, seq_major)
-    # M0: ensure all peers finished writing this rank's gathered region before reading it.
     torch.cuda.synchronize()
     sym_buffer.group.barrier()
     torch.cuda.synchronize()
-    return sym_buffer.gathered
+    return gathered
 
 
 def bf16_a2a_transpose_gemm_nt(d: torch.Tensor,
@@ -146,7 +151,9 @@ def bf16_a2a_transpose_gemm_nt_fused(d: torch.Tensor,
     repeated calls on the same buffer, reset via sym_buffer.reset_barriers() with an SP-group
     sync in between.
     """
+    views = getattr(sym_buffer, 'a2a_gemm', None)
+    gathered = views.gathered if views is not None else sym_buffer.gathered
     _C.bf16_a2a_transpose_gemm_nt(
-        d, sym_buffer.gathered, b, sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
+        d, gathered, b, sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(), sym_buffer.bs, sym_buffer.nheads,
         sym_buffer.seq, sym_buffer.head_dim)

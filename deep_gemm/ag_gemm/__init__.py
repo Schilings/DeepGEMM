@@ -187,8 +187,8 @@ def bf16_ag_gemm_nt_with_input(d: torch.Tensor,
     """
     assert a.ndim == 2 and a.shape[0] == num_tokens
     assert a.shape[1] == sym_buffer.hidden
-    local_x = sym_buffer.ag_x if hasattr(sym_buffer, 'ag_x') else sym_buffer.x
-    slots_x = sym_buffer.ag_slots_x if hasattr(sym_buffer, 'ag_slots_x') else sym_buffer.slots_x
+    local_x = sym_buffer.ag_gemm.local_x
+    slots_x = sym_buffer.ag_gemm.slots_x
     local_x[:num_tokens, :a.shape[1]].copy_(a)
 
     # The C++ communication stream may immediately pull remote ``local_x``.
