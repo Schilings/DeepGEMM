@@ -57,7 +57,8 @@ sym = get_unified_symm_buffer(group, bs, seq, hidden)
 - **`FusedUlysses`（POST 融合）**：POST 使用 `bf16_a2a_transpose_gemm_nt`（A2A+GEMM），PRE 暂时继承 serial baseline（QK RMSNorm 必须在 A2A 前做，`bf16_fused_qkv_norm_a2a_nt` 融合 PRE 是 WIP）。正确性验证：`fwd rel=0.002706, grad_X rel=0.000166, grad_Wo rel=0.000000`。
 - **`UnifiedSymmBuffer` 统一**：fused 和 variant 共用同一种 buffer 类型。新增 `x`/`gathered` 属性（A2A-transpose-GEMM 兼容）、`reset()`/`get_out_view()`/`get_rms_view()` 别名（Fused-QKV-Norm-A2A 兼容）。`x`/`gathered` 在 `_has_attn=False` 时 raise `AttributeError`，避免 AG-GEMM 误用。
 - **`ag_gemm` 修复**：`bf16_ag_gemm_nt_with_input` 优先用 `ag_x`/`ag_slots_x`（而非 `x`/`slots_x`），避免与 `UnifiedSymmBuffer` 的 attention `x` 属性冲突。
-- **`FusedPreQKVFunction`（WIP）**：forward 用 `bf16_fused_qkv_norm_a2a_nt`，backward 用 PyTorch 原生（重算 proj + norm backward + GEMM）。当前 forward seq 排列和 norm 精度需进一步调试，PRE 暂回退 serial baseline。
+- **`FusedPreQKVFunction`（WIP）**：forward 用 `bf16_fused_qkv_norm_a2a_nt`，已验证 forward 正确（Q/K/V rel=0.014 vs serial，seq 排列经 `view(sp,local_seq).transpose(1,2)` permute 后与 serial 一致）。backward（inverse A2A + RMSNorm backward + GEMM）有 bug 导致 grad 误差大（grad_X rel=1.38），需进一步调试 inverse A2A 的排列和 norm backward 的重算逻辑。PRE 暂回退 serial baseline。
+- **FA4 精度限制**：发现 BF16 FA4 对 V 的系统性 BF16 差异（rel=0.014）放大到 attention 输出 rel=0.26，但对随机 V 噪声（rel=0.014）只产生 rel=0.005。这是 BF16 数值精度限制，不是 fused kernel bug。
 - **所有测试通过**：`test_unified_buffer` 7/7、`test_gemm_rs` 6/6、`test_a2a_transpose_gemm` 4/4。
 
 ---

@@ -147,7 +147,12 @@ class FusedPreQKVFunction(torch.autograd.Function):
             norm_k_weight=norm_k_weight,
         )
         ctx.rms = rms  # [bs, seq, 2] fp32 — saved for backward
-        return out  # [bs, seq, local_nqkv] bf16
+        # The fused kernel scatters with rank-major seq ordering [sp, local_seq].
+        # Reorder to [local_seq, sp] to match the serial baseline layout
+        # so that RoPE and attention see the same token sequence.
+        sp = sym_pre.group.size()
+        out = out.view(bs, sp, local_seq, -1).transpose(1, 2).reshape(bs, sp * local_seq, -1)
+        return out  # [bs, seq, local_nqkv] bf16, [local_seq, sp] ordering
 
     @staticmethod
     @once_differentiable
@@ -279,10 +284,10 @@ class FusedPreQKVFunction(torch.autograd.Function):
         # → each rank receives sp slices of [bs, local_seq, local_n]
         # → concatenate along N to get [bs, local_seq, sp*local_n] = [bs, local_seq, n_total]
 
-        # grad_out was permuted in forward to [local_seq, sp] ordering
-        # (matching serial baseline).  Undo that permutation before inverse A2A:
-        # view as [bs, local_seq, sp, local_n] → permute to [sp, bs, local_seq, local_n]
+        # grad_out is in [local_seq, sp] ordering (the permuted layout returned
+        # by forward).  Inverse permute to [sp, local_seq] before inverse A2A.
         send = grad_out.view(bs, local_seq, sp, local_n).permute(2, 0, 1, 3).contiguous()
+        # send: [sp, bs, local_seq, local_n] — send[r] to rank r
         recv = torch.empty_like(send)
         dist.all_to_all_single(recv, send, group=sym_pre.group)
         # recv: [sp, bs, local_seq, local_n] → cat along sp (dim 0) to get

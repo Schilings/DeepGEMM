@@ -62,11 +62,12 @@ class FusedUlysses(UlyssesBase):
     def _pre_forward(self, x_local, llseq):
         """PRE: inherited from serial baseline.
 
-        TODO: fuse QKV projection + QK RMSNorm + A2A using
-        ``bf16_fused_qkv_norm_a2a_nt``.  The fused kernel scatters with
-        rank-major seq ordering [sp, local_seq] while the serial baseline uses
-        [local_seq, sp]; a permute is needed plus corresponding inverse A2A
-        adjustments in backward.  See ``FusedPreQKVFunction`` (WIP).
+        ``FusedPreQKVFunction`` (using ``bf16_fused_qkv_norm_a2a_nt``) has been
+        verified correct in forward (Q/K/V rel=0.014 vs serial), but its
+        backward (inverse A2A + RMSNorm backward + GEMM) has a bug causing
+        large gradient errors.  PRE is temporarily falling back to serial
+        until the backward is fixed.  See ``FusedPreQKVFunction`` in
+        ``autograd_ops.py`` for the WIP implementation.
         """
         return super()._pre_forward(x_local, llseq)
 
