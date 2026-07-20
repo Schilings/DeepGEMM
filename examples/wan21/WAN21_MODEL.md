@@ -53,7 +53,7 @@ patch_size=(1,2,2), text_len=512, in_dim=16, freq_dim=256, text_dim=4096, out_di
 
 ## 官方 14B 权重训练核心吞吐
 
-POST backward 的独立测试、NVTX 和 Nsight Systems 操作见 `docs/ULYSSES_POST_BWD_PROFILING.md`。
+通用 GPU profiling SOP 见 `docs/GPU_PROFILING_GUIDE.md`；Ulysses POST backward 是其中的附录案例。
 
 ```bash
 DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD/examples:$PWD \
