@@ -184,6 +184,11 @@ class UnifiedSymmBuffer:
         self._require_attn('reset_sum_buffer')
         self.sum_buffer.zero_()
 
+    # Alias for compatibility with FusedQKVNormA2ASymmBuffer.reset
+    def reset(self):
+        """Alias for reset_sum_buffer (FusedQKVNormA2ASymmBuffer compat)."""
+        self.reset_sum_buffer()
+
     # ── Views for GEMM-A2A-transpose (pre-attn) ──
     def get_gemm_a2a_out_view(self):
         """[bs, seq, local_n] bf16 — output of GEMM+A2A-transpose."""
@@ -311,6 +316,15 @@ class UnifiedSymmBuffer:
             (self.bs, self.seq, 2),
             dtype=torch.float32, device=self.buffer.device
         ).set_(self.buffer, 32 // 4, (self.bs, self.seq, 2))
+
+    # Aliases for compatibility with FusedQKVNormA2ASymmBuffer
+    def get_out_view(self):
+        """Alias for get_fused_qkv_out_view (FusedQKVNormA2ASymmBuffer compat)."""
+        return self.get_fused_qkv_out_view()
+
+    def get_rms_view(self):
+        """Alias for get_fused_qkv_rms_view (FusedQKVNormA2ASymmBuffer compat)."""
+        return self.get_fused_qkv_rms_view()
 
     @property
     def buffer_ptrs(self):

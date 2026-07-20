@@ -1,18 +1,14 @@
-"""Standard Ulysses with DeepGEMM fused POST communication operator.
+"""Standard Ulysses with DeepGEMM fused PRE and POST communication operators.
 
-PRE (QKV projection + QK RMSNorm + A2A) is identical to the serial baseline,
-because QK RMSNorm must be applied *before* the A2A head-scatter and the fused
-``bf16_gemm_a2a_transpose_nt`` kernel does not support inserting a norm between
-GEMM and A2A.  Using the dedicated ``fused_qkv_norm_a2a`` kernel would change
-the PRE implementation and is left as a future optimization.
+PRE uses ``bf16_fused_qkv_norm_a2a_nt`` (fused QKV projection + QK RMSNorm +
+A2A-transpose) — a single kernel that computes the projection, applies
+RMSNorm in a norm-deferred two-phase approach, and scatters to peers.
 
-POST (A2A-transpose + Wo GEMM) is replaced by DeepGEMM
-``bf16_a2a_transpose_gemm_nt``, which fuses the communication and GEMM using
-symmetric memory.  Wo is replicated, identical to the baseline data layout.
+POST uses ``bf16_a2a_transpose_gemm_nt`` (fused A2A-transpose + Wo GEMM).
 
-A single ``UnifiedSymmBuffer`` is shared with the variant's GEMM-RS / AG-GEMM
-operators — all operators run serially (fwd/bwd not concurrent), so one
-physical allocation is reused across PRE/POST and forward/backward.
+Wo is replicated across SP ranks, identical to the baseline data layout.
+A single ``UnifiedSymmBuffer`` is shared between PRE and POST — all operators
+run serially (fwd/bwd not concurrent), so one physical allocation is reused.
 """
 
 import torch
@@ -21,15 +17,21 @@ import torch.nn as nn
 from deep_gemm import get_unified_symm_buffer
 
 from .base import UlyssesBase
-from ..autograd_ops import fused_post_wo
+from ..autograd_ops import fused_pre_qkv, fused_post_wo
+
+
+def _build_wqkv(Wq, Wk, Wv):
+    """Build fused QKV weight in [Q | K | V] segment layout.
+
+    Returns ``[q_dim + 2*kv_dim, hidden]`` = ``[3*hidden, hidden]`` for MHA,
+    matching the layout expected by ``bf16_fused_qkv_norm_a2a_nt``:
+    ``b = [Wq(q_dim, K); Wk(kv_dim, K); Wv(kv_dim, K)]``.
+    """
+    return torch.cat([Wq, Wk, Wv], dim=0).contiguous()
 
 
 class FusedUlysses(UlyssesBase):
-    """Standard Ulysses with DeepGEMM fused POST operator.
-
-    PRE is inherited unchanged from :class:`UlyssesBase`.  Only POST uses
-    the DeepGEMM fused A2A-transpose + Wo GEMM.
-    """
+    """Standard Ulysses with DeepGEMM fused PRE and POST operators."""
 
     def __init__(self, config, sp_config):
         sp_config.use_fused_ops = True
@@ -37,6 +39,7 @@ class FusedUlysses(UlyssesBase):
         super().__init__(config, sp_config)
         self.sym_post = None
         self._owns_sym_post = False
+        self._wqkv = None  # rebuilt each forward from current q/k/v weights
 
     def _create_buffers(self):
         self.sym_post = get_unified_symm_buffer(
@@ -46,7 +49,7 @@ class FusedUlysses(UlyssesBase):
         self._owns_sym_post = True
 
     def share_buffers_from(self, other):
-        """Borrow the POST workspace shared serially by all attention layers."""
+        """Borrow the workspace shared serially by all attention layers."""
         self.sym_post = other.sym_post
         self._owns_sym_post = False
 
@@ -56,12 +59,21 @@ class FusedUlysses(UlyssesBase):
         self.sym_post = None
         self._owns_sym_post = False
 
+    def _pre_forward(self, x_local, llseq):
+        """PRE: inherited from serial baseline.
+
+        TODO: fuse QKV projection + QK RMSNorm + A2A using
+        ``bf16_fused_qkv_norm_a2a_nt``.  The fused kernel scatters with
+        rank-major seq ordering [sp, local_seq] while the serial baseline uses
+        [local_seq, sp]; a permute is needed plus corresponding inverse A2A
+        adjustments in backward.  See ``FusedPreQKVFunction`` (WIP).
+        """
+        return super()._pre_forward(x_local, llseq)
+
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
         """POST: fused A2A-transpose + Wo GEMM.
 
         ``o`` is the FA4 output: [bs, seq, local_nh, hd] (BSHD layout).
-        It is passed to ``fused_post_wo`` which copies it into sym_post.x
-        (transposed to BHSD) and runs the fused A2A+GEMM.
         """
         local_m = lbs * llseq
         y = fused_post_wo(o, self.model.o.weight, self.sym_post, local_m, self.bs)

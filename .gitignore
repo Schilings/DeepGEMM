@@ -28,4 +28,4 @@ koala-ssh.ps1
 koala-ssh.bat
 
 # Dev directory
-dev/
+dev/kernel.pch
