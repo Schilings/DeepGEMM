@@ -1,7 +1,7 @@
 # DeepGEMM 项目长期记忆
 
 ## 当前进度（2026-07-19，Wan2.1 Ulysses POST 变体）
-- **状态：显存与真实 14B 权重训练核心吞吐均已实测。** 详见 `memory/2026-07-19.md`。
+- **状态：显存与真实 14B 权重训练核心吞吐均已实测。** 权威结果表见 `examples/ulysses_variant/WAN21_ULYSSES_BENCH.md`，过程记忆见 `memory/2026-07-19.md`。
 - 严格两臂：baseline=纯 torch 同步 Ulysses + FA4（无融合算子）；variant=只换 POST 为 GEMM-RS/AG-GEMM。两臂 PRE/RoPE/attention 共用同一代码且都用 FA4。
 - 关键坑：本机 8 卡 = `SP=8, DP=1`，**不能把 SP group 当 FSDP group**（否则 baseline Wo 被切 1/8 抹掉收益）。
 - 显存实测（attention stack + FP32 Adam）：B300×8、40 层 → 8K 省 9.9 GiB(20.6%)，32K 省 9.6 GiB(14.0%)。

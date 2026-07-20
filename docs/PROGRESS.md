@@ -54,34 +54,18 @@ sym = get_unified_symm_buffer(group, bs, seq, hidden)
 
 ---
 
-## Wan2.1 14B Ulysses SP Attention Benchmark（2026-06-30 新增）
+## Wan2.1 14B Ulysses POST 变体（2026-07-20 更新）
 
-> 详见 `docs/WAN21_ULYSSES_BENCH.md`。代码在 `benchmarks/wan21/`。
+> 当前权威结果见 `examples/ulysses_variant/WAN21_ULYSSES_BENCH.md`，代码在 `examples/ulysses_variant/`。通用 profiling 方法见 `docs/GPU_PROFILING_GUIDE.md`。
 
-真实 Wan2.1 14B 训练场景（THD/PackedSequence），三条策略对比 FWD+BWD：
+当前采用严格两臂 POST-only 消融：PRE/RoPE/FA4 完全共用，baseline 为同步 A2A+完整 Wo，variant 为 Wo 输入列分片 GEMM-RS/AG-GEMM。旧三策略 benchmark 和沿 SP group 做 FSDP2 的结果不再作为当前显存或真实训练吞吐结论。
 
-| 策略 | PRE | POST | BWD POST | BWD PRE |
-|------|-----|------|----------|---------|
-| **serial** (baseline) | matmul + NCCL A2A | NCCL A2A + matmul | serial A2A-inv + matmul | serial A2A-inv + matmul |
-| **fused_std** | `bf16_gemm_a2a_transpose_nt` | `bf16_a2a_transpose_gemm_nt_fused` | serial A2A-inv + matmul | **`bf16_a2a_transpose_gemm_nt`** (M0, Wqkv_t) |
-| **fused_var** | `bf16_gemm_a2a_transpose_nt` | `bf16_gemm_rs_nt` (Wo 行拆分) | **`bf16_ag_gemm_nt`** (AG+GEMM) | **`bf16_a2a_transpose_gemm_nt`** (M0, Wqkv_t) |
+B300×8 当前结论：
 
-8 GPU B300 结果（FWD+BWD+SYNC, us；SYNC=FSDP2 风格 reduce-scatter）：
-
-| Shape | serial | fused_std | fused_var | 加速比 |
-|-------|--------|-----------|-----------|--------|
-| 1x8K | 5235 | 6503 | **4790** | 1.09x |
-| 1x32K | 18495 | 19436 | **17344** | 1.07x |
-| 1x74K | 75029 | 74013 | **72007** | 1.04x |
-| 1x168K | 342293 | 340631 | **334881** | 1.02x |
-| 1x64K | 58994 | 58062 | **56353** | 1.05x |
-| 1x148K | 269424 | 266182 | **264714** | 1.02x |
-
-- **fused_var 全面最优**：所有 shape FWD+BWD+SYNC 都最快
-- **梯度同步**：FSDP2 风格 reduce-scatter（Wqkv 总是；Wo 对 serial/fused_std，**fused_var 跳过**因 Wo 行切分）
-- **SYNC 开销**：fused_var 的 SYNC 比 serial/fused_std 少 ~30-38%（省掉 Wo 的 reduce-scatter）
-- **正确性**：2卡 1x8K/1x168K/1x148K serial+fused_std verify → FWD rel~0.0019, BWD grad_X~0.0016, grad_W~0.0030 → PASS
-- **后续优化**：BWD PRE 已改用融合 A2A+GEMM (M0, Wqkv_t NT)，正确性验证通过(gX_rel=0.0016)但加速不显著(comm 数据量小)；attention 是长序列瓶颈可考虑 SP+CP
+- 40 层 attention stack + FP32 Adam：8K 峰值显存省 9,913.9MB（20.6%），32K 省 9,629.9MB（14.0%）；
+- 官方 14B 权重、40 个完整 Transformer block、8K、DDP overlap：serial 29,249.9 tokens/s，variant 28,193.0 tokens/s（-3.61%）；
+- SP=8 所有 rank `grad_X rel=0`；
+- Nsight 已确认 POST BWD 慢点是 AG 8×远端 payload和 kernel 内等待，不是 torch GEMM。
 
 ---
 
