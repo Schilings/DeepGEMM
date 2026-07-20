@@ -208,20 +208,36 @@ python3 examples/ulysses_variant/bench_wan21_14b_train.py \
   --strategies serial,fused_var --sync-mode ddp
 ```
 
+DG_AG_PUBLISH_SYNC=symm \
+DG_JIT_USE_NVRTC=1 \
+PYTHONPATH=$PWD/examples:$PWD \
+PYTHONWARNINGS=ignore \
+python3 examples/ulysses_variant/bench_wan21_14b_train.py \
+  8 --layers 40 --seq 8192 --warmup 3 --iters 10 \
+  --strategies serial,fused,fused_var --sync-mode ddp
+```
+
 B300×8、SP=8、BF16、官方 14B 权重；时间为同步后的 rank-max wall-clock：
 
 | Strategy | FWD | BWD（含 DDP overlap） | Wall | Global tokens/s | PyTorch peak + workspace |
 |---|---:|---:|---:|---:|---:|
-| serial | 94.33 ms | 185.77 ms | 280.07 ms | 29,249.9 | 75,202.0 MiB |
-| fused_var | 92.13 ms | 198.46 ms | 290.57 ms | 28,193.0 | 71,252.6 MiB |
+| serial | 121.86 ms | 186.31 ms | 308.21 ms | 26,579.3 | 75,202.0 MiB |
+| **fused** | **96.47 ms** | 188.04 ms | **284.42 ms** | **28,802.5** | 76,583.9 MiB |
+| fused_var | 92.75 ms | 198.45 ms | 291.25 ms | 28,126.9 | 71,250.0 MiB |
 
 最终吞吐：
 
 ```text
-fused_var / serial = 0.9639x（-3.61%）
+fused     / serial = 1.0838x（+8.38%）
+fused_var / serial = 1.0584x（+5.84%）
+fused     / fused_var = 1.0240x（+2.40%）
 ```
 
-反转执行顺序复测：serial 29,425.2 tokens/s，variant 28,417.5 tokens/s，即 `-3.42%`，结论不依赖两臂运行顺序。
+关键观察：
+
+1. **fused FWD 比 serial 快 25ms**（121.86→96.47）：`bf16_fused_qkv_norm_a2a_nt` 把 GEMM+Norm+A2A 融成单 kernel，省去 3 次独立 GEMM + norm + 3 次 A2A 的 kernel launch 和中间 buffer 读写。
+2. **fused BWD 和 serial 持平**（188.04 vs 186.31）：analytical norm backward（直接用公式 `grad_x = grad_y·rms·w - x·(rms³/dim)·Σ(grad_y·x·w)`）避免了 PyTorch autograd 的 retain_graph + backward 开销，只多一次重算 GEMM。
+3. **fused_var BWD 仍比 serial 慢 12ms**（198.45 vs 186.31）：AG remote payload = 8× A2A，根因未变。
 
 此表的 peak 不含 FP32 Adam 状态，且 DDP reducer buckets 会提高显存，因此显存结论仍以上面的专用显存实验为准。
 
