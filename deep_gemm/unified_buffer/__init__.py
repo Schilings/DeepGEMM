@@ -195,13 +195,41 @@ class UnifiedSymmBuffer:
         ).set_(self.buffer, 32 // elem_size, (self.bs, self.seq, self.local_n))
 
     # ── Views for A2A-transpose-GEMM (post-attn) ──
+    @property
+    def x(self):
+        """[bs, local_nheads, seq, head_dim] bf16 — write attention output here.
+
+        Compatible with ``BF16A2ATransposeGemmSymmBuffer.x`` so that
+        ``bf16_a2a_transpose`` / ``bf16_a2a_transpose_gemm_nt`` can accept a
+        ``UnifiedSymmBuffer`` directly.
+
+        Raises ``AttributeError`` when attention params are not set, so that
+        ``hasattr(sym_buffer, 'x')`` returns ``False`` for non-attention buffers
+        (e.g. variant's GEMM-RS/AG-GEMM buffer).
+        """
+        if not self._has_attn:
+            raise AttributeError('x')
+        return self.get_a2a_transpose_gemm_views()[0]
+
+    @property
+    def gathered(self):
+        """[bs*local_seq, hidden] bf16 — A matrix for Wo GEMM (filled by comm).
+
+        Compatible with ``BF16A2ATransposeGemmSymmBuffer.gathered``.
+
+        Raises ``AttributeError`` when attention params are not set.
+        """
+        if not self._has_attn:
+            raise AttributeError('gathered')
+        return self.get_a2a_transpose_gemm_views()[1]
+
     def get_a2a_transpose_gemm_views(self):
         """Returns (x, gathered) views for A2A-transpose+GEMM.
         x: [bs, local_nheads, seq, head_dim] — write attention output here
         gathered: [bs*local_seq, hidden] — A matrix for Wo GEMM"""
         self._require_attn('get_a2a_transpose_gemm_views')
-        # barrier region for this op is variable; use 128B aligned start
-        barrier_bytes = 128  # fixed: enough for per-tile barriers + signal
+        # barrier region: align((num_m_tiles+1)*4, 128) — matches C++ layout
+        barrier_bytes = self._a2a_barrier_bytes()
         data_bytes = self.bs * self.local_nheads * self.seq * self.head_dim * 2  # bf16
         x = torch.empty(
             (self.bs, self.local_nheads, self.seq, self.head_dim),
@@ -215,11 +243,24 @@ class UnifiedSymmBuffer:
                (self.bs * self.local_seq, self.hidden))
         return x, gathered
 
+    def _a2a_barrier_bytes(self):
+        """Match C++ BF16A2ATransposeGemmWorkspace::get_barrier_bytes()."""
+        k_tile_m = 128
+        local_seq = self.local_seq
+        num_m_tiles = self.bs * ((local_seq + k_tile_m - 1) // k_tile_m)
+        n = (num_m_tiles + 1) * 4
+        return (n + 127) // 128 * 128
+
     def reset_a2a_barriers(self):
         """Zero per-tile barrier region for A2A-transpose-GEMM fused path."""
         self._require_attn('reset_a2a_barriers')
-        barrier_bytes = 128
+        barrier_bytes = self._a2a_barrier_bytes()
         self.buffer[:barrier_bytes].zero_()
+
+    # Alias for compatibility with BF16A2ATransposeGemmSymmBuffer.reset_barriers
+    def reset_barriers(self):
+        """Alias for reset_a2a_barriers (BF16A2ATransposeGemmSymmBuffer compat)."""
+        self.reset_a2a_barriers()
 
     # ── Views for GEMM-RS (general linear, no attention needed) ──
     # GEMM-RS uses its own C++ workspace struct with base=buffer.data_ptr()

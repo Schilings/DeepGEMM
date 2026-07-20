@@ -10,13 +10,15 @@ POST (A2A-transpose + Wo GEMM) is replaced by DeepGEMM
 ``bf16_a2a_transpose_gemm_nt``, which fuses the communication and GEMM using
 symmetric memory.  Wo is replicated, identical to the baseline data layout.
 
-One symmetric buffer (POST) is allocated and reused across layers/iterations.
+A single ``UnifiedSymmBuffer`` is shared with the variant's GEMM-RS / AG-GEMM
+operators — all operators run serially (fwd/bwd not concurrent), so one
+physical allocation is reused across PRE/POST and forward/backward.
 """
 
 import torch
 import torch.nn as nn
 
-from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
+from deep_gemm import get_unified_symm_buffer
 
 from .base import UlyssesBase
 from ..autograd_ops import fused_post_wo
@@ -37,11 +39,10 @@ class FusedUlysses(UlyssesBase):
         self._owns_sym_post = False
 
     def _create_buffers(self):
-        self.sym_post = get_symm_buffer_for_a2a_transpose_gemm(
-            self.group, self.bs, self.cfg.num_heads, self.seq, self.head_dim)
-        # Expose num_bytes for MultiLayerModel.sym_buf_bytes() compatibility
-        # with UnifiedSymmBuffer (used by the variant).
-        self.sym_post.num_bytes = self.sym_post.buffer.numel()
+        self.sym_post = get_unified_symm_buffer(
+            self.group, self.bs, self.seq, self.cfg.dim,
+            q_nheads=self.cfg.num_heads, kv_nheads=self.cfg.num_heads,
+            head_dim=self.head_dim, out_dtype=torch.bfloat16)
         self._owns_sym_post = True
 
     def share_buffers_from(self, other):
@@ -55,18 +56,12 @@ class FusedUlysses(UlyssesBase):
         self.sym_post = None
         self._owns_sym_post = False
 
-    def sym_buf_bytes(self):
-        """Bytes of the POST symmetric buffer (0 if not yet allocated)."""
-        if self.sym_post is None:
-            return 0
-        return self.sym_post.buffer.numel()
-
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
         """POST: fused A2A-transpose + Wo GEMM.
 
         ``o`` is the FA4 output: [bs, seq, local_nh, hd] (BSHD layout).
         It is passed to ``fused_post_wo`` which copies it into sym_post.x
-        (seq_major=True) and runs the fused A2A+GEMM.
+        (transposed to BHSD) and runs the fused A2A+GEMM.
         """
         local_m = lbs * llseq
         y = fused_post_wo(o, self.model.o.weight, self.sym_post, local_m, self.bs)
