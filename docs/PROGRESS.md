@@ -47,10 +47,18 @@ sym = get_unified_symm_buffer(group, bs, seq, hidden)
 
 ### 2026-07-17：wan21 例子迁移到 unified buffer
 
-- `examples/wan21` 的 `GemmRSFunction` + `fused_variant.py` 已从旧两独立 buffer 迁到单个 `get_unified_symm_buffer`：fwd GEMM+RS、bwd AG+GEMM 共用同一块物理 buffer，跨层经 `share_buffers_from` 共享。
+- `examples/wan21` 的 `GemmRSFunction` + `variant.py` 已从旧两独立 buffer 迁到单个 `get_unified_symm_buffer`：fwd GEMM+RS、bwd AG+GEMM 共用同一块物理 buffer，跨层经 `share_buffers_from` 共享。
 - 动机：用户要求「全局所有层、一个固定大小 buffer、fwd/bwd 都复用，不增加多余开销和显存」——这正是 `UnifiedSymmBuffer` 的设计。
 - 实现细节见 `docs/SYM_BUF_SHARING_ANALYSIS.md` 2026-07-17 节。
-- **待办**：B300 上跑 2 卡 `verify_wan21_attn.py` 确认 fused_var 的 bX_rel 仍 PASS（本机无 GPU，未验证）。
+
+### 2026-07-20：fused 策略实现 + UnifiedSymmBuffer 统一 + 文件重命名
+
+- **文件重命名**：`fused_standard.py` → `fused.py`（`FusedUlysses`），`fused_variant.py` → `variant.py`（`FusedVariantUlysses`）。
+- **`FusedUlysses`（POST 融合）**：POST 使用 `bf16_a2a_transpose_gemm_nt`（A2A+GEMM），PRE 暂时继承 serial baseline（QK RMSNorm 必须在 A2A 前做，`bf16_fused_qkv_norm_a2a_nt` 融合 PRE 是 WIP）。正确性验证：`fwd rel=0.002706, grad_X rel=0.000166, grad_Wo rel=0.000000`。
+- **`UnifiedSymmBuffer` 统一**：fused 和 variant 共用同一种 buffer 类型。新增 `x`/`gathered` 属性（A2A-transpose-GEMM 兼容）、`reset()`/`get_out_view()`/`get_rms_view()` 别名（Fused-QKV-Norm-A2A 兼容）。`x`/`gathered` 在 `_has_attn=False` 时 raise `AttributeError`，避免 AG-GEMM 误用。
+- **`ag_gemm` 修复**：`bf16_ag_gemm_nt_with_input` 优先用 `ag_x`/`ag_slots_x`（而非 `x`/`slots_x`），避免与 `UnifiedSymmBuffer` 的 attention `x` 属性冲突。
+- **`FusedPreQKVFunction`（WIP）**：forward 用 `bf16_fused_qkv_norm_a2a_nt`，backward 用 PyTorch 原生（重算 proj + norm backward + GEMM）。当前 forward seq 排列和 norm 精度需进一步调试，PRE 暂回退 serial baseline。
+- **所有测试通过**：`test_unified_buffer` 7/7、`test_gemm_rs` 6/6、`test_a2a_transpose_gemm` 4/4。
 
 ---
 

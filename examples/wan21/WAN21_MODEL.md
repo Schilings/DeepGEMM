@@ -12,7 +12,7 @@ examples/wan21/
   config.py         — Wan21Config dataclass
   autograd_ops.py   — torch.autograd.Function wrappers for fused ops
   fsdp2_utils.py    — FSDP2 (fully_shard) integration
-  sp/               — SP strategies (serial, fused_standard, fused_variant)
+  sp/               — SP strategies (serial, fused, variant)
 ```
 
 ## 官方权重验证

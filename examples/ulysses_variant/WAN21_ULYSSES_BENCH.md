@@ -25,7 +25,7 @@
 | `serial` baseline | 同步 NCCL A2A → 完整 `Wo` 的 `nn.Linear` | torch autograd → 同步逆 A2A |
 | `fused_var` | 本地 Wo 输入列分片 → DeepGEMM GEMM+RS | DeepGEMM AG+GEMM → 本地 Wo shard 梯度 GEMM |
 
-`serial` 不调用任何 DeepGEMM 通信融合算子。`fused_std` 仅保留为旧命令行的兼容别名，执行内容与 `serial` 完全相同，不属于本消融的第三条路径。
+`serial` 不调用任何 DeepGEMM 通信融合算子。`fused` 策略（`sp/fused.py` 中的 `FusedUlysses`）POST 使用 `bf16_a2a_transpose_gemm_nt` 融合 A2A+GEMM，PRE 暂继承 serial baseline；它不属于本 POST-only 消融的第三条路径，但可作为标准 Ulysses 融合通信的参照。
 
 ## 实验入口
 
