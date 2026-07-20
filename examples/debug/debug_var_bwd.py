@@ -10,7 +10,7 @@ def run(rank, ng, port):
     from wan21.config import Wan21Config, SPConfig
     from wan21.model import WanSelfAttention
     from wan21.sp.serial import SerialUlysses
-    from wan21.sp.fused_variant import FusedVariantUlysses
+    from wan21.sp.variant import FusedVariantUlysses
     cfg = Wan21Config(dim=5120, num_heads=40, head_dim=128)
     dim = cfg.dim
     s_cfg = SPConfig(sp_size=ng, group=dist.group.WORLD, layout='THD')

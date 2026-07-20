@@ -8,14 +8,17 @@ import torch
 import torch.nn as nn
 
 from .model import WanFeedForward, WanLayerNorm, WanT2VCrossAttention
-from .sp.fused_variant import FusedVariantUlysses
+from .sp.fused import FusedUlysses
 from .sp.serial import SerialUlysses
+from .sp.variant import FusedVariantUlysses
 
 
 def _make_self_attention(strategy: str, config, sp_config):
     layer_sp_config = replace(sp_config)
     if strategy == "serial":
         return SerialUlysses(config, layer_sp_config)
+    if strategy == "fused":
+        return FusedUlysses(config, layer_sp_config)
     if strategy == "fused_var":
         return FusedVariantUlysses(config, layer_sp_config)
     raise ValueError(f"Unknown strategy: {strategy}")

@@ -34,8 +34,10 @@ from wan21.config import Wan21Config, SPConfig
 def get_strategy(name, cfg, sp_cfg):
     if name == 'serial':
         from wan21.sp.serial import SerialUlysses; return SerialUlysses(cfg, sp_cfg)
+    elif name == 'fused':
+        from wan21.sp.fused import FusedUlysses; return FusedUlysses(cfg, sp_cfg)
     elif name == 'fused_var':
-        from wan21.sp.fused_variant import FusedVariantUlysses; return FusedVariantUlysses(cfg, sp_cfg)
+        from wan21.sp.variant import FusedVariantUlysses; return FusedVariantUlysses(cfg, sp_cfg)
     raise ValueError(name)
 
 

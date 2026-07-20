@@ -1,12 +1,77 @@
-"""Compatibility alias for the standard synchronous Ulysses path.
+"""Standard Ulysses with DeepGEMM fused POST communication operator.
 
-There is intentionally no "fused standard" arm in the POST-only ablation.  The
-class remains for older command lines, but it executes exactly the pure PyTorch
-baseline and allocates no DeepGEMM workspace.
+PRE (QKV projection + QK RMSNorm + A2A) is identical to the serial baseline,
+because QK RMSNorm must be applied *before* the A2A head-scatter and the fused
+``bf16_gemm_a2a_transpose_nt`` kernel does not support inserting a norm between
+GEMM and A2A.  Using the dedicated ``fused_qkv_norm_a2a`` kernel would change
+the PRE implementation and is left as a future optimization.
+
+POST (A2A-transpose + Wo GEMM) is replaced by DeepGEMM
+``bf16_a2a_transpose_gemm_nt``, which fuses the communication and GEMM using
+symmetric memory.  Wo is replicated, identical to the baseline data layout.
+
+One symmetric buffer (POST) is allocated and reused across layers/iterations.
 """
 
-from .serial import SerialUlysses
+import torch
+import torch.nn as nn
+
+from deep_gemm.a2a_transpose_gemm import get_symm_buffer_for_a2a_transpose_gemm
+
+from .base import UlyssesBase
+from ..autograd_ops import fused_post_wo
 
 
-class FusedStandardUlysses(SerialUlysses):
-    pass
+class FusedUlysses(UlyssesBase):
+    """Standard Ulysses with DeepGEMM fused POST operator.
+
+    PRE is inherited unchanged from :class:`UlyssesBase`.  Only POST uses
+    the DeepGEMM fused A2A-transpose + Wo GEMM.
+    """
+
+    def __init__(self, config, sp_config):
+        sp_config.use_fused_ops = True
+        sp_config.post_strategy = 'a2a_gemm'
+        super().__init__(config, sp_config)
+        self.sym_post = None
+        self._owns_sym_post = False
+
+    def _create_buffers(self):
+        self.sym_post = get_symm_buffer_for_a2a_transpose_gemm(
+            self.group, self.bs, self.cfg.num_heads, self.seq, self.head_dim)
+        # Expose num_bytes for MultiLayerModel.sym_buf_bytes() compatibility
+        # with UnifiedSymmBuffer (used by the variant).
+        self.sym_post.num_bytes = self.sym_post.buffer.numel()
+        self._owns_sym_post = True
+
+    def share_buffers_from(self, other):
+        """Borrow the POST workspace shared serially by all attention layers."""
+        self.sym_post = other.sym_post
+        self._owns_sym_post = False
+
+    def destroy_buffers(self):
+        if self._owns_sym_post and self.sym_post is not None:
+            self.sym_post.destroy()
+        self.sym_post = None
+        self._owns_sym_post = False
+
+    def sym_buf_bytes(self):
+        """Bytes of the POST symmetric buffer (0 if not yet allocated)."""
+        if self.sym_post is None:
+            return 0
+        return self.sym_post.buffer.numel()
+
+    def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
+        """POST: fused A2A-transpose + Wo GEMM.
+
+        ``o`` is the FA4 output: [bs, seq, local_nh, hd] (BSHD layout).
+        It is passed to ``fused_post_wo`` which copies it into sym_post.x
+        (seq_major=True) and runs the fused A2A+GEMM.
+        """
+        local_m = lbs * llseq
+        y = fused_post_wo(o, self.model.o.weight, self.sym_post, local_m, self.bs)
+        return y + self.model.o.bias
+
+
+# Compatibility alias for older imports.
+FusedStandardUlysses = FusedUlysses

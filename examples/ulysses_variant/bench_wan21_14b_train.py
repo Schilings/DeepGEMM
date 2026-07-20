@@ -1,11 +1,12 @@
 """Real-weight Wan2.1 T2V-14B transformer training-core benchmark.
 
 The benchmark runs the official 40 transformer blocks with Ulysses sequence
-parallelism. Baseline and variant share every operation and checkpoint tensor;
-only self-attention POST differs:
+parallelism. Baseline, fused and variant share every operation and checkpoint
+tensor; only self-attention PRE/POST differs:
 
-  serial:    A2A + replicated Wo
-  fused_var: column-sharded Wo + fused GEMM-ReduceScatter
+  serial:    torch matmul + synchronous NCCL A2A, replicated Wo
+  fused:     DeepGEMM fused GEMM+A2A (PRE) and A2A+GEMM (POST), replicated Wo
+  fused_var: torch PRE + DeepGEMM GEMM+RS / AG+GEMM POST, column-sharded Wo
 
 Reported throughput covers forward, backward and SP gradient synchronization.
 It intentionally excludes optimizer.step(), patch/text/time embeddings and the
