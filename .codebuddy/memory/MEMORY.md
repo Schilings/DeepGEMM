@@ -8,7 +8,7 @@
 - 真实权重吞吐：官方 checkpoint 严格加载 40 blocks/1080 tensors/14.056B params。最终严格 wall-clock、warmup=3/iters=10、DDP overlap、AG 发布+消费双 barrier：baseline 29,250 vs variant 28,193 tok/s，variant **-3.61%**。
 - SP 梯度：所有复制参数都需跨 SP reduce；variant 只有 `Wo_r_local` 不做 SP reduce，因为其 backward 已 AG 完整 `grad_y` 且各 rank 持有不同输入列 shard。若有 DP，Wo 仍需在对应 DP group 同步。
 - AG 生命周期已从 host fence 改成两个 stream-ordered `sym_buffer.handle.barrier()`：一个发布本代输入，一个确认所有 peer 已消费后才允许下一层覆盖；SP=8 实测 grad_X rel=0。最终 40 层 BWD variant 198.46ms，baseline 185.77ms。
-- BWD 剩余慢点是 AG 本体：8K/SP8 每 rank AG 远端 payload 70 MiB，baseline A2A 为 8.75 MiB，理论正好 **8×**；当前 AG 在单 comm stream 串行提交 7 peers×4 chunks 的 memcpy，组件实测 AG+GEMM 0.54–0.66ms，而同形状纯 GEMM约 0.07ms。
+- BWD 剩余慢点已由重复独立测试+Nsight 确认为 AG 本体：8K/SP8 远端 payload 70 vs A2A 8.75 MiB（8×）；AG kernel 约 475.7us、同形状纯 GEMM 45.1us、NCCL A2A kernel 46.9us。真实 autograd POST BWD 均值：8K variant≈1.34× baseline，32K≈1.97×。
 
 ## 约定（用户偏好）
 - **工作记忆存放在本仓库内** `DeepGEMM/.codebuddy/memory/`，随 git 一起 commit & push（2026-06-28 用户明确要求）。
