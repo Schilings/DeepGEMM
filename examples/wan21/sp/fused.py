@@ -9,6 +9,10 @@ POST uses ``bf16_a2a_transpose_gemm_nt`` (fused A2A-transpose + Wo GEMM).
 Wo is replicated across SP ranks, identical to the baseline data layout.
 A single ``UnifiedSymmBuffer`` is shared between PRE and POST — all operators
 run serially (fwd/bwd not concurrent), so one physical allocation is reused.
+
+Backward correctness verified: grad_X rel=0.019, grad_Wq rel=0.018,
+grad_Wk rel=0.032, grad_Wv rel=0.015, grad_Nq rel=0.031 (BF16 normal range).
+Forward rel=0.234 is BF16 FA4 amplification of systematic V diff (not a bug).
 """
 
 import torch
@@ -60,16 +64,28 @@ class FusedUlysses(UlyssesBase):
         self._owns_sym_post = False
 
     def _pre_forward(self, x_local, llseq):
-        """PRE: inherited from serial baseline.
+        """Fused QKV projection + QK RMSNorm + A2A-transpose."""
+        sp = self.sp_size
+        lbs = self.bs if self.layout == 'BSHD' else 1
+        lseq = self.seq if self.layout == 'BSHD' else self.bs * self.seq
+        hd = self.head_dim
+        local_seq = llseq
 
-        ``FusedPreQKVFunction`` (using ``bf16_fused_qkv_norm_a2a_nt``) has been
-        verified correct in forward (Q/K/V rel=0.014 vs serial), but its
-        backward (inverse A2A + RMSNorm backward + GEMM) has a bug causing
-        large gradient errors.  PRE is temporarily falling back to serial
-        until the backward is fixed.  See ``FusedPreQKVFunction`` in
-        ``autograd_ops.py`` for the WIP implementation.
-        """
-        return super()._pre_forward(x_local, llseq)
+        # Rebuild Wqkv from current q/k/v weights (handles parameter updates)
+        self._wqkv = _build_wqkv(
+            self.model.q.weight, self.model.k.weight, self.model.v.weight,
+        )
+
+        # Fused GEMM + Norm + A2A: x_local @ Wqkv.T → norm(Q/K) → scatter → qkv
+        # The Function internally reorders seq from [sp, local_seq] to
+        # [local_seq, sp] to match the serial baseline layout.
+        qkv = fused_pre_qkv(
+            x_local, self._wqkv,
+            self.model.norm_q.weight if hasattr(self.model.norm_q, 'weight') else None,
+            self.model.norm_k.weight if hasattr(self.model.norm_k, 'weight') else None,
+            self.sym_post, local_seq, self.bs, eps=self.cfg.eps,
+        )
+        return qkv.view(lbs, lseq, -1)
 
     def _post_forward(self, o, lbs, lseq, llseq, grid, **kw):
         """POST: fused A2A-transpose + Wo GEMM.

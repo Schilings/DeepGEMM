@@ -290,9 +290,15 @@ class FusedPreQKVFunction(torch.autograd.Function):
         # send: [sp, bs, local_seq, local_n] — send[r] to rank r
         recv = torch.empty_like(send)
         dist.all_to_all_single(recv, send, group=sym_pre.group)
-        # recv: [sp, bs, local_seq, local_n] → cat along sp (dim 0) to get
-        # [bs, local_seq, sp*local_n] = [bs, local_seq, n_total]
-        grad_proj_normed = recv.permute(1, 2, 0, 3).reshape(bs * local_seq, n_total)
+        # recv: [sp, bs, local_seq, local_n]
+        # Each recv[r] contains head group r's gradient for our tokens.
+        # local_n = local_q_n + 2*local_kv_n, layout [Q_seg | K_seg | V_seg]
+        # (each seg = local_hidden for MHA).
+        # Need to reorder from [sp, Q|K|V] to [Q(all sp) | K(all sp) | V(all sp)]
+        # = n_total layout [Q(q_dim) | K(kv_dim) | V(kv_dim)].
+        recv = recv.view(sp, bs, local_seq, 3, local_hidden)  # [sp, bs, ls, 3, lh]
+        recv = recv.permute(1, 2, 3, 0, 4)  # [bs, ls, 3, sp, lh]
+        grad_proj_normed = recv.reshape(bs * local_seq, n_total)
 
         # Now grad_proj_normed is [bs*local_seq, n_total] with Q/K/V segments.
         # But this is POST-norm gradient. We need to go through norm backward
@@ -387,7 +393,13 @@ class FusedPreQKVFunction(torch.autograd.Function):
             # Backward through norm (single call, Q and K share the proj graph)
             torch.autograd.backward([q_normed, k_normed], [grad_q_normed, grad_k_normed])
 
-        grad_proj = proj.grad  # [bs*local_seq, n_total]
+        grad_proj = proj.grad  # [bs*local_seq, n_total] — only Q/K filled by norm backward
+        # V segment has no norm, so its gradient passes through directly.
+        # autograd.backward only touched Q/K (via q_normed/k_normed);
+        # fill V segment manually.
+        grad_proj[:, q_dim+kv_dim:] = grad_proj_normed[:, q_dim+kv_dim:]
+
+        # GEMM backward: grad_X = grad_proj @ wqkv, grad_Wqkv = grad_proj.T @ x
         grad_x = torch.matmul(grad_proj, wqkv)
         grad_wqkv = torch.matmul(grad_proj.t(), x_local)
 
