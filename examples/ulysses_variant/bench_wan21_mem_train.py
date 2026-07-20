@@ -5,15 +5,30 @@ symmetric workspace.  All GPUs form one sequence-parallel group and DP=1, so
 parameters are not FSDP-sharded across that same SP dimension.  Standard
 Ulysses replicates Wo across SP ranks; the variant owns only a 1/SP Wo shard.
 
-Usage: python examples/bench_wan21_mem_train.py <num_gpus> [num_layers] [seq]
+By default the benchmark loads the official Wan2.1 T2V-14B checkpoint so the
+memory ablation uses the same weights as the real training throughput
+benchmark (``bench_wan21_14b_train.py``).  Pass ``--synthetic`` to fall back to
+deterministic random weights for quick smoke tests without the checkpoint.
+
+Usage: python examples/bench_wan21_mem_train.py <num_gpus> [num_layers] [seq] [strategies]
+                                              [--checkpoint-dir DIR | --synthetic]
 """
 
+import argparse
 import os, sys, math
 import torch, torch.nn as nn, torch.distributed as dist, torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from wan21.config import Wan21Config, SPConfig
+EXAMPLES_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if EXAMPLES_DIR not in sys.path:
+    sys.path.insert(0, EXAMPLES_DIR)
+
 from wan21.bench_utils import find_free_port
+from wan21.checkpoint import (
+    OFFICIAL_REPO_ID,
+    load_and_broadcast_official_parameters,
+    resolve_official_checkpoint,
+)
+from wan21.config import Wan21Config, SPConfig
 
 
 def get_strategy(name, cfg, sp_cfg):
@@ -22,6 +37,14 @@ def get_strategy(name, cfg, sp_cfg):
     elif name == 'fused_var':
         from wan21.sp.fused_variant import FusedVariantUlysses; return FusedVariantUlysses(cfg, sp_cfg)
     raise ValueError(name)
+
+
+def _official_key(local_name: str) -> str:
+    """Map MultiLayerModel parameter names to official Wan2.1 checkpoint keys.
+
+    ``layers.{i}.model.q.weight`` -> ``blocks.{i}.self_attn.q.weight``
+    """
+    return local_name.replace("layers.", "blocks.").replace(".model.", ".self_attn.")
 
 
 class MultiLayerModel(nn.Module):
@@ -62,7 +85,7 @@ class MultiLayerModel(nn.Module):
         return 0 if workspace is None else workspace.num_bytes
 
 
-def run(rank, ng, port, num_layers, seq, strategies):
+def run(rank, ng, port, args, checkpoint_dir):
     os.environ.update({'MASTER_ADDR': '127.0.0.1', 'MASTER_PORT': str(port),
                        'RANK': str(rank), 'WORLD_SIZE': str(ng)})
     torch.cuda.set_device(rank)
@@ -76,6 +99,7 @@ def run(rank, ng, port, num_layers, seq, strategies):
     # Use a valid 3D grid for every CLI sequence length.  The memory benchmark
     # only needs the product to cover the packed sequence and each axis to stay
     # within the precomputed RoPE table.
+    seq = args.seq
     assert seq % (16 * 128) == 0
     grid = torch.tensor([[seq // (16 * 128), 16, 128]], dtype=torch.long)
     bs = 1; llseq = seq // ng; lm = bs * llseq
@@ -84,24 +108,47 @@ def run(rank, ng, port, num_layers, seq, strategies):
 
     if rank == 0:
         print(f"\n{'='*145}")
-        print(f"  Wan2.1 14B Multi-Layer Training Memory Benchmark — {ng} GPUs, {num_layers} layers, seq={seq}")
+        print(f"  Wan2.1 14B Multi-Layer Training Memory Benchmark — {ng} GPUs, {args.num_layers} layers, seq={seq}")
         print(f"  dim={dim} nh={nh} hd={hd} sp={ng} local_nh={nh//ng} local_hidden={nh//ng*hd}")
         print(f"  SP-only (DP=1, no FSDP across SP) | sym_buf shared across layers | Adam fp32 m/v")
+        weight_src = f"official checkpoint: {checkpoint_dir}" if checkpoint_dir else "synthetic random weights"
+        print(f"  Weights: {weight_src}")
         print(f"{'='*145}")
         print(f"{'strategy':<12} | {'weights(MB)':>11} {'grads(MB)':>11} {'adam(MB)':>11} {'fwd_peak(MB)':>11} {'bwd_peak(MB)':>11} {'sym_buf(MB)':>11} | {'true_peak(MB)':>13}")
         print('-' * 145)
 
-    for strat_name in strategies:
+    for strat_name in args.strategies.split(','):
         sp_cfg = SPConfig(sp_size=ng, group=group, layout='THD', use_fused_ops=True)
-        model = MultiLayerModel(model_cfg, sp_cfg, num_layers, strat_name).to(dev)
+        old_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)
+        try:
+            with torch.device(dev):
+                model = MultiLayerModel(model_cfg, sp_cfg, args.num_layers, strat_name)
+        finally:
+            torch.set_default_dtype(old_dtype)
+        model.to(device=dev)
 
-        # Init weights
-        g = torch.Generator(device=dev).manual_seed(42)
-        with torch.no_grad():
-            for layer in model.layers:
-                for p in layer.model.parameters():
-                    p.data = torch.randn(p.shape, dtype=p.dtype, device=dev, generator=g) / math.sqrt(dim)
-                layer.model = layer.model.to(torch.bfloat16)
+        # Load real or synthetic weights BEFORE setup_shape, because the variant's
+        # _build_weights slices Wo into a per-rank shard during setup_shape.
+        if checkpoint_dir is not None:
+            loaded, elements = load_and_broadcast_official_parameters(
+                model, checkpoint_dir, group, key_map=_official_key,
+            )
+            if rank == 0:
+                print(
+                    f"{strat_name}: strictly loaded {loaded} tensors / "
+                    f"{elements / 1e9:.3f}B parameters from official checkpoint",
+                    flush=True,
+                )
+        else:
+            g = torch.Generator(device=dev).manual_seed(42)
+            with torch.no_grad():
+                for layer in model.layers:
+                    for p in layer.model.parameters():
+                        p.data = torch.randn(p.shape, dtype=p.dtype, device=dev, generator=g) / math.sqrt(dim)
+            for p in model.parameters():
+                dist.broadcast(p.data, src=0, group=group)
+
         model.setup_shape(bs, seq, nh, hd)
 
         # All GPUs belong to the SP group and DP=1.  Q/K/V are replicated in
@@ -160,11 +207,34 @@ def run(rank, ng, port, num_layers, seq, strategies):
     os._exit(0)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("num_gpus", type=int, nargs="?", default=8)
+    parser.add_argument("num_layers", type=int, nargs="?", default=40)
+    parser.add_argument("seq", type=int, nargs="?", default=32768)
+    parser.add_argument("strategies", nargs="?", default="serial,fused_var")
+    parser.add_argument("--checkpoint-dir")
+    parser.add_argument("--repo-id", default=OFFICIAL_REPO_ID)
+    parser.add_argument("--revision")
+    parser.add_argument(
+        "--synthetic", action="store_true",
+        help="Use random weights explicitly; official checkpoint is the default.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
-    ng = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-    num_layers = int(sys.argv[2]) if len(sys.argv) > 2 else 4
-    seq = int(sys.argv[3]) if len(sys.argv) > 3 else 32768
-    strategies = sys.argv[4].split(',') if len(sys.argv) > 4 else ['serial', 'fused_var']
+    cli_args = parse_args()
+    local_checkpoint = None
+    if not cli_args.synthetic:
+        local_checkpoint = resolve_official_checkpoint(
+            cli_args.checkpoint_dir, cli_args.repo_id, cli_args.revision
+        )
+        print(f"Official checkpoint: {local_checkpoint}")
+    else:
+        print("WARNING: using synthetic weights by explicit request")
     port = find_free_port()
-    print(f"Launching: {ng} GPUs, {num_layers} layers, seq={seq}, strategies={strategies}")
-    mp.spawn(run, args=(ng, port, num_layers, seq, strategies), nprocs=ng, join=True)
+    print(f"Launching: {cli_args.num_gpus} GPUs, {cli_args.num_layers} layers, "
+          f"seq={cli_args.seq}, strategies={cli_args.strategies}")
+    mp.spawn(run, args=(cli_args.num_gpus, port, cli_args, local_checkpoint),
+             nprocs=cli_args.num_gpus, join=True)

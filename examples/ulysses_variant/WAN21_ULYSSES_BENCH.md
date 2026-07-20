@@ -6,7 +6,7 @@
 2. 使用官方 Wan2.1 T2V-14B 权重和 40 个完整 Transformer block 时，训练吞吐下降多少？
 3. backward 的性能差距具体来自 AG+GEMM、GEMM、collective、barrier 还是梯度同步？
 
-显存实验和吞吐实验口径不同：显存表使用 40 层 self-attention stack，并显式计入 FP32 Adam 状态；真实权重吞吐使用 40 个完整 Wan2.1 Transformer block，但不包含 patch/text/time embedding、输出 head 和 optimizer step。
+两个实验均默认加载官方 Wan2.1 T2V-14B checkpoint，权重来源统一。差异仅在模型范围和统计口径：显存表使用 40 层 self-attention stack，并显式计入 FP32 Adam 状态；真实权重吞吐使用 40 个完整 Wan2.1 Transformer block，但不包含 patch/text/time embedding、输出 head 和 optimizer step。
 
 ## 严格消融定义
 
@@ -126,7 +126,7 @@ DG_JIT_USE_NVRTC=1 PYTHONPATH=$PWD/examples:$PWD \
   python3 examples/ulysses_variant/bench_wan21_mem_train.py 8 40 32768 serial,fused_var
 ```
 
-包含：SP=8/DP=1 下真实本地参数所有权、BF16 参数/梯度、FP32 Adam `m/v`、
+默认加载官方 Wan2.1 T2V-14B checkpoint（与吞吐实验同源），加 `--synthetic` 可回退到随机权重做快速冒烟。包含：SP=8/DP=1 下真实本地参数所有权、BF16 参数/梯度、FP32 Adam `m/v`、
 保存到 backward 的激活，以及跨层复用一次的 symmetric workspace。输入只创建
 本 rank 的序列分片，不再让每卡常驻完整 `X_full`。
 
@@ -152,14 +152,16 @@ fwd rel (serial vs var):    0.002873 ~ 0.002878
 
 ## 显存结果与结论
 
-B300 ×8、40 个 attention 层、SP=8/DP=1、FA4、BF16 参数/梯度、FP32 Adam m/v：
+B300 ×8、40 个 attention 层、SP=8/DP=1、FA4、BF16 参数/梯度、FP32 Adam m/v、官方 Wan2.1 T2V-14B checkpoint（每层 self-attention 的 Q/K/V/O weight+bias + Q/K norm，严格加载 400 tensors / 4.196B parameters）：
 
 | Sequence | Strategy | Weights | Grads | Adam | PyTorch peak | Sym buffer | Estimated true peak |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 8K | serial | 8,002.3 | 8,002.3 | 32,009.4 | 48,191.3 | 0 | 48,191.3 MB |
-| 8K | fused_var | 6,252.3 | 6,252.3 | 25,009.4 | 38,117.4 | 160.0 | **38,277.4 MB** |
-| 32K | serial | 8,002.3 | 8,002.3 | 32,009.4 | 68,686.5 | 0 | 68,686.5 MB |
-| 32K | fused_var | 6,252.3 | 6,252.3 | 25,009.4 | 58,416.6 | 640.0 | **59,056.6 MB** |
+| 8K | serial | 8,002.3 | 8,002.3 | 32,009.4 | 47,218.8 | 0 | 48,192.9 MB |
+| 8K | fused_var | 6,252.3 | 6,252.3 | 25,009.4 | 38,119.6 | 160.0 | **38,279.6 MB** |
+| 32K | serial | 8,002.3 | 8,002.3 | 32,009.4 | 68,688.0 | 0 | 68,688.0 MB |
+| 32K | fused_var | 6,252.3 | 6,252.3 | 25,009.4 | 58,418.2 | 640.0 | **59,058.2 MB** |
+
+> 显存数值只取决于 tensor shape 和 dtype，与具体权重数值无关；上表在改为官方 checkpoint 后数值不变，但权重来源已与吞吐实验统一。
 
 最终结论：**POST 变体确实显著节省峰值显存。**
 
