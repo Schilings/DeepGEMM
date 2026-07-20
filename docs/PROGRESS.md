@@ -51,7 +51,21 @@ sym = get_unified_symm_buffer(group, bs, seq, hidden)
 - 动机：用户要求「全局所有层、一个固定大小 buffer、fwd/bwd 都复用，不增加多余开销和显存」——这正是 `UnifiedSymmBuffer` 的设计。
 - 实现细节见 `docs/SYM_BUF_SHARING_ANALYSIS.md` 2026-07-17 节。
 
-### 2026-07-20：fused 策略实现 + UnifiedSymmBuffer 统一 + 文件重命名
+### 2026-07-20：Dynamic Ulysses SP 框架（Phase 1-2）
+
+- **调研**：ByteScale HDP（动态网格 + 数据感知分片）和 Megatron Hybrid CP（预创建 2^k NCCL 组 + HybridCPDataLoader）。
+- **Phase 1 MVP**：
+  - `DynamicSPGroupManager`：预创建 {1,2,4,8} SP/DP NCCL 组，零运行时组创建开销。
+  - `BalancedDataLoader`：FLOPs-aware 序列→SP 组分配（长序列→大 SP，短序列→小 SP）。
+  - `DynamicUlyssesLayer`：运行时 SP 切换（SP=1 纯 DP，SP>1 Ulysses A2A）。
+  - `DynamicGradientSync`：Bucketed AllReduce + token 数缩放。
+  - 全部 4 个基本测试通过。
+- **Phase 2**：
+  - `DynamicTrainer`：完整训练循环（microbatch 调度 + forward/backward + 梯度同步）。
+  - 5 个正确性测试通过（跨组 AllReduce、SP 组 AllToAll、梯度同步、调度、顺序执行）。
+  - 分析模型 benchmark：几何均值 +7.4% vs SP=8，+20% vs SP=4。
+  - 真实 GPU benchmark（B300×8）：uniform 8K 场景动态 SP 快 **2.5x**（SP=8 的 A2A 开销在短序列上占主导）。
+- **关键发现**：动态 SP 的主要收益是避免短序列的不必要 A2A 通信。SP=8 + 1K local_seq 的通信/计算比很高；SP=2 + 4K local_seq 更高效。
 
 - **文件重命名**：`fused_standard.py` → `fused.py`（`FusedUlysses`），`fused_variant.py` → `variant.py`（`FusedVariantUlysses`）。
 - **`FusedUlysses`（POST 融合）**：POST 使用 `bf16_a2a_transpose_gemm_nt`（A2A+GEMM），PRE 暂时继承 serial baseline（QK RMSNorm 必须在 A2A 前做，`bf16_fused_qkv_norm_a2a_nt` 融合 PRE 是 WIP）。正确性验证：`fwd rel=0.002706, grad_X rel=0.000166, grad_Wo rel=0.000000`。
