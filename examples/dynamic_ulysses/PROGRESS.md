@@ -50,3 +50,39 @@ Wall-clock FLOPs 分析（B300×8, hidden=5120, 40 layers）:
 - Phase 3: 真实 Wan2.1 模型集成 + 端到端训练 bench
 - Phase 3: DeepGEMM 融合算子支持（当前用 PyTorch 原生 A2A）
 - Phase 3: Pipeline scheduling（不同 SP 组的 microbatch 流水线执行）
+
+## 2026-07-21: Benchmark 控制变量修正
+
+### 问题
+
+原 `bench_train.py` 存在严重的控制变量问题：
+- Static SP=8 baseline 使用 `forward_sp`（含 A2A scatter/gather）
+- Dynamic SP 在 SP=1 时使用 `forward_dp`（**无 A2A**，完全不同的代码路径）
+
+这导致性能差异无法归因 — 混淆了两个效应：
+1. 动态 SP 选择带来的收益
+2. 完全避免 A2A 通信带来的收益
+
+### 修正
+
+1. **统一 attention 实现**：新建 `UlyssesScatterAttn`，SP=1 时 A2A 为 no-op，SP>1 时执行真实 A2A，但走同一份代码
+2. **统一 DP 并行模型**：所有 arm（含 static baselines）的 DP copies 都按 round 并行执行
+3. **多 baseline 对比**：Static-SP8 / SP4×2 / SP2×4 / SP1×8 四个静态 baseline，取最优作为对比基准
+4. **保守评估**：Dynamic SP 的加速比是相对于 *最优静态 baseline*，而非仅 SP=8
+
+### 控制变量表
+
+| 变量 | 取值（所有 arm 相同） |
+|------|------|
+| Attention 实现 | `UlyssesScatterAttn`（单一代码路径） |
+| 模型权重 & 形状 | dim=5120, heads=40, head_dim=128, layers=4 |
+| 输入序列 | 每个 scenario 相同 |
+| DP 并行模型 | 所有 arm 的 DP copies 按 round 并行 |
+
+| 自变量 | 策略 |
+|--------|------|
+| Static-SP8 | 所有序列 SP=8，串行处理 |
+| Static-SP4×2 | 所有序列 SP=4，2 DP 副本并行 |
+| Static-SP2×4 | 所有序列 SP=2，4 DP 副本并行 |
+| Static-SP1×8 | 所有序列 SP=1，8 DP 副本并行（纯 DP） |
+| **Dynamic** | `BalancedDataLoader` 按序列长度分配 SP |

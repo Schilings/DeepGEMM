@@ -70,26 +70,62 @@ for mb in microbatches:
     # Gradient sync after all microbatches
 ```
 
-## Benchmark Results
+## Benchmark Design — Controlled Experiment
+
+The Dynamic SP benchmark isolates the effect of *dynamic SP selection* by holding
+all other variables constant between arms.
+
+### Control Variables (identical across all arms)
+
+| Variable | Value |
+|----------|-------|
+| Attention implementation | `UlyssesScatterAttn` — single code path for all arms |
+| Model weights & shapes | Same `dim=5120, heads=40, head_dim=128, layers=4` |
+| Input sequences | Same per scenario |
+| DP parallelism model | DP copies run in parallel rounds in ALL arms |
+
+The `UlyssesScatterAttn` implementation handles both SP=1 (A2A is a no-op) and
+SP>1 (real A2A scatter/gather) in the same code path, so there is no confounding
+from different kernel implementations.
+
+### Independent Variable — SP Scheduling Strategy
+
+| Arm | SP Scheduling |
+|-----|---------------|
+| Static-SP8 | Every sequence at SP=8, processed sequentially (no DP) |
+| Static-SP4×2 | Every sequence at SP=4, 2 DP copies parallel per round |
+| Static-SP2×4 | Every sequence at SP=2, 4 DP copies parallel per round |
+| Static-SP1×8 | Every sequence at SP=1, 8 DP copies parallel per round (pure DP) |
+| **Dynamic** | `BalancedDataLoader` assigns SP per sequence; DP copies within each SP group run in parallel |
+
+The "Best Static" baseline for each scenario is the fastest static arm. Dynamic
+SP's speedup is measured against this best-case static baseline, making it a
+fair (conservative) comparison.
+
+### Why This Matters
+
+Previous benchmark versions compared Dynamic SP (which used `forward_dp` for
+SP=1, a different code path with no A2A) against Static SP=8 (which always used
+`forward_sp` with A2A). That conflated two effects:
+1. The benefit of dynamic SP selection
+2. The benefit of avoiding A2A communication entirely
+
+The new design uses one unified code path, so any performance difference is
+attributable solely to the SP scheduling strategy.
 
 ### Analytical Model (compute + communication)
 
-| Scenario | Static SP=8 | Dynamic | Speedup |
-|----------|------------|---------|---------|
-| uniform 8K | 0.173s | 0.082s | **2.12x** |
-| uniform 32K | 0.369s | 0.368s | 1.00x |
-| mixed | 0.315s | 0.471s | 0.67x |
-| all short | 0.040s | 0.022s | **1.86x** |
-
-Geometric mean: **+7.4% vs SP=8, +20% vs SP=4**
+See `bench_dynamic_sp.py` for the FLOPs-based analytical model (no GPU needed).
 
 ### Real GPU (B300 ×8, 4 layers)
 
-| Scenario | Static SP=8 | Dynamic | Speedup |
-|----------|------------|---------|---------|
-| uniform 8K | 9504ms | 3807ms | **2.50x** |
+Run: `python examples/dynamic_ulysses/bench_train.py 8`
 
-Key insight: SP=8 with short sequences (1K local_seq) has very high A2A communication-to-compute ratio. Dynamic SP avoids this by using SP=2 for 8K sequences.
+Output table columns:
+- `SP8 / SP4x2 / SP2x4 / SP1x8`: wall-clock (ms) for each static baseline
+- `Dynamic`: wall-clock (ms) for dynamic SP
+- `Best Static`: fastest static arm name
+- `Dyn/Best`: speedup of Dynamic vs best static (>=1.0 means Dynamic wins)
 
 ## Research Background
 
