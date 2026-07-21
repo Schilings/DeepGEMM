@@ -1,195 +1,126 @@
 # Dynamic Ulysses SP
 
-Dynamic Sequence Parallelism framework for Wan2.1 training, addressing DP load imbalance in static SP×DP configurations.
+Dynamic Sequence Parallelism framework for Wan2.1 14B training.
 
-## Problem
+## 一句话总结
 
-Static SP×DP (e.g., 4SP×2DP) suffers from **long-tail latency**: when DP groups process different-length sequences, all ranks must wait for the slowest group during gradient sync.
+在 SP×DP 进程网格上**动态调整 SP/DP 比例**：短序列用小 SP + 大 DP（多副本并行），长序列用大 SP + 小 DP（多卡协同），在完整 Wan2.1 14B（40层，官方权重）上实现 **1.464x** 几何平均吞吐提升。
 
-## Solution
+## 核心思想
 
-Dynamically adjust SP group size per microbatch based on sequence length:
-- **Long sequences** → large SP group (e.g., SP=8) for memory efficiency
-- **Short sequences** → small SP group (e.g., SP=1) to avoid A2A communication overhead
-- **All ranks** participate in gradient sync regardless of SP group size
+> **SP all-reduce 和 DP all-reduce 对权重梯度是等价的** — 都是跨 rank 的梯度聚合。因此 SP size 可以在运行时动态调整。
 
-## Architecture
+静态 SP×DP（如固定 8SP×1DP）的问题：序列长度天然异构，短序列用大 SP 浪费 A2A 通信开销，长尾序列拖慢全局。
 
+Dynamic SP 的解法：
+- **长序列** → 大 SP（如 SP=8），8 卡协同分摊 O(S²) attention 成本
+- **短序列** → 小 SP（如 SP=1），8 卡各跑一条（纯 DP 并行）
+- **所有 rank** 统一梯度同步，不受 SP 组大小影响
+
+## 实验结果
+
+**环境**: B300 ×8, Wan2.1 T2V-14B (40层, 14.056B 参数, 官方权重), SerialUlysses
+
+| 场景 | Tokens | Static SP=8 (tok/s) | Dynamic SP×DP (tok/s) | 加速比 |
+|------|-------:|---:|---:|---:|
+| all_short_2K×8 | 16,384 | 8,736 | 39,814 | **4.558x** |
+| bimodal (2×32K+6×2K) | 77,824 | 25,213 | 38,568 | **1.530x** |
+| uniform_8K×8 | 65,536 | 31,804 | 48,548 | **1.527x** |
+| one_long_tail (1×32K+7×2K) | 47,104 | 19,188 | 23,168 | **1.207x** |
+| uniform_32K×2 | 65,536 | 36,648 | 38,250 | **1.044x** |
+| mixed (多样长度) | 77,824 | 28,979 | 21,246 | 0.733x |
+
+**几何平均: 1.464x** (6 个场景中 5 个加速)
+
+### 结果解读
+
+- **all_short_2K (4.6x)**: 短序列不值得 SP 分片，SP=1 纯 DP 让 8 卡各跑一条
+- **bimodal/uniform_8K (~1.5x)**: 中等序列用 SP=2，4 个 DP 副本并行
+- **uniform_32K (1.04x)**: 长序列本身适合大 SP，DP 并行空间有限
+- **mixed (0.73x)**: 长度太分散，(sp_size, seq_len) 组合多，调度开销大
+
+## 控制变量
+
+两个 arm（Static vs Dynamic）**完全一致**的部分：
+
+| 变量 | 取值 |
+|------|------|
+| 模型 | `SPWanTransformer` + `SerialUlysses`（同一代码路径） |
+| 权重 | 官方 `Wan-AI/Wan2.1-T2V-14B` checkpoint (14.056B) |
+| 输入数据 | 相同序列和 conditioning (e, context) |
+| 梯度同步 | manual all-reduce across all ranks |
+| 总 tokens | 每个 scenario 相同 |
+
+**唯一自变量**: SP×DP 调度策略
+
+## 文件说明
+
+### 框架核心
+
+| 文件 | 功能 |
+|------|------|
+| `sp_group_manager.py` | 预创建 {1,2,4,8} SP/DP NCCL 通信组 |
+| `balanced_loader.py` | FLOPs-aware 序列→SP size 分配 |
+| `dynamic_ulysses.py` | 运行时 SP 切换的 attention 层 |
+| `grad_sync.py` | Bucketed 梯度同步 + token 缩放 |
+| `dynamic_trainer.py` | 完整训练循环（microbatch 调度 + fwd/bwd + 梯度同步） |
+| `buffer_pool.py` | 按 SP 大小预分配 UnifiedSymmBuffer |
+| `overlap_grad_sync.py` | 梯度同步与 backward overlap |
+
+### Benchmark
+
+| 文件 | 用途 | 命令 |
+|------|------|------|
+| `bench_wan21_14b.py` | **主 benchmark**：真实 14B 训练吞吐 | `python bench_wan21_14b.py 8` |
+| `bench_train.py` | 简化版（4层，无FFN），快速迭代用 | `python bench_train.py 8` |
+| `bench_dynamic_sp.py` | 分析模型（FLOPs 估算，无需 GPU） | `python bench_dynamic_sp.py 8` |
+
+### 测试
+
+| 文件 | 内容 |
+|------|------|
+| `test_dynamic_sp.py` | 4 项基本功能测试 |
+| `test_correctness.py` | 5 项正确性测试（跨组 AllReduce、A2A、梯度同步等） |
+
+### 文档
+
+| 文件 | 内容 |
+|------|------|
+| `DESIGN.md` | 完整设计方案（问题背景、方案调研、系统架构、实现计划） |
+| `PROGRESS.md` | 开发进度日志 |
+
+## 快速开始
+
+```bash
+# 完整 14B（官方权重，约 10 分钟）
+python examples/dynamic_ulysses/bench_wan21_14b.py 8
+
+# 快速测试（4层，随机权重，约 1 分钟）
+python examples/dynamic_ulysses/bench_wan21_14b.py 8 --layers 4 --synthetic
+
+# 指定 checkpoint 目录
+python examples/dynamic_ulysses/bench_wan21_14b.py 8 --checkpoint-dir /path/to/wan2.1-14b
 ```
-┌─────────────────────────┐
-│  DynamicSPGroupManager  │  Pre-creates NCCL groups for SP sizes {1,2,4,8}
-└───────────┬─────────────┘
-            │
-┌───────────▼─────────────┐
-│  BalancedDataLoader     │  FLOPs-aware sequence → SP group assignment
-└───────────┬─────────────┘
-            │
-┌───────────▼─────────────┐
-│  DynamicUlyssesLayer    │  Runtime SP-size-aware attention (SP=1 pure DP, SP>1 Ulysses A2A)
-└───────────┬─────────────┘
-            │
-┌───────────▼─────────────┐
-│  DynamicGradientSync    │  Bucketed AllReduce with token-count scaling
-└─────────────────────────┘
-```
 
-## Components
+## 技术要点
 
-| File | Description |
-|------|-------------|
-| `sp_group_manager.py` | Pre-creates power-of-2 SP/DP NCCL groups |
-| `balanced_loader.py` | FLOPs-aware sequence packing and SP assignment |
-| `dynamic_ulysses.py` | Runtime SP-size-aware attention layer |
-| `grad_sync.py` | Bucketed gradient sync across all ranks |
-| `dynamic_trainer.py` | Complete training loop with microbatch scheduling |
-| `test_dynamic_sp.py` | Basic functionality tests |
-| `test_correctness.py` | Correctness verification (5 tests) |
-| `bench_dynamic_sp.py` | Analytical FLOPs+comm model benchmark |
-| `bench_train.py` | Simplified GPU benchmark (UlyssesScatterAttn, multiple static baselines) |
-| `bench_wan21_14b.py` | **Primary**: real Wan2.1 T2V-14B training throughput benchmark |
-| `DESIGN.md` | Full design document |
+### 运行时 SP 切换
 
-## Usage
+`reconfigure_sp()` 在运行时更新每层 self-attention 的 `sp_size` 和 `group`，然后重新调用 `setup_shape()`。`SerialUlysses` 没有预分配 buffer，切换无副作用。
 
-```python
-from dynamic_ulysses import DynamicSPGroupManager, BalancedDataLoader
+### A2A 安全约束
 
-# Initialize
-gm = DynamicSPGroupManager(world_size=8)
-loader = BalancedDataLoader(world_size=8)
+同一 SP group 内所有 rank 必须同时调用 `all_to_all_single`，且发送/接收数据大小一致。因此同一 (sp_size, seq_len) 组内的 DP copies 必须处理**相同长度**的序列。
 
-# Schedule microbatches
-seq_lengths = [32768, 8192, 4096, 2048]
-microbatches = loader.schedule(seq_lengths)
-# → [Microbatch(sp=4, seq=32768), Microbatch(sp=2, seq=8192), ...]
+### 梯度同步安全
 
-# Process each microbatch with its SP size
-for mb in microbatches:
-    info = gm.get_groups(mb.sp_size)
-    # Set SP config on model layers
-    # Run forward + backward
-    # Gradient sync after all microbatches
-```
+所有 rank（无论 SP 大小）都参与最终的 `all_reduce`。Dummy forward+backward（用相同数据填充不足的 DP copy 位）确保所有 rank 都有梯度，避免 all-reduce 死锁。
 
-## Benchmark Design — Controlled Experiment
+## 研究背景
 
-The Dynamic SP benchmark isolates the effect of *dynamic SP selection* by holding
-all other variables constant between arms.
+| 方案 | 来源 | 核心思想 |
+|------|------|----------|
+| HDP | ByteScale (字节) | 统一 DP+CP，动态网格，数据感知分片 |
+| Hybrid CP | Megatron-LM (NVIDIA) | 预创建 2^k NCCL 组，运行时动态选择 |
 
-### Control Variables (identical across all arms)
-
-| Variable | Value |
-|----------|-------|
-| Attention implementation | `UlyssesScatterAttn` — single code path for all arms |
-| Model weights & shapes | Same `dim=5120, heads=40, head_dim=128, layers=4` |
-| Input sequences | Same per scenario |
-| DP parallelism model | DP copies run in parallel rounds in ALL arms |
-
-The `UlyssesScatterAttn` implementation handles both SP=1 (A2A is a no-op) and
-SP>1 (real A2A scatter/gather) in the same code path, so there is no confounding
-from different kernel implementations.
-
-### Independent Variable — SP Scheduling Strategy
-
-| Arm | SP Scheduling |
-|-----|---------------|
-| Static-SP8 | Every sequence at SP=8, processed sequentially (no DP) |
-| Static-SP4×2 | Every sequence at SP=4, 2 DP copies parallel per round |
-| Static-SP2×4 | Every sequence at SP=2, 4 DP copies parallel per round |
-| Static-SP1×8 | Every sequence at SP=1, 8 DP copies parallel per round (pure DP) |
-| **Dynamic** | `BalancedDataLoader` assigns SP per sequence; DP copies within each SP group run in parallel |
-
-The "Best Static" baseline for each scenario is the fastest static arm. Dynamic
-SP's speedup is measured against this best-case static baseline, making it a
-fair (conservative) comparison.
-
-### Why This Matters
-
-Previous benchmark versions compared Dynamic SP (which used `forward_dp` for
-SP=1, a different code path with no A2A) against Static SP=8 (which always used
-`forward_sp` with A2A). That conflated two effects:
-1. The benefit of dynamic SP selection
-2. The benefit of avoiding A2A communication entirely
-
-The new design uses one unified code path, so any performance difference is
-attributable solely to the SP scheduling strategy.
-
-### Analytical Model (compute + communication)
-
-See `bench_dynamic_sp.py` for the FLOPs-based analytical model (no GPU needed).
-
-### Real Wan2.1 14B Training Benchmark
-
-**Primary benchmark** — measures real training throughput (tokens/s) on the
-complete Wan2.1 T2V-14B transformer (40 blocks, official weights).
-
-Run: `python examples/dynamic_ulysses/bench_wan21_14b.py 8`
-
-**Design**: Dynamic SP×DP vs Static SP=8. Both arms use the same model,
-weights, data, and gradient sync. The ONLY difference is SP×DP scheduling:
-
-- **Static SP=8**: all sequences use SP=8 (dp=1), processed sequentially
-- **Dynamic SP×DP**: each sequence assigned optimal SP size; sequences with
-  the same (sp_size, seq_len) run as parallel DP copies (dp_size = world_size / sp_size)
-
-Key insight: for weight gradients, SP all-reduce and DP all-reduce are the
-SAME operation (cross-rank gradient aggregation). So SP size can be dynamically
-adjusted across the SP×DP process grid.
-
-#### Results (B300 ×8, 40 layers, 14.056B params, official weights)
-
-| Scenario | Tokens | Static SP=8 (tok/s) | Dynamic SP×DP (tok/s) | Speedup | Dyn Schedule |
-|----------|-------:|--------------------:|----------------------:|--------:|--------------|
-| uniform_8K×8 | 65,536 | 31,804 | 48,548 | **1.527x** | {2: 8} |
-| uniform_32K×2 | 65,536 | 36,648 | 38,250 | **1.044x** | {4: 2} |
-| mixed | 77,824 | 28,979 | 21,246 | 0.733x | {4:2, 2:4, 1:2} |
-| all_short_2K×8 | 16,384 | 8,736 | 39,814 | **4.558x** | {1: 8} |
-| bimodal | 77,824 | 25,213 | 38,568 | **1.530x** | {4:2, 1:6} |
-| one_long_tail | 47,104 | 19,188 | 23,168 | **1.207x** | {4:1, 1:7} |
-
-**Geometric mean: 1.464x** (Dynamic SP×DP is 46% faster than Static SP=8)
-
-#### Analysis
-
-Dynamic SP×DP wins in 5 out of 6 scenarios:
-
-1. **all_short_2K (4.558x)**: 8 short sequences use SP=1 (pure DP), all 8 GPUs
-   process different sequences in parallel. Static SP=8 wastes A2A overhead on
-   sequences too short to benefit from sequence parallelism.
-
-2. **uniform_8K (1.527x)**: 8 medium sequences use SP=2 (4 DP copies), 4
-   sequences processed in parallel per round vs 8 sequential in static.
-
-3. **bimodal (1.530x)**: 2 long sequences use SP=4, 6 short sequences use SP=1.
-   Short sequences finish fast in parallel while long sequences get SP benefit.
-
-4. **one_long_tail (1.207x)**: 1 long sequence uses SP=4, 7 short use SP=1.
-   The long sequence is the bottleneck but short sequences parallelize well.
-
-5. **uniform_32K (1.044x)**: 2 long sequences use SP=4 (2 DP copies). Nearly
-   break-even — long sequences benefit from large SP, DP parallelism limited.
-
-6. **mixed (0.733x)**: Diverse lengths cause many (sp_size, seq_len) groups,
-   each requiring separate rounds with dummy fill. Scheduling overhead dominates.
-
-Control variables (identical for both arms):
-- **Model**: `SPWanTransformer` with `SerialUlysses` (same code path)
-- **Weights**: official `Wan-AI/Wan2.1-T2V-14B` checkpoint (14.056B params)
-- **Data**: same input sequences and conditioning
-- **Grad sync**: manual all-reduce across all ranks
-- **Total tokens**: identical per scenario
-
-### Simplified Benchmark (for quick iteration)
-
-`bench_train.py` uses a simplified `UlyssesScatterAttn` (4 layers, no FFN/cross-attn)
-with multiple static baselines (SP8/SP4×2/SP2×4/SP1×8). Useful for rapid
-development testing when the full 14B model is too slow.
-
-Run: `python examples/dynamic_ulysses/bench_train.py 8`
-
-## Research Background
-
-- **ByteScale HDP** (ByteDance): Dynamic mesh, data-aware sharding, balance scheduler
-- **Megatron Hybrid CP** (NVIDIA): Pre-created power-of-2 NCCL groups, HybridCPDataLoader
-
-Our approach combines both: Megatron-style pre-created groups + ByteScale-style FLOPs scheduling + DeepGEMM Ulysses fused operators.
+本方案结合两者：Megatron 式预创建组 + ByteScale 式 FLOPs 调度 + Ulysses A2A。

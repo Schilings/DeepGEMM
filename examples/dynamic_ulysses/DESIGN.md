@@ -246,8 +246,14 @@ class DynamicGradientSync:
 - [x] `OverlapGradientSync`: 非阻塞 AllReduce 与 backward overlap
 - [x] 通信组缓存和复用（DynamicSPGroupManager 一次性预创建）
 
+### Phase 4: 真实 14B Benchmark ✓ 已完成
+- [x] `bench_wan21_14b.py`: 完整 Wan2.1 14B (40层, 官方权重) 训练吞吐 benchmark
+- [x] SP×DP 动态调整实现（DP copies 并行）
+- [x] 控制变量实验：同一模型/权重/数据，唯一变量为 SP×DP 调度策略
+- [x] 结果：几何平均 **1.464x** 加速（6 场景中 5 个加速，最高 4.558x）
+
 ### 后续方向
-- [ ] Pipeline 调度：不同 SP 大小的 microbatch 交错执行
+- [ ] Pipeline 调度：不同 SP 大小的 microbatch 交错执行（解决 mixed 场景退化）
 - [ ] DeepGEMM 融合算子集成（替换 PyTorch 原生 A2A）
 - [ ] 自适应 SP 分配（运行时 profiling 动态调整阈值）
 - [ ] 多节点扩展
