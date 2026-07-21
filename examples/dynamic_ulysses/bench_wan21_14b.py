@@ -58,8 +58,10 @@ from wan21.checkpoint import (
     resolve_official_checkpoint,
 )
 from wan21.config import SPConfig, Wan21Config
-from wan21.grad_sync import sync_replicated_grads
+from wan21.fsdp2_utils import apply_fsdp2
 from wan21.sp_training import SPWanTransformer
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.device_mesh import DeviceMesh
 
 DYN_DIR = os.path.join(EXAMPLES_DIR, 'dynamic_ulysses')
 if DYN_DIR not in sys.path:
@@ -159,7 +161,7 @@ def run_static(model, gm, seq_lengths, dim, device, e, context,
                 output = model(x, e, grid, context)
             output.backward(grad_out)
 
-        sync_replicated_grads(model, world_group, average=True)
+        # FSDP2: gradient reduce-scatter is automatic in backward — no manual sync
 
         e_evt.record()
         torch.cuda.synchronize()
@@ -256,7 +258,7 @@ def run_dynamic(model, gm, seq_lengths, dim, device, e, context,
 
                 dist.barrier(world_group)
 
-        sync_replicated_grads(model, world_group, average=True)
+        # FSDP2: gradient reduce-scatter is automatic in backward — no manual sync
 
         e_evt.record()
         torch.cuda.synchronize()
@@ -303,7 +305,7 @@ def run(rank, world_size, port, args, checkpoint_dir):
             )
     finally:
         torch.set_default_dtype(old_dtype)
-    model.to(device=device)
+    model.to(device=device, dtype=torch.bfloat16)
 
     if checkpoint_dir is not None:
         loaded, elements = load_and_broadcast_official_parameters(
@@ -316,6 +318,42 @@ def run(rank, world_size, port, args, checkpoint_dir):
             dist.broadcast(p.data, src=0, group=world_group)
         if rank == 0:
             print('Using synthetic (random) weights', flush=True)
+
+    # ---- Apply FSDP2 (fully_shard) ----
+    # FSDP2 shards params across all ranks and automatically reduce-scatters
+    # gradients in backward — replaces manual sync_replicated_grads.
+    # Applied AFTER weight loading (so full tensors are loaded first) and
+    # BEFORE setup_shape (so FSDP hooks are registered for all forward/backward).
+    #
+    # For serial strategy there are no _sp_sharded params (Wo is replicated),
+    # so no ignored_params needed for SP. For fused_var, Wo_r_local would be ignored.
+    ignored_params = set()
+    for p in model.parameters():
+        if getattr(p, '_sp_sharded', False):
+            ignored_params.add(p)
+
+    # Also ignore small parameters that interact with external inputs (e, context)
+    # in ways that break DTensor mixing rules. modulation (1×6×dim) is tiny and
+    # added to external tensor `e` — keeping it replicated avoids DTensor mixing.
+    for block in model.blocks:
+        ignored_params.add(block.modulation)
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        cast_forward_inputs=False,
+    )
+    mesh = DeviceMesh("cuda", list(range(world_size)))
+
+    # Shard each transformer block individually (so layer i's params can be
+    # all-gathered just before its forward, freeing other layers' full params)
+    for block in model.blocks:
+        fully_shard(block, mesh=mesh, reshard_after_forward=True,
+                    mp_policy=mp_policy, ignored_params=ignored_params or None)
+    # Shard the root model
+    fully_shard(model, mesh=mesh, reshard_after_forward=True,
+                mp_policy=mp_policy, ignored_params=ignored_params or None)
 
     model.setup_shape(1, args.seq, config.num_heads, config.head_dim)
     model.train()

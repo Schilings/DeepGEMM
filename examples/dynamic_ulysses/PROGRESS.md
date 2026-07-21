@@ -42,7 +42,18 @@
 2. 同一 SP group 所有 rank 必须参与 A2A
 3. 所有 rank 必须有梯度（dummy forward+backward 填充）
 
-**最终结果: 几何平均 1.464x**（详见 README.md）
+**手写梯度同步结果: 几何平均 1.464x**
+
+### 迭代 5: FSDP2 迁移（最终版本）
+
+用 PyTorch FSDP2 `fully_shard` 替换手写 `sync_replicated_grads`：
+- 对每个 transformer block + 根模型 bottom-up 调用 `fully_shard`
+- 参数自动分片为 DTensor，forward 前 all-gather，backward 后 reduce-scatter
+- `modulation` 参数加入 `ignored_params`（与外部 `e` 相加，避免 DTensor 混合）
+- 所有参数统一 bf16（FSDP2 要求 dtype 一致）
+- 删除手写 `sync_replicated_grads` 调用
+
+**FSDP2 结果: 几何平均 1.823x**（比手写 1.464x 提升 24.6%）
 
 ### Bug 修复记录
 

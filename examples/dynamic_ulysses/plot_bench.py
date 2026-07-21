@@ -27,12 +27,12 @@ scenarios = [
 scenarios_short = ['all_short', 'bimodal', 'uniform_8K', 'one_long', 'uniform_32K', 'mixed']
 
 # tokens/s
-static_tps = [8736, 25213, 31804, 19188, 36648, 28979]
-dynamic_tps = [39814, 38568, 48548, 23168, 38250, 21246]
+static_tps = [6176, 20667, 22528, 14579, 35996, 21970]
+dynamic_tps = [41235, 37206, 46916, 22476, 38706, 19447]
 
 # wall-clock ms
-static_ms = [1875.5, 3086.7, 2060.7, 2454.9, 1788.2, 2685.6]
-dynamic_ms = [411.5, 2017.8, 1349.9, 2033.1, 1713.3, 3663.0]
+static_ms = [2652.9, 3765.5, 2909.1, 3230.9, 1820.6, 3542.3]
+dynamic_ms = [397.3, 2091.7, 1396.9, 2095.8, 1693.2, 4001.8]
 
 speedups = [s / d for s, d in zip(static_ms, dynamic_ms)]
 
@@ -87,7 +87,7 @@ for bar in bars2:
 
 ax.set_ylabel('Throughput (tokens/s)', fontsize=12)
 ax.set_title('Wan2.1 T2V-14B Training Throughput: Static SP=8 vs Dynamic SP×DP\n'
-             '(B300 ×8, 40 layers, 14.056B params, official weights)', fontsize=13, fontweight='bold')
+             '(B300 ×8, 40 layers, 14.056B params, official weights, FSDP2)', fontsize=13, fontweight='bold')
 ax.set_xticks(x)
 ax.set_xticklabels(scenarios, fontsize=9)
 ax.legend(fontsize=11, loc='upper right')
@@ -283,7 +283,7 @@ ax2.grid(axis='y', alpha=0.3)
 ax2.spines['top'].set_visible(False)
 ax2.spines['right'].set_visible(False)
 
-fig.suptitle('Wan2.1 T2V-14B Dynamic SP×DP Benchmark Summary (B300 ×8, 40 layers, official weights)',
+fig.suptitle('Wan2.1 T2V-14B Dynamic SP×DP Benchmark Summary (B300 ×8, 40 layers, official weights, FSDP2)',
              fontsize=13, fontweight='bold', y=1.02)
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, 'fig5_summary.png'), dpi=150, bbox_inches='tight')

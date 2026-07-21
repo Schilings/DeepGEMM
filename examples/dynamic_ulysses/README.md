@@ -19,18 +19,18 @@ Dynamic SP 的解法：
 
 ## 实验结果
 
-**环境**: B300 ×8, Wan2.1 T2V-14B (40层, 14.056B 参数, 官方权重), SerialUlysses
+**环境**: B300 ×8, Wan2.1 T2V-14B (40层, 14.056B 参数, 官方权重), SerialUlysses, **FSDP2 (fully_shard)**
 
 | 场景 | Tokens | Static SP=8 (tok/s) | Dynamic SP×DP (tok/s) | 加速比 |
 |------|-------:|---:|---:|---:|
-| all_short_2K×8 | 16,384 | 8,736 | 39,814 | **4.558x** |
-| bimodal (2×32K+6×2K) | 77,824 | 25,213 | 38,568 | **1.530x** |
-| uniform_8K×8 | 65,536 | 31,804 | 48,548 | **1.527x** |
-| one_long_tail (1×32K+7×2K) | 47,104 | 19,188 | 23,168 | **1.207x** |
-| uniform_32K×2 | 65,536 | 36,648 | 38,250 | **1.044x** |
-| mixed (varied) | 77,824 | 28,979 | 21,246 | 0.733x |
+| all_short_2K×8 | 16,384 | 6,176 | 41,235 | **6.677x** |
+| bimodal (2×32K+6×2K) | 77,824 | 20,667 | 37,206 | **1.800x** |
+| uniform_8K×8 | 65,536 | 22,528 | 46,916 | **2.083x** |
+| one_long_tail (1×32K+7×2K) | 47,104 | 14,579 | 22,476 | **1.542x** |
+| uniform_32K×2 | 65,536 | 35,996 | 38,706 | **1.075x** |
+| mixed (varied) | 77,824 | 21,970 | 19,447 | 0.885x |
 
-**几何平均: 1.464x** (6 个场景中 5 个加速)
+**几何平均: 1.823x** (6 个场景中 5 个加速)
 
 ## 图表
 
@@ -60,7 +60,7 @@ Dynamic SP 的解法：
 | 模型 | `SPWanTransformer` + `SerialUlysses`（同一代码路径） |
 | 权重 | 官方 `Wan-AI/Wan2.1-T2V-14B` checkpoint (14.056B) |
 | 输入数据 | 相同序列和 conditioning (e, context) |
-| 梯度同步 | manual all-reduce across all ranks |
+| 梯度同步 | FSDP2 `fully_shard`（自动 reduce-scatter） |
 | 总 tokens | 每个 scenario 相同 |
 
 **唯一自变量**: SP×DP 调度策略
@@ -128,6 +128,14 @@ python examples/dynamic_ulysses/bench_wan21_14b.py 8 --checkpoint-dir /path/to/w
 ### 梯度同步安全
 
 所有 rank（无论 SP 大小）都参与最终的 `all_reduce`。Dummy forward+backward（用相同数据填充不足的 DP copy 位）确保所有 rank 都有梯度，避免 all-reduce 死锁。
+
+### FSDP2 集成
+
+使用 PyTorch FSDP2 的 `fully_shard` 替代手写梯度同步：
+- 对每个 transformer block + 根模型调用 `fully_shard`（bottom-up 顺序）
+- 参数分片为 DTensor (dim-0 shard)，forward 前 all-gather，backward 后 reduce-scatter
+- `modulation` 参数加入 `ignored_params`（与外部输入 `e` 相加，避免 DTensor 混合）
+- 所有参数统一 bf16（FSDP2 要求 dtype 一致）
 
 ## 研究背景
 
