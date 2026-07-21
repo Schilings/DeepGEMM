@@ -86,3 +86,43 @@ Wall-clock FLOPs 分析（B300×8, hidden=5120, 40 layers）:
 | Static-SP2×4 | 所有序列 SP=2，4 DP 副本并行 |
 | Static-SP1×8 | 所有序列 SP=1，8 DP 副本并行（纯 DP） |
 | **Dynamic** | `BalancedDataLoader` 按序列长度分配 SP |
+
+## 2026-07-21: 真实 Wan2.1 14B 训练吞吐 Benchmark
+
+### 问题
+
+之前的 `bench_train.py` 使用简化的 `UlyssesScatterAttn`（4层，无 FFN/cross-attn/modulation），
+不是真实的 Wan2.1 14B 模型。用户要求真实的 14B 训练吞吐数据。
+
+### 实现
+
+新增 `bench_wan21_14b.py`：
+- **模型**：`SPWanTransformer`（完整 40 层 transformer block，含 self-attn + cross-attn + FFN + modulation）
+- **策略**：`SerialUlysses`（纯 PyTorch A2A，无 DeepGEMM buffer，支持运行时 SP 切换）
+- **权重**：官方 `Wan-AI/Wan2.1-T2V-14B` checkpoint（strict streaming load）
+- **吞吐指标**：tokens/s（total_tokens / wall_clock）
+
+### 控制变量
+
+| 变量 | 取值（两个 arm 相同） |
+|------|------|
+| 模型 | `SPWanTransformer` + `SerialUlysses`（同一代码路径） |
+| 权重 | 官方 Wan2.1-T2V-14B checkpoint |
+| 数据 | 相同输入序列和 conditioning (e, context) |
+| 梯度同步 | manual all-reduce across all ranks |
+
+### 运行时 SP 切换
+
+`reconfigure_sp()` 函数在运行时更新每层 self-attention 的 `sp_size`、`group`，
+然后重新调用 `setup_shape()` 计算新的 `local_nh`、`local_seq` 等。
+`SerialUlysses` 没有预分配 buffer，所以切换是无副作用的。
+
+### 使用
+
+```bash
+# 完整 14B（官方权重）
+python examples/dynamic_ulysses/bench_wan21_14b.py 8
+
+# 快速测试（4层，随机权重）
+python examples/dynamic_ulysses/bench_wan21_14b.py 8 --layers 4 --synthetic
+```

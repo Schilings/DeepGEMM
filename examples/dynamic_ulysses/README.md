@@ -45,7 +45,8 @@ Dynamically adjust SP group size per microbatch based on sequence length:
 | `test_dynamic_sp.py` | Basic functionality tests |
 | `test_correctness.py` | Correctness verification (5 tests) |
 | `bench_dynamic_sp.py` | Analytical FLOPs+comm model benchmark |
-| `bench_train.py` | Real GPU training benchmark |
+| `bench_train.py` | Simplified GPU benchmark (UlyssesScatterAttn, multiple static baselines) |
+| `bench_wan21_14b.py` | **Primary**: real Wan2.1 T2V-14B training throughput benchmark |
 | `DESIGN.md` | Full design document |
 
 ## Usage
@@ -117,15 +118,45 @@ attributable solely to the SP scheduling strategy.
 
 See `bench_dynamic_sp.py` for the FLOPs-based analytical model (no GPU needed).
 
-### Real GPU (B300 ×8, 4 layers)
+### Real Wan2.1 14B Training Benchmark
 
-Run: `python examples/dynamic_ulysses/bench_train.py 8`
+**This is the primary benchmark** — measures real training throughput (tokens/s)
+on the complete Wan2.1 T2V-14B transformer (40 blocks, official weights).
+
+Run: `python examples/dynamic_ulysses/bench_wan21_14b.py 8`
+
+```
+# Quick test (4 layers, synthetic weights)
+python examples/dynamic_ulysses/bench_wan21_14b.py 8 --layers 4 --synthetic
+
+# Full 14B with official weights
+python examples/dynamic_ulysses/bench_wan21_14b.py 8
+
+# Custom checkpoint location
+python examples/dynamic_ulysses/bench_wan21_14b.py 8 --checkpoint-dir /path/to/wan2.1-14b
+```
 
 Output table columns:
-- `SP8 / SP4x2 / SP2x4 / SP1x8`: wall-clock (ms) for each static baseline
-- `Dynamic`: wall-clock (ms) for dynamic SP
-- `Best Static`: fastest static arm name
-- `Dyn/Best`: speedup of Dynamic vs best static (>=1.0 means Dynamic wins)
+- `Static SP=8`: wall-clock (ms) and tokens/s for static SP=8 baseline
+- `Dynamic SP`: wall-clock (ms) and tokens/s for dynamic SP
+- `Speedup`: t_static / t_dynamic (>=1.0 means Dynamic wins)
+- `Dyn Schedule`: SP size distribution used by the dynamic scheduler
+
+Control variables (identical for both arms):
+- **Model**: `SPWanTransformer` with `SerialUlysses` self-attention (same code path)
+- **Weights**: official `Wan-AI/Wan2.1-T2V-14B` checkpoint
+- **Data**: same input sequences and conditioning
+- **Grad sync**: manual all-reduce across all ranks
+
+The ONLY independent variable is the SP scheduling strategy.
+
+### Simplified Benchmark (for quick iteration)
+
+`bench_train.py` uses a simplified `UlyssesScatterAttn` (4 layers, no FFN/cross-attn)
+with multiple static baselines (SP8/SP4×2/SP2×4/SP1×8). Useful for rapid
+development testing when the full 14B model is too slow.
+
+Run: `python examples/dynamic_ulysses/bench_train.py 8`
 
 ## Research Background
 
