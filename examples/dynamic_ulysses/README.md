@@ -28,9 +28,21 @@ Dynamic SP 的解法：
 | uniform_8K×8 | 65,536 | 31,804 | 48,548 | **1.527x** |
 | one_long_tail (1×32K+7×2K) | 47,104 | 19,188 | 23,168 | **1.207x** |
 | uniform_32K×2 | 65,536 | 36,648 | 38,250 | **1.044x** |
-| mixed (多样长度) | 77,824 | 28,979 | 21,246 | 0.733x |
+| mixed (varied) | 77,824 | 28,979 | 21,246 | 0.733x |
 
 **几何平均: 1.464x** (6 个场景中 5 个加速)
+
+## 图表
+
+实验数据自动可视化（`python examples/dynamic_ulysses/plot_bench.py`）：
+
+| 图表 | 文件 | 内容 |
+|------|------|------|
+| 1 | `figures/fig1_throughput.png` | 吞吐量对比柱状图（6 场景 × 2 arm） |
+| 2 | `figures/fig2_speedup.png` | 加速比柱状图 + SP 调度分布 |
+| 3 | `figures/fig3_sp_assignment.png` | 序列长度 → SP size 分配阶梯图 |
+| 4 | `figures/fig4_breakdown.png` | Dynamic 执行时间按 (SP, seq_len) 分组分解 |
+| 5 | `figures/fig5_summary.png` | 吞吐+加速比双面板摘要图 |
 
 ### 结果解读
 
@@ -74,6 +86,7 @@ Dynamic SP 的解法：
 | `bench_wan21_14b.py` | **主 benchmark**：真实 14B 训练吞吐 | `python bench_wan21_14b.py 8` |
 | `bench_train.py` | 简化版（4层，无FFN），快速迭代用 | `python bench_train.py 8` |
 | `bench_dynamic_sp.py` | 分析模型（FLOPs 估算，无需 GPU） | `python bench_dynamic_sp.py 8` |
+| `plot_bench.py` | 图表生成（matplotlib，输出到 `figures/`） | `python plot_bench.py` |
 
 ### 测试
 
