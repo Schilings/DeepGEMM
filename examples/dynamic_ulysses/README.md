@@ -120,35 +120,47 @@ See `bench_dynamic_sp.py` for the FLOPs-based analytical model (no GPU needed).
 
 ### Real Wan2.1 14B Training Benchmark
 
-**This is the primary benchmark** — measures real training throughput (tokens/s)
-on the complete Wan2.1 T2V-14B transformer (40 blocks, official weights).
+**Primary benchmark** — measures real training throughput (tokens/s) on the
+complete Wan2.1 T2V-14B transformer (40 blocks, official weights).
 
 Run: `python examples/dynamic_ulysses/bench_wan21_14b.py 8`
 
-```
-# Quick test (4 layers, synthetic weights)
-python examples/dynamic_ulysses/bench_wan21_14b.py 8 --layers 4 --synthetic
+**Design**: Both arms process the SAME sequences one-by-one with gradient
+accumulation. The ONLY difference is which SP size each sequence uses.
+No DP parallelism — pure SP size ablation.
 
-# Full 14B with official weights
-python examples/dynamic_ulysses/bench_wan21_14b.py 8
+#### Results (B300 ×8, 40 layers, 14.056B params, official weights)
 
-# Custom checkpoint location
-python examples/dynamic_ulysses/bench_wan21_14b.py 8 --checkpoint-dir /path/to/wan2.1-14b
-```
+| Scenario | Tokens | Static SP=8 (tok/s) | Dynamic SP (tok/s) | Speedup | Dyn Schedule |
+|----------|-------:|--------------------:|-------------------:|--------:|--------------|
+| uniform_8K×8 | 65,536 | 32,214 | 12,906 | 0.401x | {2: 8} |
+| uniform_32K×2 | 65,536 | 36,558 | 19,651 | 0.538x | {4: 2} |
+| mixed | 77,824 | 28,457 | 15,686 | 0.551x | {4:2, 2:4, 1:2} |
+| all_short_2K×8 | 16,384 | 8,557 | 6,517 | 0.762x | {1: 8} |
+| bimodal | 77,824 | 24,531 | 15,159 | 0.618x | {4:2, 1:6} |
+| one_long_tail | 47,104 | 18,688 | 12,315 | 0.659x | {4:1, 1:7} |
 
-Output table columns:
-- `Static SP=8`: wall-clock (ms) and tokens/s for static SP=8 baseline
-- `Dynamic SP`: wall-clock (ms) and tokens/s for dynamic SP
-- `Speedup`: t_static / t_dynamic (>=1.0 means Dynamic wins)
-- `Dyn Schedule`: SP size distribution used by the dynamic scheduler
+**Geometric mean: 0.577x** (Dynamic SP is 42% slower without DP parallelism)
+
+#### Analysis
+
+Dynamic SP is **slower** than Static SP=8 in all scenarios when sequences are
+processed sequentially (no DP parallelism). This is expected:
+
+1. **Without DP parallelism, smaller SP = wasted GPUs** — SP=2 means only 2 GPUs
+   do A2A while 6 idle. SP=8 uses all 8 GPUs, each processing 1/8 of the sequence.
+2. **Dynamic SP's value comes from DP parallelism** — multiple short sequences
+   with small SP groups running in parallel. This benchmark isolates SP size
+   selection without DP, showing that SP size alone doesn't help.
+3. **Next step**: Add DP-parallel benchmark where multiple sequences with the
+   same SP size run in parallel DP copies.
 
 Control variables (identical for both arms):
-- **Model**: `SPWanTransformer` with `SerialUlysses` self-attention (same code path)
-- **Weights**: official `Wan-AI/Wan2.1-T2V-14B` checkpoint
+- **Model**: `SPWanTransformer` with `SerialUlysses` (same code path)
+- **Weights**: official `Wan-AI/Wan2.1-T2V-14B` checkpoint (14.056B params)
 - **Data**: same input sequences and conditioning
 - **Grad sync**: manual all-reduce across all ranks
-
-The ONLY independent variable is the SP scheduling strategy.
+- **Processing**: sequential, one sequence at a time with gradient accumulation
 
 ### Simplified Benchmark (for quick iteration)
 

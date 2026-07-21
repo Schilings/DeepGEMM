@@ -120,7 +120,7 @@ def run_static(model, gm, mbs, sp_size, dim, dev):
 
     # Process in rounds of dp_size parallel copies
     for round_idx in range(0, len(mbs), dp_size):
-        dp_idx = rank_global % dp_size  # which DP copy this rank belongs to
+        dp_idx = rank_global // sp_size  # which DP copy this rank belongs to
         mb_idx = round_idx + dp_idx
         if mb_idx < len(mbs):
             mb = mbs[mb_idx]
@@ -160,7 +160,7 @@ def run_dynamic(model, gm, mbs, dim, dev):
         group_mbs = by_sp[sp_size]
 
         for round_idx in range(0, len(group_mbs), dp_size):
-            dp_idx = rank_global % dp_size
+            dp_idx = rank_global // sp_size
             mb_idx = round_idx + dp_idx
             if mb_idx < len(group_mbs):
                 mb = group_mbs[mb_idx]

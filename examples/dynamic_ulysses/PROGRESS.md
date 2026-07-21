@@ -126,3 +126,22 @@ python examples/dynamic_ulysses/bench_wan21_14b.py 8
 # 快速测试（4层，随机权重）
 python examples/dynamic_ulysses/bench_wan21_14b.py 8 --layers 4 --synthetic
 ```
+
+### Benchmark 结果（B300 ×8, 40层, 14.056B 参数, 官方权重）
+
+| 场景 | Tokens | Static SP=8 (tok/s) | Dynamic SP (tok/s) | 加速比 | Dyn 调度 |
+|------|-------:|--------------------:|-------------------:|-------:|---------|
+| uniform_8K×8 | 65,536 | 32,214 | 12,906 | 0.401x | {2: 8} |
+| uniform_32K×2 | 65,536 | 36,558 | 19,651 | 0.538x | {4: 2} |
+| mixed | 77,824 | 28,457 | 15,686 | 0.551x | {4:2, 2:4, 1:2} |
+| all_short_2K×8 | 16,384 | 8,557 | 6,517 | 0.762x | {1: 8} |
+| bimodal | 77,824 | 24,531 | 15,159 | 0.618x | {4:2, 1:6} |
+| one_long_tail | 47,104 | 18,688 | 12,315 | 0.659x | {4:1, 1:7} |
+
+**几何平均: 0.577x**（Dynamic SP 在无 DP 并行时比 Static SP=8 慢 42%）
+
+### 分析
+
+1. **无 DP 并行时，小 SP = 浪费 GPU**：SP=2 只有 2 卡做 A2A，6 卡闲置；SP=8 全部 8 卡协同，每卡只处理 1/8 序列
+2. **Dynamic SP 的价值在于 DP 并行**：多条短序列用小 SP，DP copies 并行处理。当前 benchmark 隔离了 SP size 选择（无 DP），证明 SP size 单独不能带来收益
+3. **设计决策**：当前 benchmark 是**纯 SP size 消融实验**，控制变量最干净 — 唯一区别是每条序列用的 SP size。后续需要加入 DP 并行版本才能体现 Dynamic SP 的真正价值
