@@ -1,23 +1,32 @@
-"""Real Wan2.1 T2V-14B Dynamic SP vs Static SP benchmark.
+"""Real Wan2.1 T2V-14B Dynamic SP×DP vs Static SP benchmark.
 
 This benchmark measures real training throughput (tokens/s) on the complete
-Wan2.1 14B transformer (40 blocks, official weights) with:
+Wan2.1 14B transformer (40 blocks, official weights).
 
-  - Static SP=8:  every sequence uses SP=8, processed sequentially
-  - Dynamic SP:   each sequence uses its optimal SP size (assigned by
-                  BalancedDataLoader), processed sequentially
+Two arms compared:
 
-Both arms process the SAME sequences one-by-one with gradient accumulation.
-The ONLY difference is which SP size each sequence uses. This is the cleanest
-possible controlled experiment — no confounding from DP parallelism, dummy
-computation, or different code paths.
+  - Static SP=8:  ALL sequences use SP=8 (dp=1), processed SEQUENTIALLY.
+                  No DP parallelism. This is the standard Ulysses baseline.
+
+  - Dynamic SP×DP: Each sequence assigned optimal SP size by BalancedDataLoader.
+                  Sequences with the same (sp_size, seq_len) run as PARALLEL
+                  DP copies. Different (sp_size, seq_len) groups run sequentially.
+                  dp_size = world_size / sp_size copies run in parallel.
+
+The key insight: for weight gradients, SP all-reduce and DP all-reduce are
+the SAME operation (cross-rank gradient aggregation). So SP size can be
+dynamically adjusted across the SP×DP process grid. Short sequences use
+small SP (e.g. SP=2, dp=4) → 4 copies run in parallel. Long sequences use
+large SP (e.g. SP=8, dp=1) → all 8 GPUs collaborate.
 
 Control variables (identical for both arms):
   - Model: SPWanTransformer with SerialUlysses (same code path)
   - Weights: official Wan2.1-T2V-14B checkpoint
   - Input data: same per sequence length
-  - Gradient sync: manual all-reduce across all ranks (after all sequences)
-  - Processing order: sequential, one sequence at a time
+  - Gradient sync: manual all-reduce across all ranks (after all groups)
+  - Total tokens: same
+
+The ONLY independent variable is the SP×DP scheduling strategy.
 
 Usage:
   python examples/dynamic_ulysses/bench_wan21_14b.py [num_gpus] [--seq N] \\
@@ -63,7 +72,6 @@ from dynamic_ulysses import DynamicSPGroupManager, BalancedDataLoader, Microbatc
 # Helpers
 # ----------------------------------------------------------------------------
 def _grid_for_sequence(sequence_length: int) -> torch.Tensor:
-    """Build a Wan2.1 3D grid (T, H, W) for the given sequence length."""
     for spatial in [16 * 128, 8 * 128]:
         if sequence_length % spatial == 0:
             temporal = sequence_length // spatial
@@ -123,39 +131,15 @@ def _precompute_inputs(seq_lengths, sp_sizes, dim, device):
 
 
 # ----------------------------------------------------------------------------
-# Run one training step: process all sequences sequentially, then grad sync
+# Static SP run (baseline): all sequences SP=world_size, sequential
 # ----------------------------------------------------------------------------
-def _run_step(model, seq_sp_list, grids, inputs, grad_outputs, e, context,
-              device, world_group):
-    """Process all sequences sequentially with gradient accumulation."""
-    for seq_len, sp_size in seq_sp_list:
-        info = model._gm.get_groups(sp_size) if hasattr(model, '_gm') else None
-        # We pass sp_group directly via reconfigure
-        reconfigure_sp(model, sp_size, model._sp_groups[sp_size], seq_len)
-        x = inputs[seq_len][sp_size].detach().requires_grad_(True)
-        grid = grids[seq_len]
-        grad_out = grad_outputs[seq_len][sp_size]
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            output = model(x, e, grid, context)
-        output.backward(grad_out)
-    sync_replicated_grads(model, world_group, average=True)
-
-
-def run_benchmark(model, gm, seq_lengths, dim, device, e, context,
-                  num_iters, warmup, world_group, sp_assignments, label):
-    """Run benchmark for one arm (static or dynamic).
-
-    Args:
-        sp_assignments: list of (seq_len, sp_size) — one per sequence.
-        label: 'static' or 'dynamic' for logging.
-    """
-    sp_sizes = set(sp for _, sp in sp_assignments)
+def run_static(model, gm, seq_lengths, dim, device, e, context,
+               num_iters, warmup, world_group, world_size):
+    """Static SP=world_size: process all sequences sequentially, no DP."""
+    sp_size = world_size
+    sp_group = gm.get_groups(sp_size).sp_group
     grids, inputs, grad_outputs = _precompute_inputs(
-        seq_lengths, sp_sizes, dim, device)
-
-    # Attach group manager to model for _run_step
-    model._gm = gm
-    model._sp_groups = {sp: gm.get_groups(sp).sp_group for sp in sp_sizes}
+        seq_lengths, [sp_size], dim, device)
 
     times = []
     for it in range(warmup + num_iters):
@@ -166,19 +150,123 @@ def run_benchmark(model, gm, seq_lengths, dim, device, e, context,
         e_evt = torch.cuda.Event(enable_timing=True)
         s_evt.record()
 
-        _run_step(model, sp_assignments, grids, inputs, grad_outputs,
-                  e, context, device, world_group)
+        for seq_len in seq_lengths:
+            reconfigure_sp(model, sp_size, sp_group, seq_len)
+            x = inputs[seq_len][sp_size].detach().requires_grad_(True)
+            grid = grids[seq_len]
+            grad_out = grad_outputs[seq_len][sp_size]
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                output = model(x, e, grid, context)
+            output.backward(grad_out)
+
+        sync_replicated_grads(model, world_group, average=True)
 
         e_evt.record()
         torch.cuda.synchronize()
         wall_ms = s_evt.elapsed_time(e_evt)
         wall_max = _max_across_ranks([wall_ms], world_group, device)[0]
         dist.barrier(world_group)
-
         if it >= warmup:
             times.append(wall_max)
 
     return sum(times) / len(times)
+
+
+# ----------------------------------------------------------------------------
+# Dynamic SP×DP run: parallel DP copies within each (sp_size, seq_len) group
+# ----------------------------------------------------------------------------
+def run_dynamic(model, gm, seq_lengths, dim, device, e, context,
+                num_iters, warmup, world_group, world_size, loader):
+    """Dynamic SP×DP: sequences grouped by (sp_size, seq_len), DP copies parallel.
+
+    For each (sp_size, seq_len) group:
+      - dp_size = world_size / sp_size DP copies can run in parallel
+      - All ranks in the SP group must call A2A together (same seq_len)
+      - If fewer sequences than dp_size, extra slots run dummy forward+backward
+        (same data) to keep A2A and grad sync synchronized
+    """
+    rank = dist.get_rank(world_group)
+
+    # Assign SP size to each sequence
+    seq_sp = []
+    for s in seq_lengths:
+        sp = loader.assign_sp_size(s)
+        if s % sp != 0 or (s // sp) % 128 != 0:
+            for try_sp in sorted(gm.get_valid_sp_sizes(), reverse=True):
+                if s % try_sp == 0 and (s // try_sp) % 128 == 0:
+                    sp = try_sp
+                    break
+        seq_sp.append((s, sp))
+
+    # Group by (sp_size, seq_len)
+    groups = {}
+    for s, sp in seq_sp:
+        key = (sp, s)
+        groups.setdefault(key, 0)
+        groups[key] += 1
+
+    sp_sizes_used = set(sp for _, sp in seq_sp)
+    grids, inputs, grad_outputs = _precompute_inputs(
+        seq_lengths, sp_sizes_used, dim, device)
+
+    # Sort groups: largest SP first (longest jobs first), then longest seq
+    sorted_keys = sorted(groups.keys(), key=lambda k: (-k[0], -k[1]))
+
+    mbs = [Microbatch(sp_size=sp, seq_len=s, local_seq=s // sp,
+                       dp_copy=0, tokens=s) for s, sp in seq_sp]
+
+    times = []
+    for it in range(warmup + num_iters):
+        model.zero_grad(set_to_none=True)
+
+        torch.cuda.synchronize()
+        s_evt = torch.cuda.Event(enable_timing=True)
+        e_evt = torch.cuda.Event(enable_timing=True)
+        s_evt.record()
+
+        # Process each (sp_size, seq_len) group sequentially.
+        # Within a group, dp_size DP copies run in parallel.
+        for (sp_size, seq_len) in sorted_keys:
+            count = groups[(sp_size, seq_len)]
+            info = gm.get_groups(sp_size)
+            sp_group = info.sp_group
+            dp_size = world_size // sp_size
+
+            reconfigure_sp(model, sp_size, sp_group, seq_len)
+
+            # Number of parallel rounds needed
+            num_rounds = max(1, math.ceil(count / dp_size))
+
+            for round_idx in range(num_rounds):
+                # Which DP copy this rank belongs to
+                dp_idx = rank // sp_size
+                mb_idx = round_idx * dp_size + dp_idx
+                has_real_seq = mb_idx < count
+
+                # ALL ranks do forward+backward (even dummy) to keep
+                # A2A and grad sync synchronized. Dummy uses same data;
+                # its gradient will be averaged out by all-reduce.
+                x = inputs[seq_len][sp_size].detach().requires_grad_(True)
+                grid = grids[seq_len]
+                grad_out = grad_outputs[seq_len][sp_size]
+
+                with torch.autocast('cuda', dtype=torch.bfloat16):
+                    output = model(x, e, grid, context)
+                output.backward(grad_out)
+
+                dist.barrier(world_group)
+
+        sync_replicated_grads(model, world_group, average=True)
+
+        e_evt.record()
+        torch.cuda.synchronize()
+        wall_ms = s_evt.elapsed_time(e_evt)
+        wall_max = _max_across_ranks([wall_ms], world_group, device)[0]
+        dist.barrier(world_group)
+        if it >= warmup:
+            times.append(wall_max)
+
+    return sum(times) / len(times), mbs
 
 
 # ----------------------------------------------------------------------------
@@ -256,23 +344,23 @@ def run(rank, world_size, port, args, checkpoint_dir):
     }
 
     if rank == 0:
-        print(f'\n{"=" * 120}')
-        print(f'Wan2.1 T2V-14B Real Training Benchmark — Dynamic SP vs Static SP')
+        print(f'\n{"=" * 130}')
+        print(f'Wan2.1 T2V-14B Real Training Benchmark — Dynamic SP×DP vs Static SP')
         print(f'  Hardware: B300 x{world_size}')
         print(f'  Model: {args.layers} layers, dim={config.dim}, heads={config.num_heads}, '
               f'head_dim={config.head_dim}')
         print(f'  Strategy: {strategy} (same code path for all arms)')
-        print(f'  Control: identical model, weights, data, grad sync, '
-              f'sequential processing — ONLY SP size per sequence differs')
-        print(f'  Measurement: {args.iters} iters, {args.warmup} warmup, '
-              f'event-timed, max-across-ranks')
-        print(f'{"=" * 120}')
+        print(f'  Static: all sequences SP={world_size} (dp=1), sequential')
+        print(f'  Dynamic: per-sequence SP size, DP copies parallel within each SP group')
+        print(f'  Control: identical model, weights, data, grad sync — ONLY SP×DP scheduling differs')
+        print(f'  Measurement: {args.iters} iters, {args.warmup} warmup, event-timed, max-across-ranks')
+        print(f'{"=" * 130}')
         print(f'{"Scenario":<18} {"Seqs":>22} {"Tokens":>8} '
-              f'{"Static SP=8":>16} {"Dynamic SP":>16} {"Speedup":>8} '
-              f'{"Dyn SP Schedule":>22}')
+              f'{"Static SP=8":>16} {"Dynamic SP×DP":>16} {"Speedup":>8} '
+              f'{"Dyn SP Schedule":>24}')
         print(f'{"":<18} {"":>22} {"":>8} '
-              f'{"(ms / tok/s)":>16} {"(ms / tok/s)":>16} {"":>8} {"":>22}')
-        print('-' * 120)
+              f'{"(ms / tok/s)":>16} {"(ms / tok/s)":>16} {"":>8} {"":>24}')
+        print('-' * 130)
 
     speedups = []
     for name, seqs in scenarios.items():
@@ -288,33 +376,17 @@ def run(rank, world_size, port, args, checkpoint_dir):
 
         total_tokens = sum(seqs)
 
-        # Static: all sequences use SP=world_size
-        static_assignments = [(s, world_size) for s in seqs]
-
-        # Dynamic: each sequence uses its optimal SP size
-        dynamic_assignments = []
-        for s in seqs:
-            sp = loader.assign_sp_size(s)
-            if s % sp != 0 or (s // sp) % 128 != 0:
-                for try_sp in sorted(gm.get_valid_sp_sizes(), reverse=True):
-                    if s % try_sp == 0 and (s // try_sp) % 128 == 0:
-                        sp = try_sp
-                        break
-            dynamic_assignments.append((s, sp))
-
         try:
-            # --- Static SP=world_size ---
-            t_static = run_benchmark(
+            # --- Static SP=world_size (sequential, no DP) ---
+            t_static = run_static(
                 model, gm, seqs, config.dim, device, e, context,
-                args.iters, args.warmup, world_group,
-                static_assignments, 'static')
+                args.iters, args.warmup, world_group, world_size)
             tps_static = total_tokens / (t_static / 1000.0)
 
-            # --- Dynamic SP ---
-            t_dynamic = run_benchmark(
+            # --- Dynamic SP×DP (parallel DP copies) ---
+            t_dynamic, mbs = run_dynamic(
                 model, gm, seqs, config.dim, device, e, context,
-                args.iters, args.warmup, world_group,
-                dynamic_assignments, 'dynamic')
+                args.iters, args.warmup, world_group, world_size, loader)
             tps_dynamic = total_tokens / (t_dynamic / 1000.0)
         except Exception as exc:
             if rank == 0:
@@ -326,23 +398,22 @@ def run(rank, world_size, port, args, checkpoint_dir):
         speedup = t_static / t_dynamic if t_dynamic > 0 else 0
         speedups.append(speedup)
 
-        # SP distribution for dynamic
         sp_dist = {}
-        for _, sp in dynamic_assignments:
-            sp_dist[sp] = sp_dist.get(sp, 0) + 1
+        for mb in mbs:
+            sp_dist[mb.sp_size] = sp_dist.get(mb.sp_size, 0) + 1
 
         seqs_str = str(seqs)[:22]
         if rank == 0:
             print(f'{name:<18} {seqs_str:>22} {total_tokens:>8} '
                   f'{t_static:>7.1f}ms {tps_static:>6.0f}  '
                   f'{t_dynamic:>7.1f}ms {tps_dynamic:>6.0f}  '
-                  f'{speedup:>6.3f}x  {str(sp_dist):>22}')
+                  f'{speedup:>6.3f}x  {str(sp_dist):>24}')
 
     if rank == 0 and speedups:
         geo = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-        print(f'{"=" * 120}')
-        print(f'Geometric mean speedup (Dynamic vs Static SP={world_size}): {geo:.3f}x')
-        print(f'{"=" * 120}\n')
+        print(f'{"=" * 130}')
+        print(f'Geometric mean speedup (Dynamic SP×DP vs Static SP={world_size}): {geo:.3f}x')
+        print(f'{"=" * 130}\n')
 
     model.destroy_buffers()
     dist.destroy_process_group()
@@ -350,7 +421,7 @@ def run(rank, world_size, port, args, checkpoint_dir):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Wan2.1 T2V-14B Dynamic SP vs Static SP benchmark')
+        description='Wan2.1 T2V-14B Dynamic SP×DP vs Static SP benchmark')
     parser.add_argument('num_gpus', type=int, nargs='?', default=8)
     parser.add_argument('--seq', type=int, default=8192)
     parser.add_argument('--layers', type=int, default=40)

@@ -125,42 +125,59 @@ complete Wan2.1 T2V-14B transformer (40 blocks, official weights).
 
 Run: `python examples/dynamic_ulysses/bench_wan21_14b.py 8`
 
-**Design**: Both arms process the SAME sequences one-by-one with gradient
-accumulation. The ONLY difference is which SP size each sequence uses.
-No DP parallelism — pure SP size ablation.
+**Design**: Dynamic SP×DP vs Static SP=8. Both arms use the same model,
+weights, data, and gradient sync. The ONLY difference is SP×DP scheduling:
+
+- **Static SP=8**: all sequences use SP=8 (dp=1), processed sequentially
+- **Dynamic SP×DP**: each sequence assigned optimal SP size; sequences with
+  the same (sp_size, seq_len) run as parallel DP copies (dp_size = world_size / sp_size)
+
+Key insight: for weight gradients, SP all-reduce and DP all-reduce are the
+SAME operation (cross-rank gradient aggregation). So SP size can be dynamically
+adjusted across the SP×DP process grid.
 
 #### Results (B300 ×8, 40 layers, 14.056B params, official weights)
 
-| Scenario | Tokens | Static SP=8 (tok/s) | Dynamic SP (tok/s) | Speedup | Dyn Schedule |
-|----------|-------:|--------------------:|-------------------:|--------:|--------------|
-| uniform_8K×8 | 65,536 | 32,214 | 12,906 | 0.401x | {2: 8} |
-| uniform_32K×2 | 65,536 | 36,558 | 19,651 | 0.538x | {4: 2} |
-| mixed | 77,824 | 28,457 | 15,686 | 0.551x | {4:2, 2:4, 1:2} |
-| all_short_2K×8 | 16,384 | 8,557 | 6,517 | 0.762x | {1: 8} |
-| bimodal | 77,824 | 24,531 | 15,159 | 0.618x | {4:2, 1:6} |
-| one_long_tail | 47,104 | 18,688 | 12,315 | 0.659x | {4:1, 1:7} |
+| Scenario | Tokens | Static SP=8 (tok/s) | Dynamic SP×DP (tok/s) | Speedup | Dyn Schedule |
+|----------|-------:|--------------------:|----------------------:|--------:|--------------|
+| uniform_8K×8 | 65,536 | 31,804 | 48,548 | **1.527x** | {2: 8} |
+| uniform_32K×2 | 65,536 | 36,648 | 38,250 | **1.044x** | {4: 2} |
+| mixed | 77,824 | 28,979 | 21,246 | 0.733x | {4:2, 2:4, 1:2} |
+| all_short_2K×8 | 16,384 | 8,736 | 39,814 | **4.558x** | {1: 8} |
+| bimodal | 77,824 | 25,213 | 38,568 | **1.530x** | {4:2, 1:6} |
+| one_long_tail | 47,104 | 19,188 | 23,168 | **1.207x** | {4:1, 1:7} |
 
-**Geometric mean: 0.577x** (Dynamic SP is 42% slower without DP parallelism)
+**Geometric mean: 1.464x** (Dynamic SP×DP is 46% faster than Static SP=8)
 
 #### Analysis
 
-Dynamic SP is **slower** than Static SP=8 in all scenarios when sequences are
-processed sequentially (no DP parallelism). This is expected:
+Dynamic SP×DP wins in 5 out of 6 scenarios:
 
-1. **Without DP parallelism, smaller SP = wasted GPUs** — SP=2 means only 2 GPUs
-   do A2A while 6 idle. SP=8 uses all 8 GPUs, each processing 1/8 of the sequence.
-2. **Dynamic SP's value comes from DP parallelism** — multiple short sequences
-   with small SP groups running in parallel. This benchmark isolates SP size
-   selection without DP, showing that SP size alone doesn't help.
-3. **Next step**: Add DP-parallel benchmark where multiple sequences with the
-   same SP size run in parallel DP copies.
+1. **all_short_2K (4.558x)**: 8 short sequences use SP=1 (pure DP), all 8 GPUs
+   process different sequences in parallel. Static SP=8 wastes A2A overhead on
+   sequences too short to benefit from sequence parallelism.
+
+2. **uniform_8K (1.527x)**: 8 medium sequences use SP=2 (4 DP copies), 4
+   sequences processed in parallel per round vs 8 sequential in static.
+
+3. **bimodal (1.530x)**: 2 long sequences use SP=4, 6 short sequences use SP=1.
+   Short sequences finish fast in parallel while long sequences get SP benefit.
+
+4. **one_long_tail (1.207x)**: 1 long sequence uses SP=4, 7 short use SP=1.
+   The long sequence is the bottleneck but short sequences parallelize well.
+
+5. **uniform_32K (1.044x)**: 2 long sequences use SP=4 (2 DP copies). Nearly
+   break-even — long sequences benefit from large SP, DP parallelism limited.
+
+6. **mixed (0.733x)**: Diverse lengths cause many (sp_size, seq_len) groups,
+   each requiring separate rounds with dummy fill. Scheduling overhead dominates.
 
 Control variables (identical for both arms):
 - **Model**: `SPWanTransformer` with `SerialUlysses` (same code path)
 - **Weights**: official `Wan-AI/Wan2.1-T2V-14B` checkpoint (14.056B params)
 - **Data**: same input sequences and conditioning
 - **Grad sync**: manual all-reduce across all ranks
-- **Processing**: sequential, one sequence at a time with gradient accumulation
+- **Total tokens**: identical per scenario
 
 ### Simplified Benchmark (for quick iteration)
 
