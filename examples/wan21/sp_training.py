@@ -41,7 +41,7 @@ class SPWanAttentionBlock(nn.Module):
         self.ffn = WanFeedForward(dim, config.ffn_dim)
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x_local, e, grid, context):
+    def forward(self, x_local, e, grid, context, cu_seqlens=None):
         llseq = x_local.shape[0]
         e_chunks = tuple(
             chunk.squeeze(0) for chunk in
@@ -49,7 +49,7 @@ class SPWanAttentionBlock(nn.Module):
         )
 
         h = self.norm1(x_local).float() * (1 + e_chunks[1]) + e_chunks[0]
-        y = self.self_attn(h, grid, llseq)
+        y = self.self_attn(h, grid, llseq, cu_seqlens=cu_seqlens)
         x_local = x_local.float() + y.float() * e_chunks[2]
 
         x_batched = x_local.unsqueeze(0)
@@ -95,9 +95,9 @@ class SPWanTransformer(nn.Module):
                 if getattr(owner, "sym_post", None) is not None:
                     block.self_attn.share_buffers_from(owner)
 
-    def forward(self, x_local, e, grid, context):
+    def forward(self, x_local, e, grid, context, cu_seqlens=None):
         for block in self.blocks:
-            x_local = block(x_local, e, grid, context)
+            x_local = block(x_local, e, grid, context, cu_seqlens=cu_seqlens)
         return x_local
 
     def destroy_buffers(self):

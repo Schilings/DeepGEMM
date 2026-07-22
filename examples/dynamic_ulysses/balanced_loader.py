@@ -17,8 +17,8 @@ The scheduler outputs a list of microbatches, each tagged with its SP size.
 Microbatches are ordered so that larger SP groups run first (they take longer).
 """
 
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 import torch
 
 
@@ -42,6 +42,33 @@ class Microbatch:
     def __repr__(self):
         return (f"Microbatch(sp={self.sp_size}, seq={self.seq_len}, "
                 f"local_seq={self.local_seq}, dp_copy={self.dp_copy})")
+
+
+@dataclass
+class PackedMicrobatch:
+    """A packed microbatch containing multiple variable-length sequences.
+
+    All sequences share the same SP size and are packed into a single
+    contiguous tensor for one forward pass (THD layout, no padding).
+
+    Attributes:
+        sp_size:      SP group size.
+        seq_lens:     List of sequence lengths packed together.
+        total_tokens: sum(seq_lens).
+        local_tokens: total_tokens // sp_size (per-rank token count).
+        cu_seqlens:   Cumulative sequence lengths [0, s1, s1+s2, ...].
+        dp_copy:      Which DP copy this packed batch belongs to.
+    """
+    sp_size: int
+    seq_lens: List[int]
+    total_tokens: int
+    local_tokens: int
+    cu_seqlens: List[int]
+    dp_copy: int
+
+    def __repr__(self):
+        return (f"PackedMicrobatch(sp={self.sp_size}, seqs={self.seq_lens}, "
+                f"total={self.total_tokens}, dp={self.dp_copy})")
 
 
 class BalancedDataLoader:
@@ -177,3 +204,87 @@ class BalancedDataLoader:
             per_sp_flops[key] = per_sp_flops.get(key, 0) + per_gpu
 
         return max(per_sp_flops.values()) if per_sp_flops else 0.0
+
+    # ------------------------------------------------------------------
+    # THD packed scheduling
+    # ------------------------------------------------------------------
+    def schedule_packed(self, sequence_lengths: List[int]) -> List[PackedMicrobatch]:
+        """Create a packed microbatch schedule using THD layout.
+
+        Same SP size sequences are packed into contiguous tensors (THD layout,
+        no padding). Each PackedMicrobatch is one forward pass using
+        flash_attn_varlen_func.
+
+        Packing strategy: minimize the number of DP copies used (to reduce
+        dummy fill), while keeping per-DP-copy FLOPs balanced. If we have
+        N sequences and dp_size slots, we use min(N, dp_size) slots — packing
+        multiple sequences into the same slot when beneficial.
+
+        Steps:
+        1. Assign SP size to each sequence.
+        2. Group by SP size.
+        3. Within each SP group, pack into min(count, dp_size) balanced bins.
+        4. Return PackedMicrobatch list, ordered by SP size (largest first).
+        """
+        # Step 1: assign SP and group
+        sp_buckets: Dict[int, List[int]] = {sp: [] for sp in self.sp_sizes}
+        for seq_len in sequence_lengths:
+            aligned = ((seq_len + self.seq_align - 1) // self.seq_align) * self.seq_align
+            sp = self.assign_sp_size(aligned)
+            sp_buckets[sp].append(aligned)
+
+        # Step 2: pack each SP group into balanced bins
+        packed: List[PackedMicrobatch] = []
+        for sp in reversed(self.sp_sizes):  # largest SP first
+            bucket = sp_buckets[sp]
+            if not bucket:
+                continue
+            dp_size = self.world_size // sp
+            # Use min(count, dp_size) bins — pack multiple sequences per bin
+            # when we have fewer sequences than DP slots.
+            num_bins = min(len(bucket), dp_size)
+            bins = self._greedy_pack(bucket, num_bins)
+
+            for dp_copy, bin_seqs in enumerate(bins):
+                if not bin_seqs:
+                    continue
+                total = sum(bin_seqs)
+                # Ensure total is divisible by sp for even A2A split
+                if total % sp != 0:
+                    pad = sp - (total % sp)
+                    bin_seqs = list(bin_seqs) + [pad]
+                    total += pad
+                cu_seqlens = [0]
+                for s in bin_seqs:
+                    cu_seqlens.append(cu_seqlens[-1] + s)
+
+                packed.append(PackedMicrobatch(
+                    sp_size=sp,
+                    seq_lens=bin_seqs,
+                    total_tokens=total,
+                    local_tokens=total // sp,
+                    cu_seqlens=cu_seqlens,
+                    dp_copy=dp_copy,
+                ))
+
+        return packed
+
+    @staticmethod
+    def _greedy_pack(seqs: List[int], num_bins: int) -> List[List[int]]:
+        """Greedily pack sequences into num_bins bins, balanced by FLOPs (S²).
+
+        Uses LPT (Longest Processing Time first) rule: sort by FLOPs descending,
+        assign each to the bin with smallest current load. This gives a
+        4/3-approximation of optimal makespan.
+        """
+        sorted_seqs = sorted(seqs, key=lambda s: s * s, reverse=True)
+
+        bins: List[List[int]] = [[] for _ in range(num_bins)]
+        bin_flops = [0.0] * num_bins
+
+        for s in sorted_seqs:
+            min_bin = bin_flops.index(min(bin_flops))
+            bins[min_bin].append(s)
+            bin_flops[min_bin] += s * s
+
+        return bins

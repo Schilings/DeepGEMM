@@ -175,17 +175,15 @@ def run_static(model, gm, seq_lengths, dim, device, e, context,
 
 
 # ----------------------------------------------------------------------------
-# Dynamic SP×DP run: parallel DP copies within each (sp_size, seq_len) group
+# Dynamic SP×DP run: THD packed, parallel DP copies within each SP group
 # ----------------------------------------------------------------------------
 def run_dynamic(model, gm, seq_lengths, dim, device, e, context,
                 num_iters, warmup, world_group, world_size, loader):
-    """Dynamic SP×DP: sequences grouped by (sp_size, seq_len), DP copies parallel.
+    """Dynamic SP×DP with THD packed for SP=1.
 
-    For each (sp_size, seq_len) group:
-      - dp_size = world_size / sp_size DP copies can run in parallel
-      - All ranks in the SP group must call A2A together (same seq_len)
-      - If fewer sequences than dp_size, extra slots run dummy forward+backward
-        (same data) to keep A2A and grad sync synchronized
+    - SP=1: multiple sequences packed into one THD forward (flash_attn_varlen)
+    - SP>1: per-sequence fixed-shape forward (A2A gives full seq, no packing benefit)
+    - DP copies with same SP size run in parallel
     """
     rank = dist.get_rank(world_group)
 
@@ -193,29 +191,67 @@ def run_dynamic(model, gm, seq_lengths, dim, device, e, context,
     seq_sp = []
     for s in seq_lengths:
         sp = loader.assign_sp_size(s)
-        if s % sp != 0 or (s // sp) % 128 != 0:
+        if s % sp != 0:
             for try_sp in sorted(gm.get_valid_sp_sizes(), reverse=True):
-                if s % try_sp == 0 and (s // try_sp) % 128 == 0:
+                if s % try_sp == 0:
                     sp = try_sp
                     break
         seq_sp.append((s, sp))
 
-    # Group by (sp_size, seq_len)
-    groups = {}
-    for s, sp in seq_sp:
+    # Group by (sp_size, seq_len) for SP>1, and by sp_size for SP=1 (packed)
+    sp1_seqs = [s for s, sp in seq_sp if sp == 1]
+    sp_gt1 = [(s, sp) for s, sp in seq_sp if sp > 1]
+
+    # Pre-compute inputs for SP>1 (per sequence)
+    sp_gt1_inputs = {}
+    sp_gt1_grads = {}
+    sp_gt1_grids = {}
+    for s, sp in sp_gt1:
+        if s not in sp_gt1_inputs:
+            local_s = s // sp
+            g = torch.Generator(device=device).manual_seed(1234 + s)
+            sp_gt1_inputs[s] = {}
+            sp_gt1_grads[s] = {}
+            for try_sp in gm.get_valid_sp_sizes():
+                if s % try_sp == 0:
+                    ls = s // try_sp
+                    sp_gt1_inputs[s][try_sp] = torch.randn(ls, dim, device=device,
+                                                             dtype=torch.bfloat16, generator=g)
+                    g2 = torch.Generator(device=device).manual_seed(5678 + s)
+                    sp_gt1_grads[s][try_sp] = torch.randn(ls, dim, device=device,
+                                                           dtype=torch.float32, generator=g2)
+            sp_gt1_grids[s] = _grid_for_sequence(s).to(device)
+
+    # Pre-compute packed input for SP=1
+    sp1_packed = None
+    if sp1_seqs:
+        total = sum(sp1_seqs)
+        g = torch.Generator(device=device).manual_seed(1234 + total)
+        sp1_x = torch.randn(total, dim, device=device, dtype=torch.bfloat16, generator=g)
+        g2 = torch.Generator(device=device).manual_seed(5678 + total)
+        sp1_grad = torch.randn(total, dim, device=device, dtype=torch.float32, generator=g2)
+        cu_seqlens = [0]
+        for s in sp1_seqs:
+            cu_seqlens.append(cu_seqlens[-1] + s)
+        sp1_cu = torch.tensor(cu_seqlens, dtype=torch.long)
+        sp1_grids = torch.tensor(
+            [_grid_for_sequence(s)[0].tolist() for s in sp1_seqs],
+            dtype=torch.long, device=device)
+        sp1_packed = (sp1_x, sp1_grad, sp1_cu, sp1_grids)
+
+    # Build schedule: SP>1 groups first (largest SP first), then SP=1
+    # For SP>1: group by (sp, seq_len) — same as non-packed version
+    sp_gt1_groups = {}
+    for s, sp in sp_gt1:
         key = (sp, s)
-        groups.setdefault(key, 0)
-        groups[key] += 1
+        sp_gt1_groups.setdefault(key, 0)
+        sp_gt1_groups[key] += 1
+    sp_gt1_sorted = sorted(sp_gt1_groups.keys(), key=lambda k: (-k[0], -k[1]))
 
-    sp_sizes_used = set(sp for _, sp in seq_sp)
-    grids, inputs, grad_outputs = _precompute_inputs(
-        seq_lengths, sp_sizes_used, dim, device)
-
-    # Sort groups: largest SP first (longest jobs first), then longest seq
-    sorted_keys = sorted(groups.keys(), key=lambda k: (-k[0], -k[1]))
-
-    mbs = [Microbatch(sp_size=sp, seq_len=s, local_seq=s // sp,
-                       dp_copy=0, tokens=s) for s, sp in seq_sp]
+    # For reporting
+    sp_dist = {}
+    for _, sp in seq_sp:
+        sp_dist[sp] = sp_dist.get(sp, 0) + 1
 
     times = []
     for it in range(warmup + num_iters):
@@ -226,39 +262,80 @@ def run_dynamic(model, gm, seq_lengths, dim, device, e, context,
         e_evt = torch.cuda.Event(enable_timing=True)
         s_evt.record()
 
-        # Process each (sp_size, seq_len) group sequentially.
-        # Within a group, dp_size DP copies run in parallel.
-        for (sp_size, seq_len) in sorted_keys:
-            count = groups[(sp_size, seq_len)]
+        # SP>1: per-sequence fixed-shape, DP copies parallel
+        for (sp_size, seq_len) in sp_gt1_sorted:
+            count = sp_gt1_groups[(sp_size, seq_len)]
             info = gm.get_groups(sp_size)
             sp_group = info.sp_group
             dp_size = world_size // sp_size
-
             reconfigure_sp(model, sp_size, sp_group, seq_len)
 
-            # Number of parallel rounds needed
             num_rounds = max(1, math.ceil(count / dp_size))
-
             for round_idx in range(num_rounds):
-                # Which DP copy this rank belongs to
                 dp_idx = rank // sp_size
                 mb_idx = round_idx * dp_size + dp_idx
-                has_real_seq = mb_idx < count
 
-                # ALL ranks do forward+backward (even dummy) to keep
-                # A2A and grad sync synchronized. Dummy uses same data;
-                # its gradient will be averaged out by all-reduce.
-                x = inputs[seq_len][sp_size].detach().requires_grad_(True)
-                grid = grids[seq_len]
-                grad_out = grad_outputs[seq_len][sp_size]
+                x = sp_gt1_inputs[seq_len][sp_size].detach().requires_grad_(True)
+                grid = sp_gt1_grids[seq_len]
+                grad_out = sp_gt1_grads[seq_len][sp_size]
 
                 with torch.autocast('cuda', dtype=torch.bfloat16):
                     output = model(x, e, grid, context)
                 output.backward(grad_out)
-
                 dist.barrier(world_group)
 
-        # FSDP2: gradient reduce-scatter is automatic in backward — no manual sync
+        # SP=1: per-sequence fixed-shape, DP copies parallel
+        # (same as SP>1 — packed varlen only helps when seqs > dp_size)
+        if sp1_seqs:
+            sp_size = 1
+            info = gm.get_groups(sp_size)
+            sp_group = info.sp_group
+            dp_size = world_size // sp_size
+
+            # Group by seq_len
+            sp1_groups = {}
+            for s in sp1_seqs:
+                sp1_groups.setdefault(s, 0)
+                sp1_groups[s] += 1
+
+            for seq_len in sorted(sp1_groups.keys(), reverse=True):
+                count = sp1_groups[seq_len]
+                reconfigure_sp(model, sp_size, sp_group, seq_len)
+                local_s = seq_len  # sp=1, local_seq = seq_len
+
+                if seq_len not in sp_gt1_inputs:
+                    g = torch.Generator(device=device).manual_seed(1234 + seq_len)
+                    xi = torch.randn(local_s, dim, device=device,
+                                      dtype=torch.bfloat16, generator=g)
+                    g2 = torch.Generator(device=device).manual_seed(5678 + seq_len)
+                    gi = torch.randn(local_s, dim, device=device,
+                                      dtype=torch.float32, generator=g2)
+                    grid_i = _grid_for_sequence(seq_len).to(device)
+                else:
+                    xi = sp_gt1_inputs[seq_len].get(1)
+                    if xi is None:
+                        g = torch.Generator(device=device).manual_seed(1234 + seq_len)
+                        xi = torch.randn(local_s, dim, device=device,
+                                          dtype=torch.bfloat16, generator=g)
+                    gi = sp_gt1_grads[seq_len].get(1)
+                    if gi is None:
+                        g2 = torch.Generator(device=device).manual_seed(5678 + seq_len)
+                        gi = torch.randn(local_s, dim, device=device,
+                                          dtype=torch.float32, generator=g2)
+                    grid_i = sp_gt1_grids[seq_len]
+
+                num_rounds = max(1, math.ceil(count / dp_size))
+                for round_idx in range(num_rounds):
+                    dp_idx = rank  # sp=1, dp_idx = rank
+                    mb_idx = round_idx * dp_size + dp_idx
+
+                    x = xi.detach().requires_grad_(True)
+                    with torch.autocast('cuda', dtype=torch.bfloat16):
+                        output = model(x, e, grid_i, context)
+                    output.backward(gi)
+                    dist.barrier(world_group)
+
+        # FSDP2: gradient reduce-scatter is automatic in backward
 
         e_evt.record()
         torch.cuda.synchronize()
@@ -268,7 +345,7 @@ def run_dynamic(model, gm, seq_lengths, dim, device, e, context,
         if it >= warmup:
             times.append(wall_max)
 
-    return sum(times) / len(times), mbs
+    return sum(times) / len(times), [], sp_dist
 
 
 # ----------------------------------------------------------------------------
@@ -421,8 +498,8 @@ def run(rank, world_size, port, args, checkpoint_dir):
                 args.iters, args.warmup, world_group, world_size)
             tps_static = total_tokens / (t_static / 1000.0)
 
-            # --- Dynamic SP×DP (parallel DP copies) ---
-            t_dynamic, mbs = run_dynamic(
+            # --- Dynamic SP×DP (THD packed, parallel DP copies) ---
+            t_dynamic, packed_mbs, sp_dist = run_dynamic(
                 model, gm, seqs, config.dim, device, e, context,
                 args.iters, args.warmup, world_group, world_size, loader)
             tps_dynamic = total_tokens / (t_dynamic / 1000.0)
@@ -435,10 +512,6 @@ def run(rank, world_size, port, args, checkpoint_dir):
 
         speedup = t_static / t_dynamic if t_dynamic > 0 else 0
         speedups.append(speedup)
-
-        sp_dist = {}
-        for mb in mbs:
-            sp_dist[mb.sp_size] = sp_dist.get(mb.sp_size, 0) + 1
 
         seqs_str = str(seqs)[:22]
         if rank == 0:

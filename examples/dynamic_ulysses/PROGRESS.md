@@ -44,16 +44,27 @@
 
 **手写梯度同步结果: 几何平均 1.464x**
 
-### 迭代 5: FSDP2 迁移（最终版本）
+### 迭代 5: FSDP2 迁移
 
 用 PyTorch FSDP2 `fully_shard` 替换手写 `sync_replicated_grads`：
 - 对每个 transformer block + 根模型 bottom-up 调用 `fully_shard`
 - 参数自动分片为 DTensor，forward 前 all-gather，backward 后 reduce-scatter
 - `modulation` 参数加入 `ignored_params`（与外部 `e` 相加，避免 DTensor 混合）
 - 所有参数统一 bf16（FSDP2 要求 dtype 一致）
-- 删除手写 `sync_replicated_grads` 调用
 
-**FSDP2 结果: 几何平均 1.823x**（比手写 1.464x 提升 24.6%）
+**FSDP2 结果: 几何平均 1.823x**
+
+### 迭代 6: THD Packed (SP=1 varlen)
+
+新增 THD packed 支持：
+- `PackedMicrobatch` + `schedule_packed` + `_greedy_pack` (LPT 贪心装箱)
+- `_attn_forward` 支持 `flash_attn_varlen_func`（packed THD 模式）
+- `_rope_packed` 按序列分段应用 3D RoPE
+- `SPWanTransformer.forward` 透传 `cu_seqlens` 参数
+
+关键发现：THD packed 对 SP=1 有收益（多条短序列一次 forward），但对 SP>1 无收益（A2A 后序列完整，varlen 有额外开销）。最终方案：**SP>1 用固定形状逐条 forward，SP=1 用 packed varlen**。
+
+**THD Packed 结果: 几何平均 1.847x**（比 FSDP2 非 packed 1.823x 提升 1.3%）
 
 ### Bug 修复记录
 

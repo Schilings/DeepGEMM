@@ -27,12 +27,12 @@ scenarios = [
 scenarios_short = ['all_short', 'bimodal', 'uniform_8K', 'one_long', 'uniform_32K', 'mixed']
 
 # tokens/s
-static_tps = [6176, 20667, 22528, 14579, 35996, 21970]
-dynamic_tps = [41235, 37206, 46916, 22476, 38706, 19447]
+static_tps = [5902, 20072, 22161, 14162, 35857, 22084]
+dynamic_tps = [40414, 36968, 46832, 22372, 38596, 19374]
 
 # wall-clock ms
-static_ms = [2652.9, 3765.5, 2909.1, 3230.9, 1820.6, 3542.3]
-dynamic_ms = [397.3, 2091.7, 1396.9, 2095.8, 1693.2, 4001.8]
+static_ms = [2776.2, 3877.2, 2957.3, 3326.1, 1827.7, 3524.0]
+dynamic_ms = [405.4, 2105.2, 1399.4, 2105.5, 1698.0, 4017.0]
 
 speedups = [s / d for s, d in zip(static_ms, dynamic_ms)]
 

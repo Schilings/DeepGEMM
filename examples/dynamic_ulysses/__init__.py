@@ -13,7 +13,7 @@ See DESIGN.md for the full design document.
 """
 
 from .sp_group_manager import DynamicSPGroupManager, SPGroupInfo
-from .balanced_loader import BalancedDataLoader, Microbatch
+from .balanced_loader import BalancedDataLoader, Microbatch, PackedMicrobatch
 from .dynamic_ulysses import DynamicUlyssesLayer, SPConfig
 from .grad_sync import DynamicGradientSync
 from .dynamic_trainer import DynamicTrainer
@@ -22,7 +22,7 @@ from .overlap_grad_sync import OverlapGradientSync
 
 __all__ = [
     'DynamicSPGroupManager', 'SPGroupInfo',
-    'BalancedDataLoader', 'Microbatch',
+    'BalancedDataLoader', 'Microbatch', 'PackedMicrobatch',
     'DynamicUlyssesLayer', 'SPConfig',
     'DynamicGradientSync',
     'DynamicTrainer',
