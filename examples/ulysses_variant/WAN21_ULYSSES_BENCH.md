@@ -327,9 +327,73 @@ AG kernel 的 GPU 生命周期约为同 shape 纯 GEMM 的 `475.7 / 45.1 ≈ 10.
 
 ## 结果来源
 
-- 2026-07-19～2026-07-20，NVIDIA B300×8；
+- 2026-07-19～2026-07-22，NVIDIA B300×8；
 - 官方 checkpoint revision：`a064a6c...`；
 - 真实 14B benchmark：`51f00d9`；
 - AG 发布/消费协议与最终吞吐：`e5a7356`；
 - POST autograd/NVTX profiling：`d5e41a4`；
-- 通用 profiling SOP：`2fa2641`。
+- 通用 profiling SOP：`2fa2641`；
+- 变量扫描吞吐/显存实验：`bench_variant_sweep.py` + `plot_variant_sweep.py`。
+
+## 变量扫描实验（序列长度 2K → 32K）
+
+### 实验设计
+
+- **硬件**：B300 ×8, SP=8, DP=1
+- **模型**：40 层完整 Transformer block，官方 Wan2.1-T2V-14B checkpoint (14.056B)
+- **策略**：serial (baseline, replicated Wo) vs fused_var (Wo column-sharded)
+- **同步**：DDP overlap（`sync-mode ddp`）
+- **序列长度**：2K, 4K, 8K, 16K, 32K
+- **迭代**：10 iters, 3 warmup, event-timed, max-across-ranks
+
+### 吞吐扫描结果
+
+| Seq | serial tok/s | fused_var tok/s | ratio | serial BWD | var BWD | BWD gap |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2K | 8,256 | 8,353 | **1.012x** | 155.8ms | 153.8ms | -1.3% |
+| 4K | 16,791 | 16,255 | 0.968x | 150.3ms | 163.6ms | +8.9% |
+| 8K | 29,061 | 28,247 | 0.972x | 186.0ms | 198.6ms | +6.8% |
+| 16K | 39,172 | 36,797 | 0.939x | 284.1ms | 300.6ms | +5.8% |
+| 32K | 37,675 | 36,440 | 0.967x | 585.2ms | 604.1ms | +3.2% |
+
+**关键观察**：
+1. **2K 时变体反而更快**（+1.2%）：短序列 Wo 计算量小，AG 通信开销被 DP overlap 掩盖
+2. **4K-32K 吞吐损失 3.3%-6.1%**：BWD 的 AG 8× 远端 payload 是瓶颈
+3. **BWD gap 随序列增长趋于收敛**：8K +6.8% → 32K +3.2%，因为长序列计算量大，AG 占比下降
+
+### 显存扫描结果（40 层 attention stack + FP32 Adam）
+
+| Seq | serial peak (MB) | var peak (MB) | 节省 (MB) | 节省 (%) | sym buffer (MB) |
+|---:|---:|---:|---:|---:|---:|
+| 2K | 48,088 | 37,661 | 10,427 | **21.7%** | 40 |
+| 4K | 48,103 | 37,716 | 10,387 | **21.6%** | 80 |
+| 8K | 48,193 | 38,280 | 9,913 | **20.6%** | 160 |
+| 16K | 54,375 | 45,205 | 9,170 | **16.9%** | 320 |
+| 32K | 68,688 | 59,058 | 9,630 | **14.0%** | 640 |
+
+**关键观察**：
+1. **显存节省 14.0%-21.7%**，与序列长度负相关（Wo 节省固定 10.5GB，总显存随序列增长）
+2. **sym buffer 仅 40-640 MB**，远小于节省的 ~10GB，净收益显著
+3. **2K 节省比例最高**（21.7%）：短序列 activation 小，Wo 节省占比大
+
+### 吞吐-显存 Tradeoff
+
+| 指标 | 2K | 4K | 8K | 16K | 32K |
+|------|---:|---:|---:|---:|---:|
+| 吞吐损失 | -1.2% | +3.3% | +2.8% | +6.1% | +3.3% |
+| 显存节省 | 21.7% | 21.6% | 20.6% | 16.9% | 14.0% |
+| **Tradeoff** | **双赢** | 可接受 | 可接受 | 临界 | 可接受 |
+
+**结论**：变体在所有序列长度下都显著节省显存（14%-22%），吞吐损失可控（1%-6%）。2K 时甚至双赢（吞吐+1.2%，显存-21.7%）。这证明 fused_var 是一种**值得使用的方案**，尤其在显存受限场景。
+
+### 图表
+
+| 图表 | 文件 | 内容 |
+|------|------|------|
+| var1 | `figures/fig_var1_throughput.png` | 吞吐 vs 序列长度曲线 |
+| var2 | `figures/fig_var2_memory.png` | 显存 vs 序列长度曲线 |
+| var3 | `figures/fig_var3_tradeoff.png` | 吞吐-显存 tradeoff 散点图（箭头从 serial 指向 var） |
+| var4 | `figures/fig_var4_breakdown.png` | FWD/BWD 分解 vs 序列长度 |
+| var5 | `figures/fig_var5_ratio_memory.png` | 吞吐比 + 显存节省双轴图 |
+
+运行扫描：`bench_variant_sweep.py`；生成图表：`plot_variant_sweep.py`。
