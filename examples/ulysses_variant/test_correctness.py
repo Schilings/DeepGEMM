@@ -156,8 +156,9 @@ def run(rank, ng, port):
             print(f'         {name}: {err:.6f}')
 
     # ---- Test 4: Loss curve (20 steps) ----
+    num_train_steps = 50
     if rank == 0:
-        print(f'\n[Test 4] Loss curve (20 training steps, lr=1e-4)')
+        print(f'\n[Test 4] Loss curve ({num_train_steps} training steps, lr=1e-4, different input each step)')
 
     # Rebuild fresh models with same weights for training
     torch.manual_seed(42)
@@ -196,21 +197,23 @@ def run(rank, ng, port):
     opt_s = torch.optim.AdamW(serial_model2.parameters(), lr=1e-4)
     opt_v = torch.optim.AdamW(var_model2.parameters(), lr=1e-4)
 
-    # Same input for all steps
-    x_train = torch.randn(local_seq, dim, device=dev, dtype=torch.bfloat16,
-                          generator=torch.Generator(device=dev).manual_seed(42))
+    # Different input each step (reflects real training)
+    torch.manual_seed(42)
+    inputs = [torch.randn(local_seq, dim, device=dev, dtype=torch.bfloat16)
+              for _ in range(50)]
 
     losses_s, losses_v = [], []
     max_loss_diff = 0
-    for step in range(20):
+    for step in range(num_train_steps):
+        x_step = inputs[step]
+
         # Serial
         opt_s.zero_grad()
-        xi = x_train.detach().requires_grad_(True)
+        xi = x_step.detach().requires_grad_(True)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out_s = serial_model2(xi, e, grid, context)
             loss_s = out_s.float().pow(2).mean()
         loss_s.backward()
-        # Sync grads (simulating DDP all-reduce)
         for p in serial_model2.parameters():
             if p.grad is not None and not getattr(p, '_sp_sharded', False):
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -219,7 +222,7 @@ def run(rank, ng, port):
 
         # Var
         opt_v.zero_grad()
-        xi2 = x_train.detach().requires_grad_(True)
+        xi2 = x_step.detach().requires_grad_(True)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             out_v = var_model2(xi2, e, grid, context)
             loss_v = out_v.float().pow(2).mean()
@@ -238,7 +241,7 @@ def run(rank, ng, port):
         max_loss_diff = max(max_loss_diff, diff)
 
         if rank == 0 and step % 5 == 0:
-            print(f'  step {step:2d}: serial={loss_s_val:.6f}  var={loss_v_val:.6f}  diff={diff:.4%}')
+            print(f'  step {step:2d}: serial={loss_s_val:.6f}  var={loss_v_val:.6f}  diff={diff:.4%}', flush=True)
 
     if rank == 0:
         print(f'\n  Max loss difference across 20 steps: {max_loss_diff:.4%}')
@@ -256,7 +259,7 @@ def run(rank, ng, port):
 
         # Save loss curve data for plotting
         import json
-        out = {'steps': list(range(20)), 'serial': losses_s, 'var': losses_v,
+        out = {'steps': list(range(num_train_steps)), 'serial': losses_s, 'var': losses_v,
                'fwd_rel': fwd_rel, 'grad_x_rel': grad_x_rel,
                'max_grad_w_rel': max_grad_w, 'max_loss_diff': max_loss_diff}
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'correctness_results.json')

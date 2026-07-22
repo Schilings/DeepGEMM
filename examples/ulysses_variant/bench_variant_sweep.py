@@ -117,7 +117,7 @@ def run(rank, world_size, port, args, checkpoint_dir):
     e = torch.randn(1, 6, config.dim, device=device, dtype=torch.float32, generator=cond_g) * 0.01
     context = torch.randn(1, 512, config.dim, device=device, dtype=torch.bfloat16, generator=cond_g) * 0.02
 
-    seq_lengths = [2048, 4096, 8192, 16384, 32768]
+    seq_lengths = [2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768]
     strategies = [s.strip() for s in args.strategies.split(',')]
 
     results = {'seq_lens': seq_lengths, 'strategies': strategies, 'data': {}}
