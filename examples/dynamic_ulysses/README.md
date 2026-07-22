@@ -44,6 +44,15 @@ Dynamic SP 的解法：
 | 4 | `figures/fig4_breakdown.png` | Dynamic 执行时间按 (SP, seq_len) 分组分解 |
 | 5 | `figures/fig5_summary.png` | 吞吐+加速比双面板摘要图 |
 
+### 变量扫描曲线图（`bench_sweep.py` + `plot_sweep.py`）
+
+| 图表 | 文件 | 扫描变量 | 核心发现 |
+|------|------|----------|----------|
+| 6 | `figures/fig6_sweep_seq_len.png` | 序列长度 (2K→32K) | 短序列加速 6.6x，长序列趋于 1.0x |
+| 7 | `figures/fig7_sweep_num_seqs.png` | 序列数量 (1→16) | ≥2 条序列即加速，DP 扩展性线性 |
+| 8 | `figures/fig8_sweep_sp_size.png` | SP size (1→8) | 单序列：SP 越大越快（23,998 tok/s） |
+| 9 | `figures/fig9_sweep_ratio.png` | 长短序列比例 | 全短 6.5x → 全长 1.1x，曲线清晰 |
+
 ### 结果解读
 
 - **all_short_2K (4.6x)**: 短序列不值得 SP 分片，SP=1 纯 DP 让 8 卡各跑一条
