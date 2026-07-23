@@ -12,6 +12,7 @@ from .sp.fused import FusedUlysses
 from .sp.serial import SerialUlysses
 from .sp.variant import FusedVariantUlysses
 from .sp.variant_v2 import FusedVariantV2Ulysses
+from .sp.variant_v2_wo import FusedVariantV2WoUlysses
 
 
 def _make_self_attention(strategy: str, config, sp_config):
@@ -24,6 +25,8 @@ def _make_self_attention(strategy: str, config, sp_config):
         return FusedVariantUlysses(config, layer_sp_config)
     if strategy == "fused_var_v2":
         return FusedVariantV2Ulysses(config, layer_sp_config)
+    if strategy == "fused_var_v2_wo":
+        return FusedVariantV2WoUlysses(config, layer_sp_config)
     raise ValueError(f"Unknown strategy: {strategy}")
 
 

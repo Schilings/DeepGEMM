@@ -236,6 +236,87 @@ def post_linear_v2(attn, weight, workspace, local_m, grad_manager):
 
 
 # ---------------------------------------------------------------------------
+# POST linear v2 + Wo deferred — also defers grad_weight to next layer's AG
+# ---------------------------------------------------------------------------
+
+class PostLinearV2WoFunction(torch.autograd.Function):
+    """Same as PostLinearV2Function but **also defers the Wo weight gradient**.
+
+    Backward:
+      1. Launch ``dist.all_gather_into_tensor`` on *comm_stream*.
+      2. Process deferred QKV (and previous layer's Wo) weight grads on the
+         default stream — overlaps with AG.
+      3. Wait for AG.
+      4. ``grad_attn = grad_y_full @ weight``   [full_m, local_hidden]  (immediate)
+      5. Push ``(attn, grad_y_full, weight)`` onto deferred queue for next layer.
+    """
+
+    @staticmethod
+    def forward(ctx, attn, weight, workspace, local_m, grad_manager):
+        if attn.ndim != 2 or weight.ndim != 2:
+            raise ValueError('attn and weight must be 2D tensors')
+        if attn.shape[1] != weight.shape[1]:
+            raise ValueError('attn K dimension must match the local Wo shard')
+        sp = workspace.group.size()
+        if attn.shape[0] != local_m * sp:
+            raise ValueError('attn rows must equal local_m * sequence-parallel size')
+
+        ctx.workspace = workspace
+        ctx.local_m = local_m
+        ctx.grad_manager = grad_manager
+        ctx.save_for_backward(attn, weight)
+
+        output = attn.new_empty((local_m, weight.shape[0]))
+        bf16_gemm_rs_nt(output, attn, weight, workspace, local_m)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        attn, weight = ctx.saved_tensors
+        local_m = ctx.local_m
+        gm = ctx.grad_manager
+        group = ctx.workspace.group
+        sp = group.size()
+        full_m = local_m * sp
+        hidden = weight.shape[0]
+
+        grad_output = grad_output.contiguous()
+        w_dtype = weight.dtype
+        if grad_output.dtype != w_dtype:
+            grad_output = grad_output.to(w_dtype)
+
+        # 1 — Launch AG on comm stream
+        grad_y_full = gm.get_ag_buffer(full_m, hidden, w_dtype,
+                                       grad_output.device)
+        gm.comm_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gm.comm_stream):
+            dist.all_gather_into_tensor(grad_y_full, grad_output, group=group)
+
+        # 2 — Process deferred QKV + previous Wo weight grads (overlap with AG)
+        gm.process()
+
+        # 3 — Wait for AG
+        torch.cuda.current_stream().wait_stream(gm.comm_stream)
+
+        # 4 — grad_attn = grad_y_full @ weight  (immediate — needed by prev layer)
+        grad_attn = torch.matmul(grad_y_full, weight)
+        if grad_attn.dtype != attn.dtype:
+            grad_attn = grad_attn.to(attn.dtype)
+
+        # 5 — Defer Wo weight grad: grad_weight = grad_y_full.T @ attn
+        #     Pushed to queue; will be computed in next layer's AG window.
+        gm.push(attn.detach(), grad_y_full.detach(), weight)
+
+        return grad_attn, None, None, None, None
+
+
+def post_linear_v2_wo(attn, weight, workspace, local_m, grad_manager):
+    """v2 POST linear with **Wo weight grad also deferred**."""
+    return PostLinearV2WoFunction.apply(attn, weight, workspace, local_m, grad_manager)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
