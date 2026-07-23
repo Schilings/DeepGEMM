@@ -11,6 +11,7 @@ from .model import WanFeedForward, WanLayerNorm, WanT2VCrossAttention
 from .sp.fused import FusedUlysses
 from .sp.serial import SerialUlysses
 from .sp.variant import FusedVariantUlysses
+from .sp.variant_v2 import FusedVariantV2Ulysses
 
 
 def _make_self_attention(strategy: str, config, sp_config):
@@ -21,6 +22,8 @@ def _make_self_attention(strategy: str, config, sp_config):
         return FusedUlysses(config, layer_sp_config)
     if strategy == "fused_var":
         return FusedVariantUlysses(config, layer_sp_config)
+    if strategy == "fused_var_v2":
+        return FusedVariantV2Ulysses(config, layer_sp_config)
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
