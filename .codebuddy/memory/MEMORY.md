@@ -1,6 +1,17 @@
 # DeepGEMM 项目长期记忆
 
-## 当前进度（2026-07-19，Wan2.1 Ulysses POST 变体）
+## 当前进度（2026-07-23，Ulysses Variant v2）
+- **状态：v2（原生 AG + 延迟 QKV 权重梯度 overlap）已实现并完成全部实验。** 权威结果见 `examples/ulysses_variant_v2/WAN21_ULYSSES_V2_BENCH.md`，过程记忆见 `memory/2026-07-23.md`。
+- v2 核心思想：POST backward 改用原生 NCCL all_gather + 原生 GEMM（不再用融合 AG+GEMM），将 QKV 权重梯度延迟到下一层 AG 通信窗口中 overlap。
+- **POST backward 速度**：v2 actual autograd 0.393ms vs v1 0.765ms（8K/SP8），仅为 v1 的 0.513×，接近 baseline 0.369ms（1.065×）。原生 NCCL AG (0.213ms) 远快于 v1 融合 AG+GEMM (0.573ms)。
+- **训练吞吐（manual sync）**：v2 23,142 > v1 22,772 > serial 22,289 tok/s（+3.83% vs serial, +1.62% vs v1）。
+- **v2 在所有序列长度下优于 v1**（+0.9% ~ +4.7%），BWD 快 2.3% ~ 9.9%。
+- **显存与 v1 一致**：8K 节省 20.5%。
+- **1000 步训练收敛性一致**：前 900 步 diff < 0.02%。
+- DDP 模式有局限：QKV 排除出 DDP 后手动 all-reduce 无法 overlap，推荐 manual sync。
+- FA4 SM 10.3 兼容性修复：`flash_fwd_sm100.py:162` 断言 `sm_110f`（别名 `sm_101f`）改为 `sm_103f`。`third-party/cutlass/include` 从 `nvidia/mathdx` 包符号链接。
+
+## 历史进度（2026-07-19，Wan2.1 Ulysses POST 变体 v1）
 - **状态：显存与真实 14B 权重训练核心吞吐均已实测。** 权威结果表见 `examples/ulysses_variant/WAN21_ULYSSES_BENCH.md`，过程记忆见 `memory/2026-07-19.md`。
 - 严格两臂：baseline=纯 torch 同步 Ulysses + FA4（无融合算子）；variant=只换 POST 为 GEMM-RS/AG-GEMM。两臂 PRE/RoPE/attention 共用同一代码且都用 FA4。
 - 关键坑：本机 8 卡 = `SP=8, DP=1`，**不能把 SP group 当 FSDP group**（否则 baseline Wo 被切 1/8 抹掉收益）。
