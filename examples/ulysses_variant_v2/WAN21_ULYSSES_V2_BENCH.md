@@ -279,6 +279,43 @@ Loss curve 关键点：
 5. **训练收敛性一致**：1000 步 loss curve 前 900 步 diff < 0.02%，趋势完全一致。
 6. **DDP 模式有局限**：QKV 排除出 DDP 后手动 all-reduce 无法 overlap，推荐 manual sync。
 
+## 附录：v2_wo 实验（同时延迟 Wo 权重梯度）
+
+### 设计
+
+`fused_var_v2_wo` 在 v2 基础上，把 POST backward 的 Wo 权重梯度
+（`grad_weight = grad_y_full.T @ attn`）也推入 deferred queue，延迟到下一层
+AG 通信窗口中执行。代码见 `examples/wan21/sp/variant_v2_wo.py`。
+
+### 实验结果
+
+B300×8, 40 层, 8K, 官方 14B 权重, manual sync, warmup=3/iters=10：
+
+| Strategy | FWD | BWD | SYNC | Wall | tokens/s | Peak |
+|---|---:|---:|---:|---:|---:|---:|
+| serial | 105.88 ms | 141.56 ms | 124.51 ms | 368.78 ms | 22,214 | 54,111 MiB |
+| fused_var (v1) | 103.26 ms | 148.47 ms | 113.67 ms | 362.98 ms | 22,568 | 50,837 MiB |
+| fused_var_v2 | 104.73 ms | 144.45 ms | 113.46 ms | 360.48 ms | 22,725 | 50,811 MiB |
+| fused_var_v2_wo | 102.01 ms | 146.50 ms | 113.22 ms | **359.78 ms** | **22,766** | **63,361 MiB** |
+
+```
+fused_var_v2_wo / serial  = 1.0249x (+2.49%)
+fused_var_v2_wo / v2      = 1.0018x (+0.18%)
+```
+
+### 结论
+
+1. **吞吐收益微乎其微**：v2_wo 比 v2 仅快 0.18%（22,766 vs 22,725 tok/s）。
+   Wo 的 dW GEMM 本身仅 ~0.07ms（8K），延迟它的收益太小。
+2. **BWD 反而略慢**：v2_wo BWD 146.50ms vs v2 144.45ms。当前层省了 dW 计算，
+   但下一层 AG 窗口要多算一个 Wo dW GEMM，AG 窗口不够大时溢出到关键路径。
+3. **显存暴涨 +12.5GB**：v2_wo peak 63,361 MiB vs v2 50,811 MiB。延迟 Wo grad
+   需要跨层保存 `grad_y_full`（all_gather 完整输出 `[full_m, hidden]` bf16），
+   40 层潜在累积导致显存大幅增加。
+4. **不值得**：Wo dW 延迟的收益（+0.18%）远不及其显存代价（+12.5GB）。
+
+**v2（只延迟 QKV）是最优方案**。v2_wo 代码保留作为实验记录。
+
 ## 图表
 
 | 图表 | 文件 | 内容 |
